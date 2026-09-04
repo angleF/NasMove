@@ -124,11 +124,11 @@ def assert_task_transition(current: TaskState, target: TaskState) -> None:
 
 
 def authorize_source_delete(evidence: DeletionEvidence) -> SourceDeleteAuthorization:
-    if not evidence.source_unchanged:
+    if evidence.source_unchanged is not True:
         raise UnsafeSourceDeletion("source changed after transfer began")
-    if not evidence.full_hash_verified:
+    if evidence.full_hash_verified is not True:
         raise UnsafeSourceDeletion("full source and target hash verification is required")
-    if not evidence.target_committed:
+    if evidence.target_committed is not True:
         raise UnsafeSourceDeletion("target must be committed before source deletion")
     if evidence.verified_session_generation != evidence.current_session_generation:
         raise UnsafeSourceDeletion("session generation changed after verification")

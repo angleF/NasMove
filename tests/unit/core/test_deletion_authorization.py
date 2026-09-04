@@ -12,6 +12,7 @@ from nasmove.core.model import (
     ConnectionProfileId,
     DeletionEvidence,
     RemotePath,
+    SourceDeleteAuthorization,
     SourceFingerprint,
     TaskId,
     TaskRecord,
@@ -19,6 +20,7 @@ from nasmove.core.model import (
     TransferItemId,
     TransferItemRecord,
     VerificationPolicy,
+    advance_revision,
 )
 from nasmove.core.states import ItemState, SourceKind, TaskState
 from nasmove.core.transitions import authorize_source_delete
@@ -96,6 +98,45 @@ def test_valid_evidence_returns_immutable_authorization_with_evidence_values() -
     assert authorization.session_generation == 4
     with pytest.raises(FrozenInstanceError):
         authorization.sha256 = "b" * 64  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "field", ["source_unchanged", "full_hash_verified", "target_committed"]
+)
+def test_deletion_evidence_rejects_truthy_non_boolean_safety_flags(field: str) -> None:
+    with pytest.raises(DomainValidationError):
+        _evidence(**{field: "false"})
+
+
+@pytest.mark.parametrize(
+    "field", ["source_unchanged", "full_hash_verified", "target_committed"]
+)
+def test_authorization_defensively_rejects_truthy_non_boolean_safety_flags(field: str) -> None:
+    evidence = _evidence()
+    object.__setattr__(evidence, field, "false")
+
+    with pytest.raises(UnsafeSourceDeletion):
+        authorize_source_delete(evidence)
+
+
+@pytest.mark.parametrize("field", ["verified_session_generation", "current_session_generation"])
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_deletion_evidence_rejects_non_positive_or_non_integer_generations(
+    field: str, value: int | bool
+) -> None:
+    with pytest.raises(DomainValidationError):
+        _evidence(**{field: value})
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_source_delete_authorization_rejects_invalid_session_generation(value: int | bool) -> None:
+    with pytest.raises(DomainValidationError):
+        SourceDeleteAuthorization(
+            source_fingerprint=_fingerprint(),
+            target_path=RemotePath("target/file.bin"),
+            sha256=SHA256,
+            session_generation=value,
+        )
 
 
 @pytest.mark.parametrize("value", ["", "/absolute", "back\\slash", "a//b", "a/./b", "a/../b"])
@@ -205,3 +246,59 @@ def test_transfer_item_rejects_offset_past_source_size_and_incomplete_hash_proof
             state=ItemState.VERIFIED,
             full_hash_verified=True,
         )
+
+
+def test_advance_revision_returns_a_new_task_record_without_mutating_the_original() -> None:
+    now = datetime.now(UTC)
+    record = TaskRecord(
+        id=TaskId("task-1"),
+        name="Copy files",
+        action=TransferAction.COPY,
+        connection=_connection(),
+        target_root=RemotePath("target"),
+        conflict_policy=ConflictPolicy.AUTO_RENAME,
+        verification_policy=VerificationPolicy.FULL,
+        state=TaskState.DRAFT,
+        queue_position=0,
+        recovery_generation=1,
+        total_files=1,
+        total_bytes=10,
+        copied_bytes=0,
+        verified_bytes=0,
+        revision=7,
+        created_at=now,
+        updated_at=now,
+    )
+
+    advanced = advance_revision(record)
+
+    assert isinstance(advanced, TaskRecord)
+    assert advanced.revision == 8
+    assert record.revision == 7
+    assert advanced is not record
+
+
+def test_advance_revision_returns_a_new_transfer_item_without_mutating_the_original() -> None:
+    record = TransferItemRecord(
+        id=TransferItemId("item-1"),
+        task_id=TaskId("task-1"),
+        source_path=Path("/source/file.bin"),
+        relative_path=PurePosixPath("file.bin"),
+        final_path=RemotePath("target/file.bin"),
+        temp_path=RemotePath("target/.file.bin.part"),
+        source_fingerprint=_fingerprint(),
+        state=ItemState.PLANNED,
+        revision=3,
+    )
+
+    advanced = advance_revision(record)
+
+    assert isinstance(advanced, TransferItemRecord)
+    assert advanced.revision == 4
+    assert record.revision == 3
+    assert advanced is not record
+
+
+def test_advance_revision_rejects_non_record_objects() -> None:
+    with pytest.raises(TypeError):
+        advance_revision(object())  # type: ignore[arg-type]

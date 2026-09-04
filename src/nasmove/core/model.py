@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import NewType
@@ -26,6 +26,16 @@ _SHA256_PATTERN = re.compile(r"[0-9a-f]{64}")
 def _require_non_negative(value: int, field_name: str) -> None:
     if value < 0:
         raise DomainValidationError(f"{field_name} must not be negative")
+
+
+def _require_exact_bool(value: object, field_name: str) -> None:
+    if type(value) is not bool:
+        raise DomainValidationError(f"{field_name} must be a bool")
+
+
+def _require_positive_int(value: object, field_name: str) -> None:
+    if type(value) is not int or value <= 0:
+        raise DomainValidationError(f"{field_name} must be a positive int")
 
 
 def _require_sha256(value: str, field_name: str) -> None:
@@ -227,6 +237,16 @@ class DeletionEvidence:
     target_path: RemotePath | None = None
     sha256: str | None = None
 
+    def __post_init__(self) -> None:
+        for field_name, value in (
+            ("source_unchanged", self.source_unchanged),
+            ("full_hash_verified", self.full_hash_verified),
+            ("target_committed", self.target_committed),
+        ):
+            _require_exact_bool(value, field_name)
+        _require_positive_int(self.verified_session_generation, "verified_session_generation")
+        _require_positive_int(self.current_session_generation, "current_session_generation")
+
 
 @dataclass(frozen=True, slots=True)
 class SourceDeleteAuthorization:
@@ -237,3 +257,10 @@ class SourceDeleteAuthorization:
 
     def __post_init__(self) -> None:
         _require_sha256(self.sha256, "sha256")
+        _require_positive_int(self.session_generation, "session_generation")
+
+
+def advance_revision[T: (TaskRecord, TransferItemRecord)](record: T) -> T:
+    if not isinstance(record, (TaskRecord, TransferItemRecord)):
+        raise TypeError("record must be a TaskRecord or TransferItemRecord")
+    return replace(record, revision=record.revision + 1)
