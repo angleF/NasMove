@@ -113,6 +113,10 @@ TASK_TRANSITIONS: Final[Mapping[TaskState, frozenset[TaskState]]] = MappingProxy
 )
 
 
+def _is_positive_exact_int(value: object) -> bool:
+    return type(value) is int and value > 0
+
+
 def assert_item_transition(current: ItemState, target: ItemState) -> None:
     if target not in ITEM_TRANSITIONS.get(current, frozenset()):
         raise InvalidTransition(f"item transition from {current!s} to {target!s} is not allowed")
@@ -130,6 +134,10 @@ def authorize_source_delete(evidence: DeletionEvidence) -> SourceDeleteAuthoriza
         raise UnsafeSourceDeletion("full source and target hash verification is required")
     if evidence.target_committed is not True:
         raise UnsafeSourceDeletion("target must be committed before source deletion")
+    if not _is_positive_exact_int(evidence.verified_session_generation):
+        raise UnsafeSourceDeletion("verified session generation must be a positive int")
+    if not _is_positive_exact_int(evidence.current_session_generation):
+        raise UnsafeSourceDeletion("current session generation must be a positive int")
     if evidence.verified_session_generation != evidence.current_session_generation:
         raise UnsafeSourceDeletion("session generation changed after verification")
     if evidence.source_fingerprint is None:

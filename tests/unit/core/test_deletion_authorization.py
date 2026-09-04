@@ -139,6 +139,28 @@ def test_source_delete_authorization_rejects_invalid_session_generation(value: i
         )
 
 
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"verified_session_generation": True, "current_session_generation": 1},
+        {"verified_session_generation": 0, "current_session_generation": 0},
+        {"verified_session_generation": -1, "current_session_generation": -1},
+        {"verified_session_generation": 1, "current_session_generation": True},
+        {"verified_session_generation": 1, "current_session_generation": 0},
+        {"verified_session_generation": 1, "current_session_generation": -1},
+    ],
+)
+def test_authorization_defensively_rejects_tampered_invalid_generations(
+    changes: dict[str, int | bool],
+) -> None:
+    evidence = _evidence()
+    for field, value in changes.items():
+        object.__setattr__(evidence, field, value)
+
+    with pytest.raises(UnsafeSourceDeletion):
+        authorize_source_delete(evidence)
+
+
 @pytest.mark.parametrize("value", ["", "/absolute", "back\\slash", "a//b", "a/./b", "a/../b"])
 def test_remote_path_rejects_non_normalized_relative_posix_paths(value: str) -> None:
     with pytest.raises(DomainValidationError):
