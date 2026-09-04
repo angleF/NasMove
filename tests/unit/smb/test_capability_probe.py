@@ -2,13 +2,22 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
+from uuid import UUID
 
 import pytest
+from smbprotocol.exceptions import SMBOSError
+from smbprotocol.header import NtStatus
 
+import nasmove.smb.capability_probe as capability_probe_module
 from nasmove.core.model import ConnectionConfig, ConnectionProfileId, RemotePath
 from nasmove.core.ports import RemoteStat
 from nasmove.smb.capability_probe import SmbCapabilityProbe
-from nasmove.smb.error_mapping import StaleSmbHandleError, TargetExistsError
+from nasmove.smb.error_mapping import (
+    RenameOutcomeUnknownError,
+    StaleSmbHandleError,
+    TargetExistsError,
+    redacted_error_code,
+)
 from nasmove.smb.smbprotocol_gateway import SmbProtocolGateway
 from tests.fixtures.fake_smb import RecordingSmbGateway
 
@@ -69,6 +78,77 @@ def test_full_read_must_match_expected_truncated_content() -> None:
     assert report.rename_exclusive is True
     assert report.cleanup is True
     assert report.error_code == "verify:content_mismatch"
+
+
+def _fixed_probe_uuid() -> UUID:
+    return UUID("12345678-1234-5678-1234-567812345678")
+
+
+def test_rename_collision_never_deletes_preexisting_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = RecordingSmbGateway()
+    renamed = "archive/incoming/.nasmove-probe-12345678123456781234567812345678.renamed"
+    original = "archive/incoming/.nasmove-probe-12345678123456781234567812345678.tmp"
+    protected_content = b"preexisting-owner-data"
+    gateway.files[renamed] = protected_content
+    monkeypatch.setattr(capability_probe_module, "uuid4", _fixed_probe_uuid)
+
+    report = SmbCapabilityProbe(gateway).run(RemotePath("archive/incoming"))
+
+    assert gateway.files[renamed] == protected_content
+    assert original not in gateway.files
+    assert report.rename_exclusive is False
+    assert report.cleanup is False
+    assert report.error_code == "rename_exclusive:target_exists"
+
+
+def test_uncertain_rename_result_preserves_possible_destination_for_manual_review(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = RecordingSmbGateway(ambiguous_rename=True)
+    renamed = "archive/incoming/.nasmove-probe-12345678123456781234567812345678.renamed"
+    monkeypatch.setattr(capability_probe_module, "uuid4", _fixed_probe_uuid)
+
+    report = SmbCapabilityProbe(gateway).run(RemotePath("archive/incoming"))
+
+    assert renamed in gateway.files
+    assert report.rename_exclusive is False
+    assert report.cleanup is False
+    assert report.error_code == "rename_exclusive:rename_outcome_unknown"
+
+
+@pytest.mark.parametrize(
+    ("ntstatus", "expected"),
+    [
+        (NtStatus.STATUS_ACCESS_DENIED, "permission_denied"),
+        (NtStatus.STATUS_DISK_FULL, "disk_full"),
+        (NtStatus.STATUS_OBJECT_NAME_COLLISION, "target_exists"),
+    ],
+)
+def test_real_smb_os_error_ntstatus_maps_to_safe_code(ntstatus: int, expected: str) -> None:
+    error = SMBOSError(ntstatus, r"\\private-nas\secret-share\customer-name")
+
+    code = redacted_error_code(error)
+
+    assert code == expected
+    assert "private-nas" not in code
+    assert "customer-name" not in code
+
+
+def test_real_smb_exception_body_never_enters_capability_report() -> None:
+    gateway = RecordingSmbGateway(
+        create_error=SMBOSError(
+            NtStatus.STATUS_ACCESS_DENIED,
+            r"\\private-nas\secret-share\customer-name",
+        )
+    )
+
+    report = SmbCapabilityProbe(gateway).run(RemotePath("archive/incoming"))
+
+    assert report.error_code == "create:permission_denied"
+    assert "private-nas" not in report.error_code
+    assert "customer-name" not in report.error_code
 
 
 def _config() -> ConnectionConfig:
@@ -178,3 +258,27 @@ def test_rename_exclusive_refuses_existing_target_without_calling_smb_rename(
         gateway.rename_exclusive(RemotePath("a/source"), RemotePath("a/target"))
 
     assert rename_calls == []
+
+
+def test_rename_exclusive_marks_lost_response_as_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+
+    def lose_rename_response(source: str, target: str, **kwargs: Any) -> None:
+        del source, target, kwargs
+        raise TimeoutError("private server response was lost")
+
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.rename",
+        lose_rename_response,
+    )
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "memory-only-secret")
+    monkeypatch.setattr(gateway, "stat", lambda path: None)
+
+    with pytest.raises(RenameOutcomeUnknownError):
+        gateway.rename_exclusive(RemotePath("a/source"), RemotePath("a/target"))

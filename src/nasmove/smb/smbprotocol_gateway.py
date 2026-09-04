@@ -10,9 +10,11 @@ import smbclient  # type: ignore[import-untyped]
 from nasmove.core.model import ConnectionConfig, RemotePath
 from nasmove.core.ports import RemoteEntry, RemoteStat, SessionInfo
 from nasmove.smb.error_mapping import (
+    RenameOutcomeUnknownError,
     StaleSmbHandleError,
     TargetExistsError,
     UnsupportedSmbDialectError,
+    redacted_error_code,
 )
 
 _DIALECT_NAMES = {
@@ -169,9 +171,9 @@ class SmbProtocolGateway:
         except FileExistsError as error:
             raise TargetExistsError("exclusive SMB rename target already exists") from error
         except Exception as error:
-            if self.stat(target) is not None:
+            if redacted_error_code(error) == "target_exists":
                 raise TargetExistsError("exclusive SMB rename target already exists") from error
-            raise
+            raise RenameOutcomeUnknownError("exclusive SMB rename outcome is unknown") from error
 
     def remove_file(self, path: RemotePath) -> None:
         smbclient.remove(self._unc(path), **self._session_kwargs())

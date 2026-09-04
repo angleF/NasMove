@@ -7,6 +7,7 @@ from typing import BinaryIO
 
 from nasmove.core.model import ConnectionConfig, RemotePath
 from nasmove.core.ports import RemoteEntry, RemoteStat, SessionInfo
+from nasmove.smb.error_mapping import RenameOutcomeUnknownError
 
 
 class _RecordingStream(BytesIO):
@@ -40,7 +41,14 @@ class _RecordingStream(BytesIO):
 
 
 class RecordingSmbGateway:
-    def __init__(self, *, fail_cleanup: bool = False, corrupt_read: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        fail_cleanup: bool = False,
+        corrupt_read: bool = False,
+        create_error: Exception | None = None,
+        ambiguous_rename: bool = False,
+    ) -> None:
         self.calls: list[str] = []
         self.files: dict[str, bytes] = {}
         self.created_paths: list[RemotePath] = []
@@ -48,6 +56,8 @@ class RecordingSmbGateway:
         self._generation = 0
         self._fail_cleanup = fail_cleanup
         self._corrupt_read = corrupt_read
+        self._create_error = create_error
+        self._ambiguous_rename = ambiguous_rename
 
     def connect(self, config: ConnectionConfig, password: str) -> SessionInfo:
         del config, password
@@ -94,6 +104,8 @@ class RecordingSmbGateway:
     @contextmanager
     def create_exclusive(self, path: RemotePath) -> Iterator[BinaryIO]:
         self.calls.append("create_exclusive")
+        if self._create_error is not None:
+            raise self._create_error
         if path.value in self.files:
             raise FileExistsError(path.value)
         self.files[path.value] = b""
@@ -114,11 +126,15 @@ class RecordingSmbGateway:
         if target.value in self.files:
             raise FileExistsError(target.value)
         self.files[target.value] = self.files.pop(source.value)
+        if self._ambiguous_rename:
+            raise RenameOutcomeUnknownError("simulated lost rename response")
 
     def remove_file(self, path: RemotePath) -> None:
         self.calls.append("remove_file")
         if self._fail_cleanup:
             raise PermissionError("simulated cleanup denial")
+        if path.value not in self.files:
+            raise FileNotFoundError(path.value)
         del self.files[path.value]
 
     def make_dir(self, path: RemotePath) -> None:

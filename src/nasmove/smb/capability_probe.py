@@ -123,8 +123,6 @@ class SmbCapabilityProbe:
         if not created:
             return False, None
         candidates = [renamed] if was_renamed else [original]
-        if rename_attempted and not was_renamed:
-            candidates.append(renamed)
         cleanup_error: str | None = None
         for candidate in candidates:
             try:
@@ -133,7 +131,8 @@ class SmbCapabilityProbe:
                 continue
             except Exception as error:  # noqa: BLE001 - cleanup failures must be reported
                 cleanup_error = redacted_error_code(error)
-        return cleanup_error is None, cleanup_error
+        rename_result_is_certain = not rename_attempted or was_renamed
+        return cleanup_error is None and rename_result_is_certain, cleanup_error
 
 
 class _ContentMismatchError(Exception):
