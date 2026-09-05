@@ -198,3 +198,70 @@ def test_idempotent_configure_rechecks_and_repairs_file_mode(tmp_path: Path) -> 
     os.chmod(tmp_path / "nasmove.log", 0o644)
     configure_logging(tmp_path)
     assert (tmp_path / "nasmove.log").stat().st_mode & 0o777 == 0o600
+
+
+def test_allowed_fields_are_validated_in_nested_mapping_and_record_extra() -> None:
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "%s", ({
+        "task_id": "task-1",
+        "item_id": "item-1",
+        "error_category": "AUTH",
+        "error_code": "os_error_5",
+        "nested": {"task_id": "task-2 password=leaked", "error_code": "bad/value"},
+    },), None)
+    record.task_id = "task-3"
+    record.error_code = "error-code-3"
+    record.item_id = "bad value"
+    RedactingFilter().filter(record)
+    message = record.getMessage()
+    assert "task-1" in message and "item-1" in message and "AUTH" in message
+    assert "password=leaked" not in message
+    assert "bad/value" not in message and "bad value" not in message
+    assert record.task_id == "task-3" and record.error_code == "error-code-3"
+    assert record.item_id == "<redacted-field>"
+
+
+def test_delimited_and_unicode_credentials_are_redacted_to_end_of_line() -> None:
+    message = _message("password=p@ss,word; unicode秘密 ordinary=also-hidden")
+    assert "p@ss" not in message and "p@ss,word" not in message and "unicode秘密" not in message
+    message = _message("Authorization: Bearer TOP,SECRET Authorization: Basic SECOND SECRET")
+    assert "TOP" not in message and "SECRET" not in message and "SECOND" not in message
+
+
+def test_unknown_absolute_tilde_and_relative_paths_are_wholly_redacted() -> None:
+    for value in (
+        "/opt/My Private/data/file.txt",
+        "/var/lib/nas/private/file.txt",
+        "~/My Private/file name.txt",
+        "folder/private/file.txt",
+    ):
+        message = _message(value)
+        assert value not in message
+        assert "private" not in message
+
+
+def test_log_record_factory_protects_dynamic_child_with_private_handler(tmp_path: Path) -> None:
+    configure_logging(tmp_path / "secure")
+    child = logging.getLogger("nasmove.dynamic-child")
+    child.handlers.clear()
+    child.propagate = False
+    handler = logging.FileHandler(tmp_path / "child.log", encoding="utf-8")
+    child.addHandler(handler)
+    child.error("password=dynamic-secret")
+    handler.flush()
+    handler.close()
+    child.removeHandler(handler)
+    assert "dynamic-secret" not in (tmp_path / "child.log").read_text()
+
+
+def test_non_nasmove_logger_is_not_changed_by_record_factory(tmp_path: Path) -> None:
+    configure_logging(tmp_path / "secure")
+    logger = logging.getLogger("other-component")
+    handler = logging.FileHandler(tmp_path / "other.log", encoding="utf-8")
+    logger.handlers.clear()
+    logger.propagate = False
+    logger.addHandler(handler)
+    logger.error("password=external-secret")
+    handler.flush()
+    handler.close()
+    logger.removeHandler(handler)
+    assert "external-secret" in (tmp_path / "other.log").read_text()

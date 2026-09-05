@@ -7,7 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from getpass import getuser
 from io import TextIOWrapper
 from pathlib import Path
@@ -38,6 +38,7 @@ _SENSITIVE_KEY_BASES = {
 }
 _NORMALIZED_SENSITIVE_KEY_BASES = {key.replace("-", "_") for key in _SENSITIVE_KEY_BASES}
 _ALLOWED_EXTRA_KEYS = {"task_id", "item_id", "error_category", "error_code"}
+_ALLOWED_FIELD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}\Z")
 _PATH_KEYS = {"path", "source", "target", "source_path", "target_path", "remote_path", "local_path"}
 _STANDARD_RECORD_FIELDS = {
     "args", "asctime", "created", "exc_info", "exc_text", "filename", "funcName",
@@ -45,11 +46,11 @@ _STANDARD_RECORD_FIELDS = {
     "pathname", "process", "processName", "relativeCreated", "stack_info", "thread", "threadName",
 }
 
-_AUTH_HEADER_RE = re.compile(r"(?i)\b(?:authorization\s*[:=]\s*)?(?:bearer|basic|ntlm)\s+[^\s,;]+")
+_AUTH_HEADER_RE = re.compile(r"(?i)\b(?:authorization\s*[:=]\s*)?(?:bearer|basic|ntlm)\s+[^\r\n]*")
 _KEY_VALUE_RE = re.compile(
     r"(?i)(?P<key>password|passwd|passphrase|token|secret(?:[_-][^\s:=]+)?|authorization(?:[_-]header)?|"
     r"bearer|basic|ntlm(?:[_-]response)?|ticket|session[_-]?key(?:[_-]id)?|hash|username|user_name)"
-    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\s,;]+)"
+    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\r\n]*)"
 )
 _SMB_URL_RE = re.compile(
     r"(?i)(?P<scheme>(?:smb|cifs)://)(?P<userinfo>[^/\\\s@]+@)?(?P<host>[^/\\\s]+)(?P<path>/[^\r\n]*)?"
@@ -57,12 +58,6 @@ _SMB_URL_RE = re.compile(
 _UNC_RE = re.compile(
     r"(?i)(?P<prefix>\\\\)(?P<userinfo>[^\\/\s@]+@)?(?P<host>[^\\/\s]+)(?P<path>\\[^\r\n]*)?"
 )
-_PATH_VALUE_RE = re.compile(
-    r"(?i)(?P<key>source[_-]?path|target[_-]?path|remote[_-]?path|local[_-]?path|path)"
-    r"\s*[:=]\s*(?P<value>\"[^\"]*\"|'[^']*'|[^\r\n]*)"
-)
-_LOCAL_PATH_RE = re.compile(r"(?<![\w:])/(?:[^/\s]+/)+(?P<name>[^/\s]+)")
-_LOCAL_PATH_WITH_SPACES_RE = re.compile(r"(?<![\w:])(?P<path>/(?:Users|Volumes|private|tmp)/[^\r\n]*)")
 
 
 def _is_sensitive_key(key: str) -> bool:
@@ -100,14 +95,19 @@ def _redact_text(value: str) -> str:
     value = _UNC_RE.sub(replace_unc, value)
     value = _AUTH_HEADER_RE.sub(lambda match: _REDACTED, value)
 
-    def replace_path_key(match: re.Match[str]) -> str:
-        return f"{match.group('key')}=<path>/{_path_basename(match.group('value'))}"
-
-    value = _PATH_VALUE_RE.sub(replace_path_key, value)
-    value = _LOCAL_PATH_WITH_SPACES_RE.sub(lambda match: f"<path>/{_path_basename(match.group('path'))}", value)
-    value = _LOCAL_PATH_RE.sub(lambda match: f"<path>/{match.group('name')}", value)
     value = _KEY_VALUE_RE.sub(lambda match: f"{match.group('key')}={_REDACTED}", value)
-    value = _LOCAL_PATH_RE.sub(lambda match: f"<path>/{match.group('name')}", value)
+    redacted_lines: list[str] = []
+    for line in value.splitlines(keepends=True):
+        newline = ""
+        content = line
+        if line.endswith("\n"):
+            content, newline = line[:-1], "\n"
+            if content.endswith("\r"):
+                content, newline = content[:-1], "\r\n"
+        if "/" in content or "\\" in content or "~" in content:
+            content = f"<path>/{_path_basename(content)}"
+        redacted_lines.append(content + newline)
+    value = "".join(redacted_lines)
     for index, replacement in enumerate(protected):
         value = value.replace(f"__NASMOVE_PROTECTED_{index}__", replacement)
     return value
@@ -117,13 +117,22 @@ def _redact_path_value(value: str) -> str:
     return f"<path>/{_path_basename(value)}"
 
 
+def _redact_allowed_field(value: Any) -> Any:
+    if not isinstance(value, str) or _ALLOWED_FIELD_RE.fullmatch(value) is None:
+        return "<redacted-field>"
+    if re.search(r"(?i)(password|authorization|bearer|basic|ntlm|ticket|session[_-]?key|token|secret)", value):
+        return "<redacted-field>"
+    sanitized = _redact_text(value)
+    return sanitized if sanitized == value else "<redacted-field>"
+
+
 def _redact_value(value: Any, *, key: str | None = None, visited: set[int] | None = None, depth: int = 0) -> Any:
     if visited is None:
         visited = set()
     try:
         normalized_key = key.lower().replace("-", "_") if key is not None else None
-        if normalized_key in _ALLOWED_EXTRA_KEYS and isinstance(value, (str, int)):
-            return value
+        if normalized_key in _ALLOWED_EXTRA_KEYS:
+            return _redact_allowed_field(value)
         if normalized_key is not None and _is_sensitive_key(normalized_key):
             return _REDACTED
         if normalized_key in _PATH_KEYS and isinstance(value, str):
@@ -195,6 +204,28 @@ class RedactingFilter(logging.Filter):
             record.exc_info = None
             record.exc_text = None
         return True
+
+
+_ORIGINAL_FACTORY: Callable[..., logging.LogRecord] | None = None
+
+
+def _nasmove_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+    if _ORIGINAL_FACTORY is None:
+        raise RuntimeError("NasMove record factory is not initialized")
+    record = _ORIGINAL_FACTORY(*args, **kwargs)
+    if record.name == "nasmove" or record.name.startswith("nasmove."):
+        RedactingFilter().filter(record)
+    return record
+
+
+def _install_record_factory() -> None:
+    global _ORIGINAL_FACTORY
+    current = logging.getLogRecordFactory()
+    if current is _nasmove_record_factory:
+        return
+    if _ORIGINAL_FACTORY is None or current is not _nasmove_record_factory:
+        _ORIGINAL_FACTORY = current
+    logging.setLogRecordFactory(_nasmove_record_factory)
 
 
 def _run_acl_command(arguments: list[str]) -> str:
@@ -321,6 +352,7 @@ def _attach_filter(logger: logging.Logger) -> None:
 
 def configure_logging(log_dir: Path | None = None) -> logging.Logger:
     """Configure one private NasMove diagnostics handler and secure logger descendants."""
+    _install_record_factory()
     target_dir = Path(log_dir) if log_dir is not None else Path.home() / "Library" / "Logs" / "NasMove"
     _ensure_private_directory(target_dir)
     target = target_dir / "nasmove.log"
