@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from pathlib import Path
 
 from nasmove.security.redacted_logging import RedactingFilter, configure_logging
@@ -90,3 +92,109 @@ def test_configure_logging_is_private_and_idempotent(tmp_path: Path) -> None:
     assert log_file.stat().st_mode & 0o777 == 0o600
     assert tmp_path.stat().st_mode & 0o777 == 0o700
     assert len([handler for handler in logger.handlers if getattr(handler, "_nasmove_secure_handler", False)]) == 1
+
+
+def test_auth_headers_are_redacted_before_generic_authorization_key() -> None:
+    message = _message("Authorization: Bearer one Authorization:Basic two NTLM three")
+    assert "one" not in message and "two" not in message and "three" not in message
+
+
+def test_nested_auth_variants_fail_closed_but_allowed_context_survives() -> None:
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "%s", ({
+        "Auth": {
+            "passphrase": "a",
+            "token": "b",
+            "secret_value": "c",
+            "authorization_header": "Bearer d",
+            "ntlm_response": "e",
+            "ticket": {"session_key_id": "f"},
+        },
+        "task_id": "task-1",
+        "item_id": "item-1",
+        "error_category": "AUTH",
+        "error_code": "permission_denied",
+    },), None)
+    RedactingFilter().filter(record)
+    message = record.getMessage()
+    for value in ("'a'", "'b'", "'c'", "'d'", "'e'", "'f'"):
+        assert value not in message
+    assert "task-1" in message and "AUTH" in message
+
+
+def test_preset_exception_text_is_removed_and_exception_is_safe() -> None:
+    record = logging.LogRecord("x", logging.ERROR, __file__, 1, "failed", (), None)
+    record.exc_text = "ValueError: password=leaked /Users/alice/private/file.txt"
+    try:
+        raise ValueError("raw-password")
+    except ValueError:
+        record.exc_info = sys.exc_info()
+    RedactingFilter().filter(record)
+    assert record.exc_text is None
+    assert record.exc_info is None
+
+
+def test_filter_is_fail_closed_for_cycles_and_bad_repr() -> None:
+    class Bad:
+        def __repr__(self) -> str:
+            raise RuntimeError("secret")
+
+        def __str__(self) -> str:
+            raise RuntimeError("secret")
+
+    cycle: list[object] = []
+    cycle.append(cycle)
+    record = logging.LogRecord("x", logging.INFO, __file__, 1, "%s %s", (cycle, Bad()), None)
+    assert RedactingFilter().filter(record) is True
+    assert "secret" not in record.getMessage()
+
+
+def test_utf16_bytes_are_not_rendered_as_original_content() -> None:
+    original = "密码-token".encode("utf-16")
+    message = _message("payload=%s", (original,))
+    assert original.hex() not in message
+    assert "密码" not in message
+
+
+def test_paths_with_spaces_are_replaced_as_whole_values() -> None:
+    message = _message(
+        "source_path=\"/Users/alice/My Private/file name.txt\" remote_path=\"share/My Private/file name.txt\""
+    )
+    assert "/Users/alice/My Private" not in message
+    assert "share/My Private" not in message
+    assert "file name.txt" in message
+
+
+def test_existing_handlers_and_children_cannot_bypass_redaction(tmp_path: Path) -> None:
+    logger = logging.getLogger("nasmove")
+    logger.handlers.clear()
+    logger.propagate = True
+    ordinary = logging.FileHandler(tmp_path / "ordinary.log", encoding="utf-8")
+    logger.addHandler(ordinary)
+    configure_logging(tmp_path / "secure")
+    logging.getLogger("nasmove.child").error("password=leaked")
+    for handler in logger.handlers:
+        handler.flush()
+    ordinary.close()
+    logger.removeHandler(ordinary)
+    assert "leaked" not in (tmp_path / "ordinary.log").read_text()
+
+
+def test_recursive_log_directories_are_private_and_wide_existing_parent_unchanged(tmp_path: Path) -> None:
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    os.chmod(existing, 0o755)
+    nested = existing / "a" / "b"
+    try:
+        configure_logging(nested)
+    except OSError:
+        pass
+    else:
+        raise AssertionError("wide existing parent must be rejected")
+    assert existing.stat().st_mode & 0o777 == 0o755
+
+
+def test_idempotent_configure_rechecks_and_repairs_file_mode(tmp_path: Path) -> None:
+    configure_logging(tmp_path)
+    os.chmod(tmp_path / "nasmove.log", 0o644)
+    configure_logging(tmp_path)
+    assert (tmp_path / "nasmove.log").stat().st_mode & 0o777 == 0o600
