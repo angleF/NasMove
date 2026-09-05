@@ -118,6 +118,20 @@ def test_uncertain_rename_result_preserves_possible_destination_for_manual_revie
     assert report.error_code == "rename_exclusive:rename_outcome_unknown"
 
 
+def test_uncertain_rename_cleanup_accepts_real_smb_missing_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gateway = RecordingSmbGateway(ambiguous_rename=True, real_missing_remove=True)
+    renamed = "archive/incoming/.nasmove-probe-12345678123456781234567812345678.renamed"
+    monkeypatch.setattr(capability_probe_module, "uuid4", _fixed_probe_uuid)
+
+    report = SmbCapabilityProbe(gateway).run(RemotePath("archive/incoming"))
+
+    assert renamed in gateway.files
+    assert report.cleanup is False
+    assert report.error_code == "rename_exclusive:rename_outcome_unknown"
+
+
 @pytest.mark.parametrize(
     ("ntstatus", "expected"),
     [
@@ -195,6 +209,81 @@ def test_connect_returns_negotiated_security_and_increments_generation(
     assert register_calls[0][0] == ("nas.example.test",)
     assert register_calls[0][1]["username"] == "LAB\\tester"
     assert register_calls[0][1]["encrypt"] is True
+
+
+@pytest.mark.parametrize(
+    "ntstatus",
+    [NtStatus.STATUS_OBJECT_NAME_NOT_FOUND, NtStatus.STATUS_OBJECT_PATH_NOT_FOUND],
+)
+def test_stat_returns_none_for_real_smb_missing_status(
+    monkeypatch: pytest.MonkeyPatch,
+    ntstatus: int,
+) -> None:
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+
+    def missing_stat(path: str, **kwargs: Any) -> Any:
+        raise SMBOSError(ntstatus, path)
+
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.stat", missing_stat)
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "memory-only-secret")
+
+    assert gateway.stat(RemotePath("archive/missing")) is None
+
+
+def test_stat_reraises_real_smb_non_missing_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    error = SMBOSError(NtStatus.STATUS_ACCESS_DENIED, r"\\private\share\denied")
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+
+    def denied_stat(path: str, **kwargs: Any) -> Any:
+        del path, kwargs
+        raise error
+
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.stat", denied_stat)
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "memory-only-secret")
+
+    with pytest.raises(SMBOSError) as captured:
+        gateway.stat(RemotePath("archive/denied"))
+
+    assert captured.value is error
+
+
+def test_rename_exclusive_calls_smb_rename_after_real_missing_target_stat(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rename_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+
+    def missing_stat(path: str, **kwargs: Any) -> Any:
+        raise SMBOSError(NtStatus.STATUS_OBJECT_NAME_NOT_FOUND, path)
+
+    def record_rename(source: str, target: str, **kwargs: Any) -> None:
+        del kwargs
+        rename_calls.append((source, target))
+
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.stat", missing_stat)
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.rename", record_rename)
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "memory-only-secret")
+
+    gateway.rename_exclusive(RemotePath("archive/source"), RemotePath("archive/target"))
+
+    assert rename_calls == [
+        (
+            r"\\nas.example.test\test-share\archive\source",
+            r"\\nas.example.test\test-share\archive\target",
+        )
+    ]
 
 
 def test_open_update_uses_normalized_unc_binary_update_and_reset_invalidates_handle(

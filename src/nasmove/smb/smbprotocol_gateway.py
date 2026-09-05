@@ -120,8 +120,10 @@ class SmbProtocolGateway:
     def stat(self, path: RemotePath) -> RemoteStat | None:
         try:
             result = smbclient.stat(self._unc(path), **self._session_kwargs())
-        except FileNotFoundError:
-            return None
+        except OSError as error:
+            if redacted_error_code(error) == "path_not_found":
+                return None
+            raise
         return RemoteStat(
             size=result.st_size,
             is_directory=stat_module.S_ISDIR(result.st_mode),

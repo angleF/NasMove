@@ -23,12 +23,16 @@ class UnsupportedSmbDialectError(OSError):
 _SAFE_STATUS = re.compile(r"STATUS_[A-Z0-9_]+")
 _NTSTATUS_CODES = {
     0xC0000022: "permission_denied",  # STATUS_ACCESS_DENIED
+    0xC0000034: "path_not_found",  # STATUS_OBJECT_NAME_NOT_FOUND
     0xC0000035: "target_exists",  # STATUS_OBJECT_NAME_COLLISION
+    0xC000003A: "path_not_found",  # STATUS_OBJECT_PATH_NOT_FOUND
     0xC000007F: "disk_full",  # STATUS_DISK_FULL
 }
 _STATUS_NAME_CODES = {
     "STATUS_ACCESS_DENIED": "permission_denied",
+    "STATUS_OBJECT_NAME_NOT_FOUND": "path_not_found",
     "STATUS_OBJECT_NAME_COLLISION": "target_exists",
+    "STATUS_OBJECT_PATH_NOT_FOUND": "path_not_found",
     "STATUS_DISK_FULL": "disk_full",
 }
 

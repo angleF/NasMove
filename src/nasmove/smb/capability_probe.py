@@ -127,8 +127,10 @@ class SmbCapabilityProbe:
         for candidate in candidates:
             try:
                 self._gateway.remove_file(candidate)
-            except FileNotFoundError:
-                continue
+            except OSError as error:
+                if redacted_error_code(error) == "path_not_found":
+                    continue
+                cleanup_error = redacted_error_code(error)
             except Exception as error:  # noqa: BLE001 - cleanup failures must be reported
                 cleanup_error = redacted_error_code(error)
         rename_result_is_certain = not rename_attempted or was_renamed

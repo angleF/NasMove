@@ -5,6 +5,9 @@ from contextlib import AbstractContextManager, contextmanager
 from io import BytesIO
 from typing import BinaryIO
 
+from smbprotocol.exceptions import SMBOSError
+from smbprotocol.header import NtStatus
+
 from nasmove.core.model import ConnectionConfig, RemotePath
 from nasmove.core.ports import RemoteEntry, RemoteStat, SessionInfo
 from nasmove.smb.error_mapping import RenameOutcomeUnknownError
@@ -48,6 +51,7 @@ class RecordingSmbGateway:
         corrupt_read: bool = False,
         create_error: Exception | None = None,
         ambiguous_rename: bool = False,
+        real_missing_remove: bool = False,
     ) -> None:
         self.calls: list[str] = []
         self.files: dict[str, bytes] = {}
@@ -58,6 +62,7 @@ class RecordingSmbGateway:
         self._corrupt_read = corrupt_read
         self._create_error = create_error
         self._ambiguous_rename = ambiguous_rename
+        self._real_missing_remove = real_missing_remove
 
     def connect(self, config: ConnectionConfig, password: str) -> SessionInfo:
         del config, password
@@ -134,6 +139,8 @@ class RecordingSmbGateway:
         if self._fail_cleanup:
             raise PermissionError("simulated cleanup denial")
         if path.value not in self.files:
+            if self._real_missing_remove:
+                raise SMBOSError(NtStatus.STATUS_OBJECT_NAME_NOT_FOUND, path.value)
             raise FileNotFoundError(path.value)
         del self.files[path.value]
 
