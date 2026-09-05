@@ -28,11 +28,18 @@ class TransferLocal:
         self.trace = trace
         self.cancel_token: TransferToken | None = None
         self.cancel_on_eof = False
+        self.fingerprint_override: SourceFingerprint | None = None
 
     @contextmanager
     def open_read(self, path: Path) -> Iterator[BinaryIO]:
         del path
         yield _TracingLocalStream(self.content, self.trace, self.cancel_token, self.cancel_on_eof)
+
+    def fingerprint(self, path: Path) -> SourceFingerprint:
+        del path
+        if self.fingerprint_override is not None:
+            return self.fingerprint_override
+        return SourceFingerprint(1, 2, SourceKind.FILE, len(self.content), 1)
 
 
 class _TracingLocalStream(BytesIO):
@@ -129,6 +136,28 @@ class TransferRemote:
             self.switch_generation_after_stat = False
         return result
 
+    @contextmanager
+    def open_read(self, path: RemotePath) -> Iterator[BinaryIO]:
+        self.trace.append(f"remote.open_read@{path.value}")
+        value = self.files.get(path.value)
+        if value is None:
+            raise FileNotFoundError(path.value)
+        yield BytesIO(bytes(value))
+
+    def truncate(self, path: RemotePath, size: int) -> None:
+        self.trace.append(f"remote.truncate@{size}")
+        if path.value not in self.files:
+            raise FileNotFoundError(path.value)
+        self.files[path.value] = self.files[path.value][:size]
+
+    def rename_exclusive(self, source: RemotePath, target: RemotePath) -> None:
+        self.trace.append(f"remote.rename@{target.value}")
+        if target.value in self.files:
+            raise FileExistsError(target.value)
+        if source.value not in self.files:
+            raise FileNotFoundError(source.value)
+        self.files[target.value] = self.files.pop(source.value)
+
     def is_generation_current(self, generation: int) -> bool:
         with self._lifecycle_lock:
             return self.active_generation == generation
@@ -198,11 +227,22 @@ class TransferRepository:
     def __init__(self, trace: list[str]) -> None:
         self.trace = trace
         self.checkpoints: list[Checkpoint] = []
+        self.items: dict[TransferItemId, TransferItemRecord] = {}
 
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
         offset = checkpoint.confirmed_offset
         self.trace.append(f"repository.save_checkpoint@{offset}")
         self.checkpoints.append(checkpoint)
+
+    def get_item(self, item_id: TransferItemId) -> TransferItemRecord:
+        return self.items[item_id]
+
+    def checkpoints_desc(self, item_id: TransferItemId) -> list[Checkpoint]:
+        return sorted(
+            (checkpoint for checkpoint in self.checkpoints if checkpoint.item_id == item_id),
+            key=lambda checkpoint: (checkpoint.created_at, checkpoint.confirmed_offset),
+            reverse=True,
+        )
 
 
 class TransferToken:
@@ -252,6 +292,94 @@ class FakeDependencies:
     def session(self, *, generation: int) -> SessionInfo:
         self.remote.active_generation = generation
         return SessionInfo("3.1.1", True, True, generation)
+
+
+@dataclass
+class RecoveryFixture:
+    local: TransferLocal
+    remote: TransferRemote
+    repository: TransferRepository
+    coordinator: object
+    item: TransferItemRecord
+    item_id: TransferItemId
+
+    @property
+    def remote_size(self) -> int:
+        return len(self.remote.files.get(self.item.temp_path.value, b""))
+
+    @remote_size.setter
+    def remote_size(self, value: int) -> None:
+        self.remote.files[self.item.temp_path.value] = bytearray(self.local.content[:value])
+
+    @property
+    def remote_actions(self) -> list[str]:
+        return [entry for entry in self.remote.trace if entry.startswith("remote.")]
+
+    @property
+    def isolated_paths(self) -> list[str]:
+        return [path for path in self.remote.files if ".orphan" in path]
+
+    @property
+    def local_changed(self) -> bool:
+        return self.local.fingerprint_override is not None
+
+    @local_changed.setter
+    def local_changed(self, value: bool) -> None:
+        self.local.fingerprint_override = (
+            SourceFingerprint(1, 2, SourceKind.FILE, len(self.local.content), 2) if value else None
+        )
+
+    def set_window_match(self, *, offset: int, matches: bool) -> None:
+        from nasmove.localio.hashing import sha256_range
+
+        window_length = min(4 * 1024 * 1024, offset)
+        window_start = offset - window_length
+        with self.local.open_read(self.item.source_path) as source:
+            digest = sha256_range(source, window_start, window_length)
+        if not matches:
+            digest = "0" * 64 if digest != "0" * 64 else "1" * 64
+        self.repository.checkpoints.append(
+            Checkpoint(
+                item_id=self.item.id,
+                confirmed_offset=offset,
+                remote_size=offset,
+                window_start=window_start,
+                window_length=window_length,
+                window_sha256=digest,
+                session_generation=1,
+            )
+        )
+
+    def install_final_file(self, *, correct: bool) -> None:
+        value = self.local.content if correct else self.local.content[:-1] + b"x"
+        self.remote.files[self.item.final_path.value] = bytearray(value)
+
+
+@pytest.fixture
+def recovery_fixture() -> RecoveryFixture:
+    from nasmove.transfer.recovery import RecoveryCoordinator
+
+    trace: list[str] = []
+    content = bytes(range(256)) * (128 * 1024 * 1024 // 256 + 1)
+    local = TransferLocal(content, trace)
+    remote = TransferRemote(trace)
+    repository = TransferRepository(trace)
+    item = FakeDependencies(local, remote, repository, trace, TransferToken()).item(
+        size=128 * 1024 * 1024,
+        confirmed_offset=128 * 1024 * 1024,
+    )
+    repository.items[item.id] = item
+    session = SessionInfo("3.1.1", True, True, 1)
+    remote.active_generation = 1
+    fixture = RecoveryFixture(
+        local=local,
+        remote=remote,
+        repository=repository,
+        coordinator=RecoveryCoordinator(repository, local, remote, session),
+        item=item,
+        item_id=item.id,
+    )
+    return fixture
 
 
 @pytest.fixture
