@@ -255,23 +255,32 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     elif not has_current_schema(connection):
         raise RuntimeError("database schema changed during initialization")
 
-    expected_hash = expected_schema_fingerprint()
     connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
-    connection.executescript(SCHEMA_SQL + _trigger_sql())
-    actual_hash = schema_fingerprint(connection)
-    if actual_hash != expected_hash:
-        raise RuntimeError("database schema does not match the current schema")
-    connection.execute(
-        "INSERT INTO schema_meta(key, value) VALUES ('version', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (SCHEMA_VERSION,),
-    )
-    connection.execute(
-        "INSERT INTO schema_meta(key, value) VALUES (?, ?) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        (SCHEMA_HASH_KEY, actual_hash),
-    )
-    connection.commit()
+    if not is_new_database:
+        connection.commit()
+        return
+
+    expected_hash = expected_schema_fingerprint()
+    try:
+        connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_SQL + _trigger_sql())
+        actual_hash = schema_fingerprint(connection)
+        if actual_hash != expected_hash:
+            raise RuntimeError("database schema does not match the current schema")
+        connection.execute(
+            "INSERT INTO schema_meta(key, value) VALUES ('version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SCHEMA_VERSION,),
+        )
+        connection.execute(
+            "INSERT INTO schema_meta(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (SCHEMA_HASH_KEY, actual_hash),
+        )
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
