@@ -20,7 +20,7 @@ from nasmove.core.model import (
     TransferItemRecord,
 )
 from nasmove.core.ports import RemoteStat, SessionInfo
-from nasmove.core.states import ItemState, SourceKind, TransferAction
+from nasmove.core.states import ItemState, SourceKind, TaskState, TransferAction
 
 
 class TransferLocal:
@@ -308,6 +308,15 @@ class TransferRepository:
         self.tasks: dict[TaskId, TaskRecord] = {}
         self.fail_done_transition_once = False
 
+    def list_items(self, task_id: TaskId) -> list[TransferItemRecord]:
+        return [item for item in self.items.values() if item.task_id == task_id]
+
+    def transition_task(self, task_id: TaskId, expected: TaskState, target: TaskState) -> None:
+        current = self.tasks[task_id]
+        if current.state is not expected:
+            raise RuntimeError("unexpected task state")
+        self.tasks[task_id] = replace(current, state=target, revision=current.revision + 1)
+
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
         offset = checkpoint.confirmed_offset
         self.trace.append(f"repository.save_checkpoint@{offset}")
@@ -348,6 +357,12 @@ class TransferToken:
     def __init__(self, pause: bool = False) -> None:
         self.pause_requested = pause
         self.cancel_requested = False
+
+    def request_pause(self) -> None:
+        self.pause_requested = True
+
+    def request_cancel(self) -> None:
+        self.cancel_requested = True
 
 
 @dataclass
@@ -689,3 +704,161 @@ def deletion_fixture() -> DeletionFixture:
     session = SessionInfo("3.1.1", True, True, 1)
     service = SourceDeletionService(repository, local, remote, verifier)
     return DeletionFixture(local, remote, repository, verifier, service, item, session)
+
+
+class EngineVerifier:
+    def __init__(self, trace: list[str], result_matches: bool = True) -> None:
+        self.trace = trace
+        self.matches = result_matches
+
+    def verify_full(self, item: TransferItemRecord) -> object:
+        from nasmove.localio.hashing import sha256_stream
+        from nasmove.transfer.verification import VerificationResult
+
+        self.trace.append("full_verify")
+        with BytesIO(b"payload") as source:
+            digest = sha256_stream(source)
+        return VerificationResult(
+            matches=self.matches,
+            source_unchanged=True,
+            source_hash=digest.hexdigest,
+            remote_hash=digest.hexdigest,
+            source_bytes=item.source_fingerprint.size,
+            remote_bytes=item.source_fingerprint.size,
+            session_generation=1,
+            remote_file_id="file-engine",
+        )
+
+
+class EngineCopyWriter:
+    def __init__(self, trace: list[str]) -> None:
+        self.trace = trace
+
+    def copy(self, item, start_offset, session, token=None):
+        from nasmove.transfer.checkpoint_writer import CopyOutcome, CopyResult
+
+        del start_offset, session, token
+        self.trace.append("transfer")
+        return CopyResult(CopyOutcome.COMPLETED, item.source_fingerprint.size, item.source_fingerprint.size)
+
+
+class EngineCommitter:
+    def __init__(self, trace: list[str]) -> None:
+        self.trace = trace
+
+    def commit(self, item, verification):
+        from nasmove.transfer.commit import CommitResult
+
+        del verification
+        self.trace.append("commit")
+        return CommitResult(item.final_path, item.source_fingerprint.size, "file-engine")
+
+
+class EngineDeletion:
+    def __init__(self, trace: list[str]) -> None:
+        self.trace = trace
+
+    def delete_verified_source(self, item_id, session):
+        from nasmove.transfer.deletion import DeletionResult
+
+        del session
+        self.trace.extend(("authorize_delete", "delete_source"))
+        return DeletionResult(item_id, ItemState.DONE, True)
+
+
+@dataclass
+class EngineFixture:
+    engine: object
+    repository: TransferRepository
+    move_task: TaskRecord
+    item: TransferItemRecord
+    token: TransferToken
+    trace: list[str]
+    events: list[object]
+    verifier: EngineVerifier
+
+
+@pytest.fixture
+def engine_fixture() -> EngineFixture:
+    from nasmove.transfer.recovery import RecoveryDecision, RecoveryDisposition
+    from nasmove.transfer.transfer_engine import TransferEngine
+    from tests.fixtures.builders import build_task_record
+
+    trace: list[str] = []
+    events: list[object] = []
+    local = TransferLocal(b"payload", trace)
+    remote = TransferRemote(trace)
+    repository = TransferRepository([])
+    task = replace(
+        build_task_record(),
+        action=TransferAction.MOVE,
+        state=TaskState.QUEUED,
+        total_bytes=len(local.content),
+    )
+    item = replace(
+        FakeDependencies(local, remote, repository, trace, TransferToken()).item(size=len(local.content)),
+        state=ItemState.PLANNED,
+    )
+    repository.tasks[task.id] = task
+    repository.items[item.id] = item
+
+    class Recovery:
+        def find_safe_offset(self, item_id):
+            return RecoveryDecision(0, False, RecoveryDisposition.START_OVER)
+
+    class Sink:
+        def publish(self, event):
+            events.append(event)
+
+    token = TransferToken()
+    verifier = EngineVerifier(trace)
+    engine = TransferEngine(
+        repository=repository,
+        recovery=Recovery(),
+        checkpoint_writer=EngineCopyWriter(trace),
+        verifier=verifier,
+        committer=EngineCommitter(trace),
+        deletion_service=EngineDeletion(trace),
+        session=SessionInfo("3.1.1", True, True, 1),
+        event_sink=Sink(),
+    )
+    return EngineFixture(engine, repository, task, item, token, trace, events, verifier)
+
+
+@dataclass
+class QueueFixture:
+    coordinator: object
+    completed_order: list[str]
+    max_concurrent_tasks: int = 0
+
+    def enqueue(self, task_id: str) -> None:
+        self.coordinator.enqueue(task_id)
+
+    def run_until_empty(self) -> None:
+        while self.coordinator.run_next() is not None:
+            pass
+        self.max_concurrent_tasks = 1 if self.completed_order else 0
+
+
+@pytest.fixture
+def queue_fixture() -> QueueFixture:
+    from nasmove.core.states import TaskState
+    from nasmove.transfer.transfer_engine import QueueCoordinator, TaskResult
+
+    completed_order: list[str] = []
+    active = 0
+    maximum = 0
+
+    class Engine:
+        def run_task(self, task_id, token):
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            completed_order.append(str(task_id))
+            active -= 1
+            return TaskResult(True, TaskState.COMPLETED)
+
+    fixture = QueueFixture(QueueCoordinator(Engine()), completed_order)
+    fixture.__dict__["_active"] = lambda: active
+    fixture.__dict__["_maximum"] = lambda: maximum
+    return fixture
