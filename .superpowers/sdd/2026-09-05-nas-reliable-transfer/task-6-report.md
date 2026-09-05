@@ -71,3 +71,42 @@ Success: no issues found in 18 source files
 提交信息：`feat: secure credentials and redact diagnostics`
 
 提交 SHA：`a41367f3621dc07cd448388bd372dfd23c06ffbf`。
+
+## 独立审查修复轮次 1／5
+
+### RED／GREEN
+
+针对审查列出的 13 项 Important 先补充回归测试；修复前安全定向测试为 `11 failed, 10 passed`。修复后：
+
+```text
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest tests/unit/security -q
+21 passed
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/ruff check src/nasmove/security tests/unit/security tests/fixtures/security.py tests/conftest.py
+All checks passed!
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/mypy src/nasmove
+Success: no issues found in 18 source files
+```
+
+### 逐项处理证据
+
+1. 认证头在通用键值正则前整体替换，覆盖大小写、多个 `Authorization` 头及 Bearer／Basic／NTLM。
+2. 敏感键采用大小写无关的前缀／后缀匹配，覆盖 password、passwd、passphrase、token、secret、authorization_header、bearer、basic、ntlm_response、ticket、session_key_id、hash 等；嵌套 mapping／sequence 递归处理，仅允许四类结构化 ID／错误字段原样保留。
+3. 过滤器始终清空 `exc_text` 和 `exc_info`，Formatter 不再接触原异常参数或 traceback。
+4. 递归 sanitizer 使用最大深度、元素上限和 visited 集合；任何容器迭代、str／repr 失败都返回 `<redacted>`，循环对象测试通过。
+5. configure_logging 将同一脱敏 filter 安装到现有 `nasmove` 及 `nasmove.*` handler，阻断向 root 传播，安全 handler 保持唯一；普通 FileHandler 回归测试确认不写明文。
+6. 默认 keyring import 失败和所有后端异常统一返回 `UnsafeCredentialBackend` 安全摘要，不包含原异常文本。
+7. 初始化只解析一次 backend，要求与官方 `keyring.backends.macOS.Keyring` 精确同类；后续只调用已固定实例方法，切换全局 backend 的竞态测试通过。
+8. 后端异常先在 except 块内记录失败标志，块外再抛安全错误；`__cause__`／`__context__` 均不携带原密码异常。
+9. SMB URL、UNC、本地绝对路径和带空格路径整体保护或替换，必要时吞掉后续文本；仅保留安全路径占位或文件名。
+10. bytes 不再解码或输出 repr，统一使用 `<redacted-bytes>`，包含 UTF-16 bytes 的测试通过。
+11. 日志目录逐级创建并复检 `0700`；既有非私有父目录拒绝且不修改其 mode。系统临时目录和标准 macOS 日志祖先作为平台目录例外。
+12. macOS 通过参数列表调用 `/bin/ls -lde` 与 `/bin/chmod -N`，固定 `LC_ALL=C`、`shell=False`；既有非当前用户 user/group/everyone ACL 拒绝，新建目标清 ACL 后复检；非 macOS 跳过 ACL 命令。
+13. 幂等 configure 每次复检目标 owner、regular、symlink、mode 和 ACL；外部将文件改为 `0644` 后再次调用会修复为 `0600`。
+
+### 风险
+
+- macOS ACL 输出格式依赖系统 `/bin/ls -lde`，升级系统时应复核 ACL 解析测试；非 macOS 明确不执行 ACL 命令。
+- 过滤器对异常或恶意对象采用 fail-closed，极端日志对象可能只保留 `<redacted>`，这是安全优先的预期损失。
+- 实现提交仍为 `a41367f3621dc07cd448388bd372dfd23c06ffbf`；本轮修复提交为 `5f72d79d9ef44c773cb02681857613d1f82fe19d`（`fix: close credential and logging leaks`）。
