@@ -8,7 +8,7 @@ DONE
 
 先新增 `tests/unit/test_app_recovery.py` 与应用夹具，再运行定向测试；在实现缺失阶段按预期得到 `ModuleNotFoundError: No module named 'nasmove.app'`（RED）。
 
-随后以最小实现新增 `ApplicationService`、`SingleInstanceLock`、启动／关闭报告，并为 `RecoveryCoordinator` 补充启动恢复委托接口。
+随后以最小实现新增 `ApplicationService`、`SingleInstanceLock`、启动／关闭报告，并为 `RecoveryCoordinator` 补充启动恢复委托接口。复审轮 2 先为正式队列生命周期协议、资源所有权与五个强退窗口补测试，确认 RED 后再实现。
 
 ## 实施摘要
 
@@ -21,13 +21,13 @@ DONE
 ## 验证
 
 ```text
-/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest tests/unit/test_app_recovery.py tests/fault/test_forced_quit_recovery.py -q
-8 passed
+PYTHONPATH=. /Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/pytest tests/unit/test_app_recovery.py tests/unit/transfer/test_queue.py tests/fault/test_forced_quit_recovery.py -q
+32 passed in 33.58s
 ```
 
 ```text
-/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest -q
-758 passed, 1 skipped in 59.58s
+PYTHONPATH=. /Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/pytest -q
+778 passed, 1 skipped in 203.52s
 ```
 
 ```text
@@ -61,21 +61,22 @@ git diff --check
 
 复审发现并修复以下问题：
 
-- `QueueCoordinator` 现提供正式的 `stop_accepting()`、`request_pause()`、`wait_for_safe_boundary()` 和 `flush_and_checkpoint()` 生命周期协议；活动 token 由真实 `run_next()` 绑定，应用只有在 engine 返回安全边界后才会 flush、持久化暂停并关闭 SMB／SQLite／锁。超时保持资源和锁，允许后续 `request_shutdown()` 重试。
+- `QueueCoordinator` 现提供正式的 `stop_accepting()`、`request_pause()`、`wait_for_safe_boundary()` 和 `flush_and_checkpoint()` 生命周期协议；活动 token 在任务选择前、由统一生命周期锁原子发布，选择阶段也被视为 active。应用只有在 engine 返回安全边界后才会 flush、持久化暂停并关闭 SMB／SQLite／锁。超时保持资源和锁，允许后续 `request_shutdown()` 重试。
 - 默认 SQLite 仓储改为获得单实例锁后惰性创建，锁冲突不会打开或泄漏数据库；外部注入仓储仍由调用方管理。
-- flush、暂停持久化和关闭异常均转换为安全的 `ShutdownResult`，仍按 SMB → SQLite → 锁顺序清理；重复 shutdown 稳定返回，不留下僵尸锁。
-- 新增真实 QueueCoordinator 阻塞 engine 多线程测试、锁冲突下惰性仓储测试、flush／暂停异常测试、超时重试测试；强退测试使用子进程在写块／刷新／校验／重命名／删除状态窗口退出，再真实 SQLite 重开并验证进入 `INTERRUPTED` 且源文件保留。
+- flush、暂停持久化和关闭异常均转换为安全的 `ShutdownResult`，仍按 SMB → SQLite → 锁顺序清理；关闭失败保留锁并可重试剩余资源，重复 shutdown 稳定返回，不留下可并发启动的半关闭实例。
+- 注入的 repository／SMB 默认 borrowed，不由应用关闭；通过 `transfer_ownership=True` 才由应用管理内部资源。新增真实 QueueCoordinator 阻塞 engine 多线程测试、锁冲突下惰性仓储测试、flush／暂停异常、SQLite／SMB 关闭失败、超时重试及 borrowed 资源测试。
+- 强退高保真测试使用子进程在 `CheckpointWriter` 写块／flush、`IntegrityVerifier` 校验、`TargetCommitter` 原子重命名、`SourceDeletionService` 源删除五个窗口调用 `os._exit`；磁盘 fake SMB 持久化远端文件，真实 SQLite 由 `ApplicationService.start()` 重开。未完成窗口恢复为可解释的 `INTERRUPTED` 且源保留；delete 窗口在源删除已完成而状态尚未最终提交时，恢复为 `SOURCE_DELETE_AUTHORIZED`，源缺失但目标保留，符合可恢复删除协议。
 
 复审修复先运行 RED，再实现 GREEN：
 
 ```text
-/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest tests/unit/test_app_recovery.py tests/unit/transfer/test_queue.py -q
+PYTHONPATH=. /Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/pytest tests/unit/test_app_recovery.py tests/unit/transfer/test_queue.py -q
 5 failed, 12 passed
 ```
 
 修复后定向测试：
 
 ```text
-/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest tests/unit/test_app_recovery.py tests/unit/transfer/test_queue.py tests/fault/test_forced_quit_recovery.py -q
-23 passed
+PYTHONPATH=. /Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/pytest tests/unit/test_app_recovery.py tests/unit/transfer/test_queue.py tests/fault/test_forced_quit_recovery.py -q
+32 passed in 33.58s
 ```

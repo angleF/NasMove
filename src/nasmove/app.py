@@ -157,8 +157,10 @@ class ApplicationService:
         credential_store: object | None = None,
         lock_path: Path | str | None = None,
         database_path: Path | str | None = None,
+        transfer_ownership: bool = False,
     ) -> None:
-        self._owns_repository = repository is None
+        self._owns_repository = repository is None or transfer_ownership
+        self._owns_smb = smb_gateway is not None and transfer_ownership
         self._database_path = (
             Path(database_path)
             if database_path is not None
@@ -176,6 +178,9 @@ class ApplicationService:
         self._started = False
         self._accepting = False
         self._shutdown_token = CancellationToken()
+        self._repository_closed = False
+        self._smb_closed = False
+        self._shutdown_prepared = False
 
     @property
     def accepting_tasks(self) -> bool:
@@ -184,11 +189,13 @@ class ApplicationService:
     def start(self) -> StartupReport:
         if self._started:
             return StartupReport(True)
+        self._shutdown_prepared = False
         if not self._lock.acquire():
             return StartupReport(False, already_running=True, error="已有 NasMove 实例正在运行")
         try:
             if self._repository is None:
                 self._repository = SqliteTaskRepository(self._database_path)
+                self._repository_closed = False
             self._integrity_check()
             interrupted = self._mark_interrupted()
             tasks = self._list_incomplete()
@@ -227,43 +234,40 @@ class ApplicationService:
         self._call_optional(self._queue, "stop_accepting")
         self._call_optional(self._queue, "request_pause")
         self._shutdown_token.request_pause()
-        if not self._wait_for_boundary(max(0.0, timeout)):
-            return ShutdownResult(
-                False,
-                timed_out=True,
-                message="仍在安全暂停中",
-            )
         failure: BaseException | None = None
+        paused = 0
+        if not self._shutdown_prepared:
+            if not self._wait_for_boundary(max(0.0, timeout)):
+                return ShutdownResult(
+                    False,
+                    timed_out=True,
+                    message="仍在安全暂停中",
+                )
+            try:
+                self._call_optional(self._queue, "flush_and_checkpoint")
+            except Exception as error:  # noqa: BLE001 - shutdown must release the lock
+                failure = error
+            try:
+                paused = self._pause_active_tasks()
+            except Exception as error:  # noqa: BLE001 - shutdown must release the lock
+                failure = failure or error
+            self._shutdown_prepared = True
         try:
-            self._call_optional(self._queue, "flush_and_checkpoint")
-        except Exception as error:  # noqa: BLE001 - shutdown must release the lock
-            failure = error
-        try:
-            paused = self._pause_active_tasks()
-        except Exception as error:  # noqa: BLE001 - shutdown must release the lock
-            paused = 0
+            self._close_smb()
+        except Exception as error:  # noqa: BLE001 - continue ordered cleanup
             failure = failure or error
         try:
-            try:
-                self._close_smb()
-            except Exception as error:  # noqa: BLE001 - continue ordered cleanup
-                failure = failure or error
-        finally:
-            try:
-                try:
-                    self._close_repository()
-                except Exception as error:  # noqa: BLE001 - lock must not leak
-                    failure = failure or error
-            finally:
-                try:
-                    self._lock.release()
-                finally:
-                    self._started = False
+            self._close_repository()
+        except Exception as error:  # noqa: BLE001 - lock must not leak
+            failure = failure or error
+        if self._resources_closed():
+            self._lock.release()
+            self._started = False
         return ShutdownResult(
-            failure is None,
+            failure is None and not self._started,
             paused_tasks=paused,
-            message="已安全暂停并关闭",
-            error=None if failure is None else "shutdown persistence failed",
+            message="已安全暂停并关闭" if failure is None else "仍在安全暂停中",
+            error=None if failure is None else "shutdown resource close failed",
         )
 
     def _integrity_check(self) -> None:
@@ -373,13 +377,25 @@ class ApplicationService:
         return paused
 
     def _close_smb(self) -> None:
-        if self._smb is not None:
+        if self._owns_smb and self._smb is not None and not self._smb_closed:
             self._call_optional(self._smb, "disconnect")
+            self._smb_closed = True
 
     def _close_repository(self) -> None:
-        repository, self._repository = self._repository, None if self._owns_repository else self._repository
-        if repository is not None:
-            self._call_optional(repository, "close")
+        if not self._owns_repository or self._repository_closed:
+            return
+        repository = self._repository
+        if repository is None:
+            self._repository_closed = True
+            return
+        self._call_optional(repository, "close")
+        self._repository_closed = True
+        self._repository = None
+
+    def _resources_closed(self) -> bool:
+        return (not self._owns_smb or self._smb_closed) and (
+            not self._owns_repository or self._repository_closed
+        )
 
     @staticmethod
     def _call_optional(target: object, method_name: str, *args: object) -> object | None:

@@ -18,6 +18,7 @@ class ApplicationRepository:
         self.tasks: dict[TaskId, TaskRecord] = {}
         self.closed = False
         self.fail_transition = False
+        self.fail_close = False
 
     def seed(self, task: TaskRecord) -> None:
         self.tasks[task.id] = task
@@ -68,6 +69,9 @@ class ApplicationRepository:
 
     def close(self) -> None:
         self.trace.append("close_db")
+        if self.fail_close:
+            self.fail_close = False
+            raise OSError("injected database close failure")
         self.closed = True
 
 
@@ -111,6 +115,9 @@ class ApplicationSmb:
 
     def disconnect(self) -> None:
         self.trace.append("disconnect_smb")
+        if getattr(self, "fail_disconnect", False):
+            self.fail_disconnect = False
+            raise OSError("injected SMB disconnect failure")
         self.closed = True
 
 
@@ -161,6 +168,7 @@ def app_fixture(tmp_path: Path) -> ApplicationFixture:
         smb_gateway=smb,
         credential_store=credentials,
         lock_path=lock_path,
+        transfer_ownership=True,
     )
     return ApplicationFixture(
         service, repository, queue, smb, credentials, trace, task.id, lock_path

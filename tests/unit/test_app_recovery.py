@@ -121,6 +121,7 @@ def test_real_queue_timeout_keeps_resources_until_engine_reaches_boundary(app_fi
         smb_gateway=app_fixture.smb,
         credential_store=app_fixture.credentials,
         lock_path=app_fixture.lock_path,
+        transfer_ownership=True,
     )
     app_fixture.service.start()
     worker = Thread(target=queue.run_next)
@@ -218,3 +219,59 @@ def test_shutdown_can_be_retried_after_timeout(app_fixture) -> None:
     second = app_fixture.service.request_shutdown(timeout=1)
 
     assert second.completed is True
+
+
+def test_owned_close_failure_retains_lock_until_retry_succeeds(app_fixture) -> None:
+    app_fixture.service.start()
+    app_fixture.queue.boundary_reached.set()
+    app_fixture.smb.fail_disconnect = True
+
+    first = app_fixture.service.request_shutdown(timeout=1)
+
+    assert first.completed is False
+    from nasmove.app import SingleInstanceLock
+
+    blocked = SingleInstanceLock(app_fixture.lock_path)
+    assert blocked.acquire() is False
+    second = app_fixture.service.request_shutdown(timeout=1)
+    assert second.completed is True
+    assert blocked.acquire() is True
+    blocked.release()
+
+
+def test_owned_database_close_failure_retains_lock_until_retry_succeeds(app_fixture) -> None:
+    app_fixture.service.start()
+    app_fixture.queue.boundary_reached.set()
+    app_fixture.repository.fail_close = True
+
+    first = app_fixture.service.request_shutdown(timeout=1)
+
+    assert first.completed is False
+    from nasmove.app import SingleInstanceLock
+
+    blocked = SingleInstanceLock(app_fixture.lock_path)
+    assert blocked.acquire() is False
+    second = app_fixture.service.request_shutdown(timeout=1)
+    assert second.completed is True
+    assert blocked.acquire() is True
+    blocked.release()
+
+
+def test_injected_resources_are_borrowed_by_default(app_fixture) -> None:
+    from nasmove.app import ApplicationService
+
+    service = ApplicationService(
+        repository=app_fixture.repository,
+        queue=app_fixture.queue,
+        smb_gateway=app_fixture.smb,
+        credential_store=app_fixture.credentials,
+        lock_path=app_fixture.lock_path,
+    )
+    service.start()
+    app_fixture.queue.boundary_reached.set()
+
+    result = service.request_shutdown(timeout=1)
+
+    assert result.completed is True
+    assert app_fixture.smb.closed is False
+    assert app_fixture.repository.closed is False

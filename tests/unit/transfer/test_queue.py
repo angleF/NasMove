@@ -98,3 +98,41 @@ def test_queue_pause_waits_for_running_engine_to_reach_safe_boundary() -> None:
 
     with pytest.raises(RuntimeError, match="stopping"):
         coordinator.enqueue("task-b")
+
+
+def test_shutdown_observes_task_selection_as_active_and_passes_pause_token() -> None:
+    from nasmove.core.model import TaskId
+    from nasmove.core.states import TaskState
+    from nasmove.transfer.transfer_engine import QueueCoordinator, TaskResult
+
+    selection_started = Event()
+    release_selection = Event()
+    engine_started = Event()
+    received: list[object] = []
+
+    class Repository:
+        def next_queued_task(self):
+            selection_started.set()
+            release_selection.wait(1)
+            return type("Task", (), {"id": TaskId("selected")})()
+
+    class Engine:
+        def run_task(self, task_id, token):
+            received.append(token)
+            engine_started.set()
+            return TaskResult(False, TaskState.PAUSED)
+
+    coordinator = QueueCoordinator(Engine(), Repository())
+    worker = Thread(target=coordinator.run_next)
+    worker.start()
+    assert selection_started.wait(1)
+
+    coordinator.stop_accepting()
+    coordinator.request_pause()
+    assert coordinator.wait_for_safe_boundary(0.01) is False
+    release_selection.set()
+    assert engine_started.wait(1)
+    worker.join(1)
+    assert not worker.is_alive()
+    assert received and received[0].pause_requested is True
+    assert coordinator.wait_for_safe_boundary(1) is True
