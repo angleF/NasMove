@@ -68,6 +68,16 @@ class _GenerationCheckedStream:
         return self._raw.truncate(size)
 
 
+def write_all(stream: BinaryIO, data: bytes) -> None:
+    """Write all bytes, since SMB writes are allowed to complete partially."""
+    offset = 0
+    while offset < len(data):
+        written = stream.write(data[offset:])
+        if not isinstance(written, int) or written <= 0 or written > len(data) - offset:
+            raise OSError("SMB write made no progress or returned an invalid count")
+        offset += written
+
+
 class SmbProtocolGateway:
     def __init__(self) -> None:
         self._connection_cache: dict[str, Any] = {}
@@ -170,10 +180,12 @@ class SmbProtocolGateway:
                 self._unc(target),
                 **self._session_kwargs(),
             )
-        except FileExistsError as error:
-            raise TargetExistsError("exclusive SMB rename target already exists") from error
-        except Exception as error:
-            if redacted_error_code(error) == "target_exists":
+        except OSError as error:
+            try:
+                target_exists = self.stat(target) is not None
+            except OSError:
+                target_exists = False
+            if target_exists or redacted_error_code(error) == "target_exists":
                 raise TargetExistsError("exclusive SMB rename target already exists") from error
             raise RenameOutcomeUnknownError("exclusive SMB rename outcome is unknown") from error
 

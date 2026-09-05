@@ -168,7 +168,7 @@ class ShortWritingStream(BytesIO):
 
 
 class FakeNtStatusError(Exception):
-    def __init__(self, status: str) -> None:
+    def __init__(self, status: str | int) -> None:
         super().__init__(status)
         self.status = status
 
