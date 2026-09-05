@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import socket
 from pathlib import Path
 
 import pytest
@@ -388,3 +389,57 @@ def test_planner_scans_each_source_once(tmp_path: Path, monkeypatch: pytest.Monk
     planner.plan(PlanRequest("copy", config(), (source,), RemotePath("incoming")))
 
     assert scan_count == 1
+
+
+def test_explicit_top_level_symlink_is_persisted_as_skipped(tmp_path: Path) -> None:
+    target = tmp_path / "target.txt"
+    target.write_text("outside")
+    source = tmp_path / "link.txt"
+    source.symlink_to(target)
+    repository = AtomicRepository()
+
+    TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+        PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+    )
+
+    items = repository.persisted
+    assert len(items) == 1
+    assert items[0].relative_path.as_posix() == "link.txt"
+    assert items[0].state is ItemState.SKIPPED
+
+
+@pytest.mark.parametrize("kind", ["fifo", "socket"])
+def test_explicit_top_level_special_source_never_opens_final_component(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+) -> None:
+    source = tmp_path / f"{kind}.special"
+    listener: socket.socket | None = None
+    if kind == "fifo":
+        os.mkfifo(source)
+    else:
+        source = Path("/private/tmp") / "nasmove-planning-test.sock"
+        source.unlink(missing_ok=True)
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(str(source))
+    repository = AtomicRepository()
+    real_open = planner_module.os.open
+
+    def reject_final_open(path, flags, mode=0o777, *, dir_fd=None):
+        if dir_fd is not None and path == source.name:
+            raise AssertionError("special final components must be classified by lstat")
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(planner_module.os, "open", reject_final_open)
+    try:
+        TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+            PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+        )
+    finally:
+        if listener is not None:
+            listener.close()
+            source.unlink(missing_ok=True)
+
+    items = repository.persisted
+    assert len(items) == 1
+    assert items[0].relative_path.as_posix() == source.name
+    assert items[0].state is ItemState.SKIPPED

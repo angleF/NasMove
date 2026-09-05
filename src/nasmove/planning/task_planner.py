@@ -274,20 +274,10 @@ class TaskPlanner:
 
     @staticmethod
     def _source_identity(source: Path) -> tuple[int, int]:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        parent_fd = os.open(os.sep, flags | os.O_DIRECTORY)
+        parent_fd = TaskPlanner._open_parent(source)
         try:
-            parts = source.parts
-            for component in parts[1:-1]:
-                next_fd = os.open(component, flags | os.O_DIRECTORY, dir_fd=parent_fd)
-                os.close(parent_fd)
-                parent_fd = next_fd
-            final_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
-            try:
-                info = os.fstat(final_fd)
-                return info.st_dev, info.st_ino
-            finally:
-                os.close(final_fd)
+            info = os.stat(source.name, dir_fd=parent_fd, follow_symlinks=False)
+            return info.st_dev, info.st_ino
         except OSError as exc:
             if exc.errno in {ELOOP, ENOTDIR}:
                 raise DomainValidationError("source path or an ancestor must not be a symlink") from exc
@@ -295,30 +285,57 @@ class TaskPlanner:
         finally:
             os.close(parent_fd)
 
-    def _scan(self, root: Path) -> Iterator[_Discovered]:
-        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-        parts = root.parts
-        parent_fd = os.open(os.sep, flags | os.O_DIRECTORY)
+    @staticmethod
+    def _open_parent(source: Path) -> int:
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = os.open(os.sep, flags)
         try:
-            for component in parts[1:-1]:
-                next_fd = os.open(component, flags | os.O_DIRECTORY, dir_fd=parent_fd)
+            for component in source.parts[1:-1]:
+                next_fd = os.open(component, flags, dir_fd=parent_fd)
                 os.close(parent_fd)
                 parent_fd = next_fd
-            final_fd = os.open(parts[-1], flags, dir_fd=parent_fd)
-            try:
-                info = os.fstat(final_fd)
-                if stat.S_ISREG(info.st_mode):
-                    yield _Discovered(
-                        str(root), root, PurePosixPath(root.name), self._fingerprint(info), ItemState.PLANNED
-                    )
-                elif stat.S_ISDIR(info.st_mode):
-                    yield from self._scan_directory_fd(final_fd, root, PurePosixPath(root.name), flags, str(root))
-                else:
-                    yield _Discovered(
-                        str(root), root, PurePosixPath(root.name), self._synthetic_fingerprint(info), ItemState.SKIPPED
-                    )
-            finally:
-                os.close(final_fd)
+            return parent_fd
+        except OSError as exc:
+            os.close(parent_fd)
+            if exc.errno in {ELOOP, ENOTDIR}:
+                raise DomainValidationError("source path or an ancestor must not be a symlink") from exc
+            raise
+
+    def _scan(self, root: Path) -> Iterator[_Discovered]:
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = self._open_parent(root)
+        try:
+            info = os.stat(root.name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode) or not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+                yield _Discovered(
+                    str(root), root, PurePosixPath(root.name), self._synthetic_fingerprint(info), ItemState.SKIPPED
+                )
+            elif stat.S_ISREG(info.st_mode):
+                final_fd = os.open(root.name, flags, dir_fd=parent_fd)
+                try:
+                    bound = os.fstat(final_fd)
+                    if stat.S_ISREG(bound.st_mode):
+                        yield _Discovered(
+                            str(root), root, PurePosixPath(root.name), self._fingerprint(bound), ItemState.PLANNED
+                        )
+                    else:
+                        yield _Discovered(
+                            str(root), root, PurePosixPath(root.name), self._synthetic_fingerprint(bound), ItemState.SKIPPED
+                        )
+                finally:
+                    os.close(final_fd)
+            else:
+                final_fd = os.open(root.name, flags | os.O_DIRECTORY, dir_fd=parent_fd)
+                try:
+                    bound = os.fstat(final_fd)
+                    if stat.S_ISDIR(bound.st_mode):
+                        yield from self._scan_directory_fd(final_fd, root, PurePosixPath(root.name), flags, str(root))
+                    else:
+                        yield _Discovered(
+                            str(root), root, PurePosixPath(root.name), self._synthetic_fingerprint(bound), ItemState.SKIPPED
+                        )
+                finally:
+                    os.close(final_fd)
         except OSError as exc:
             if exc.errno in {ELOOP, ENOTDIR}:
                 raise DomainValidationError("source path or an ancestor must not be a symlink") from exc
