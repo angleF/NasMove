@@ -33,3 +33,39 @@ def test_smb_url_is_split_into_host_share_and_path() -> None:
 def test_parent_escape_is_rejected() -> None:
     with pytest.raises(InvalidRemotePath):
         normalize_remote_path("archive/../../private")
+
+
+@pytest.mark.parametrize(
+    ("value", "host", "port"),
+    [
+        ("nas.local:1445/archive/photos", "nas.local", 1445),
+        ("[2001:db8::20]:1445/archive/photos", "2001:db8::20", 1445),
+        ("smb://nas.local:1445/archive/photos", "nas.local", 1445),
+    ],
+)
+def test_address_parses_explicit_port(value: str, host: str, port: int) -> None:
+    parsed = parse_smb_address(value)
+
+    assert (parsed.host, parsed.port) == (host, port)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "smb://user:secret@nas.local/archive",
+        "smb://nas.local:/archive",
+        "smb://nas.local:0/archive",
+        "smb://nas.local:65536/archive",
+        "nas.local:/archive",
+        "[2001:db8::20]:/archive",
+    ],
+)
+def test_address_rejects_userinfo_empty_or_invalid_ports(value: str) -> None:
+    with pytest.raises(ValueError):
+        parse_smb_address(value)
+
+
+@pytest.mark.parametrize("value", ["smb://nas.local/bad<share", "smb://nas.local/share/bad>"])
+def test_address_applies_smb_name_rules_to_share_and_initial_path(value: str) -> None:
+    with pytest.raises(ValueError):
+        parse_smb_address(value)

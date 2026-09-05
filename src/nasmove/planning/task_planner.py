@@ -3,12 +3,12 @@ from __future__ import annotations
 import os
 import stat
 import uuid
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from errno import ENOENT
+from errno import ELOOP, ENOENT, ENOTDIR
 from pathlib import Path, PurePosixPath
-from typing import Any, Protocol
+from typing import Protocol
 
 from nasmove.core.errors import DomainValidationError
 from nasmove.core.model import (
@@ -35,6 +35,16 @@ from nasmove.planning.paths import normalize_remote_path
 
 class LocalFileGateway(Protocol):
     def fingerprint(self, path: Path) -> SourceFingerprint: ...
+
+
+class PlanRepository(Protocol):
+    """Atomically persist one task and its bounded item batches."""
+
+    def persist_plan(
+        self,
+        task: TaskRecord,
+        batches: Iterable[Sequence[TransferItemRecord]],
+    ) -> None: ...
 
 
 @dataclass(frozen=True, slots=True, init=False)
@@ -76,7 +86,7 @@ class PlanRequest:
         object.__setattr__(self, "name", name)
         object.__setattr__(self, "connection", connection)
         object.__setattr__(self, "sources", tuple(Path(path) for path in sources))
-        object.__setattr__(self, "target_root", target_root)
+        object.__setattr__(self, "target_root", normalize_remote_path(target_root.value))
         object.__setattr__(self, "action", action)
         object.__setattr__(self, "conflict_policy", conflict_policy)
         object.__setattr__(self, "verification_policy", verification_policy)
@@ -91,7 +101,7 @@ class PlanRequest:
 @dataclass(frozen=True, slots=True)
 class PlannedTask:
     task: TaskRecord
-    items: tuple[TransferItemRecord, ...]
+    item_count: int
     total_bytes: int
     safety_margin: int
     required_space: int
@@ -118,39 +128,16 @@ class TaskPlanner:
         self,
         local_gateway: LocalFileGateway,
         smb_gateway: SmbGateway,
-        repository: Any | None = None,
-        *,
-        batch_sink: Callable[[Sequence[TransferItemRecord]], None] | None = None,
+        repository: PlanRepository | None = None,
     ) -> None:
         self._local = local_gateway
         self._smb = smb_gateway
         self._repository = repository
-        self._batch_sink = batch_sink
 
     def plan(self, request: PlanRequest) -> PlannedTask:
-        occupied: dict[str, set[str]] = {}
-        mapped: dict[tuple[str, ...], str] = {}
-        items: list[TransferItemRecord] = []
-        batch: list[TransferItemRecord] = []
-        total_bytes = 0
-        total_files = 0
+        sources = self._validate_sources(request.sources)
+        total_bytes, total_files, item_count = self._summarize(sources)
         task_id = request.task_id or TaskId(str(uuid.uuid4()))
-
-        for source in request.sources:
-            absolute = Path(os.path.abspath(source))
-            for discovered in self._scan(absolute):
-                if discovered.state is ItemState.PLANNED and discovered.fingerprint.kind is SourceKind.FILE:
-                    total_bytes += discovered.fingerprint.size
-                    total_files += 1
-                item = self._make_item(request, discovered, occupied, mapped, task_id)
-                items.append(item)
-                batch.append(item)
-                if len(batch) == self.BATCH_SIZE:
-                    self._save_batch(batch)
-                    batch.clear()
-        if batch:
-            self._save_batch(batch)
-
         safety_margin = max(self.SAFETY_MINIMUM, (total_bytes * 5 + 99) // 100)
         required_space = total_bytes + safety_margin
         free_space = self._smb.free_space(request.target_root)
@@ -176,7 +163,48 @@ class TaskPlanner:
             created_at=now,
             updated_at=now,
         )
-        return PlannedTask(task, tuple(items), total_bytes, safety_margin, required_space, free_space)
+        if self._repository is not None:
+            self._repository.persist_plan(task, self._iter_batches(request, sources, task_id))
+        return PlannedTask(task, item_count, total_bytes, safety_margin, required_space, free_space)
+
+    def _summarize(self, sources: Sequence[Path]) -> tuple[int, int, int]:
+        total_bytes = 0
+        total_files = 0
+        item_count = 0
+        for source in sources:
+            for discovered in self._scan(source):
+                item_count += 1
+                if discovered.state is ItemState.PLANNED and discovered.fingerprint.kind is SourceKind.FILE:
+                    total_bytes += discovered.fingerprint.size
+                    total_files += 1
+        return total_bytes, total_files, item_count
+
+    def _iter_batches(
+        self,
+        request: PlanRequest,
+        sources: Sequence[Path],
+        task_id: TaskId,
+    ) -> Iterator[tuple[TransferItemRecord, ...]]:
+        occupied: dict[str, set[str]] = {}
+        mapped: dict[tuple[str, ...], str] = {}
+        batch: list[TransferItemRecord] = []
+        for source in sources:
+            for discovered in self._scan(source):
+                batch.append(self._make_item(request, discovered, occupied, mapped, task_id))
+                if len(batch) == self.BATCH_SIZE:
+                    yield tuple(batch)
+                    batch.clear()
+        if batch:
+            yield tuple(batch)
+
+    @staticmethod
+    def _validate_sources(sources: Sequence[Path]) -> tuple[Path, ...]:
+        normalized = tuple(Path(os.path.abspath(source)) for source in sources)
+        for index, source in enumerate(normalized):
+            for other in normalized[index + 1 :]:
+                if source == other or source in other.parents or other in source.parents:
+                    raise DomainValidationError("source paths must not duplicate or overlap")
+        return normalized
 
     def _scan(self, root: Path) -> Iterator[_Discovered]:
         info = root.lstat()
@@ -193,28 +221,60 @@ class TaskPlanner:
         yield from self._scan_directory(root, PurePosixPath(root.name))
 
     def _scan_directory(self, directory: Path, relative: PurePosixPath) -> Iterator[_Discovered]:
-        entries = sorted(os.scandir(directory), key=lambda entry: entry.name)
-        if not entries:
+        flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            directory_fd = os.open(directory, flags)
+        except OSError as exc:
+            if exc.errno not in {ELOOP, ENOTDIR}:
+                raise
             info = directory.lstat()
-            yield _Discovered(
-                directory,
-                relative,
-                SourceFingerprint(info.st_dev, info.st_ino, SourceKind.EMPTY_DIRECTORY, 0, info.st_mtime_ns),
-                ItemState.PLANNED,
-            )
+            yield _Discovered(directory, relative, self._synthetic_fingerprint(info), ItemState.SKIPPED)
             return
-        for entry in entries:
-            path = Path(entry.path)
-            child_relative = relative / entry.name
-            info = entry.stat(follow_symlinks=False)
-            if stat.S_ISLNK(info.st_mode):
-                yield _Discovered(path, child_relative, self._synthetic_fingerprint(info), ItemState.SKIPPED)
-            elif stat.S_ISREG(info.st_mode):
-                yield _Discovered(path, child_relative, self._local.fingerprint(path), ItemState.PLANNED)
-            elif stat.S_ISDIR(info.st_mode):
-                yield from self._scan_directory(path, child_relative)
-            else:
-                yield _Discovered(path, child_relative, self._synthetic_fingerprint(info), ItemState.SKIPPED)
+        try:
+            yield from self._scan_directory_fd(directory_fd, directory, relative, flags)
+        finally:
+            os.close(directory_fd)
+
+    def _scan_directory_fd(
+        self,
+        directory_fd: int,
+        directory: Path,
+        relative: PurePosixPath,
+        flags: int,
+    ) -> Iterator[_Discovered]:
+        with os.scandir(directory_fd) as iterator:
+            entries = sorted(iterator, key=lambda entry: entry.name)
+            if not entries:
+                info = os.fstat(directory_fd)
+                yield _Discovered(
+                    directory,
+                    relative,
+                    SourceFingerprint(info.st_dev, info.st_ino, SourceKind.EMPTY_DIRECTORY, 0, info.st_mtime_ns),
+                    ItemState.PLANNED,
+                )
+                return
+            for entry in entries:
+                path = directory / entry.name
+                child_relative = relative / entry.name
+                info = entry.stat(follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode):
+                    yield _Discovered(path, child_relative, self._synthetic_fingerprint(info), ItemState.SKIPPED)
+                elif stat.S_ISREG(info.st_mode):
+                    yield _Discovered(path, child_relative, self._local.fingerprint(path), ItemState.PLANNED)
+                elif stat.S_ISDIR(info.st_mode):
+                    try:
+                        child_fd = os.open(entry.name, flags, dir_fd=directory_fd)
+                    except OSError as exc:
+                        if exc.errno not in {ELOOP, ENOTDIR}:
+                            raise
+                        yield _Discovered(path, child_relative, self._synthetic_fingerprint(info), ItemState.SKIPPED)
+                    else:
+                        try:
+                            yield from self._scan_directory_fd(child_fd, path, child_relative, flags)
+                        finally:
+                            os.close(child_fd)
+                else:
+                    yield _Discovered(path, child_relative, self._synthetic_fingerprint(info), ItemState.SKIPPED)
 
     def _make_item(
         self,
@@ -240,12 +300,12 @@ class TaskPlanner:
             target_parts.append(mapped[key])
         final_value = f"{request.target_root.value}/{('/'.join(target_parts))}"
         final_path = normalize_remote_path(final_value)
-        name = target_parts[-1]
+        item_id = TransferItemId(str(uuid.uuid4()))
         temp_path = normalize_remote_path(
-            f"{request.target_root.value}/{('/'.join(target_parts[:-1] + [f'.{name}.part']))}"
+            f"{request.target_root.value}/{('/'.join(target_parts[:-1] + [f'.nasmove-{item_id}.part']))}"
         )
         return TransferItemRecord(
-            id=TransferItemId(str(uuid.uuid4())),
+            id=item_id,
             task_id=task_id,
             source_path=discovered.path,
             relative_path=discovered.relative_path,
@@ -262,17 +322,6 @@ class TaskPlanner:
             if exc.errno == ENOENT:
                 return set()
             raise
-
-    def _save_batch(self, batch: Sequence[TransferItemRecord]) -> None:
-        frozen = tuple(batch)
-        if self._batch_sink is not None:
-            self._batch_sink(frozen)
-        if self._repository is not None:
-            for method_name in ("save_item_batch", "save_items_batch", "save_batch", "save_items", "append_items"):
-                method = getattr(self._repository, method_name, None)
-                if method is not None:
-                    method(frozen)
-                    break
 
     @staticmethod
     def _synthetic_fingerprint(info: os.stat_result) -> SourceFingerprint:

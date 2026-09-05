@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import os
+import shutil
 from pathlib import Path
 
+import pytest
+
+import nasmove.planning.task_planner as planner_module
+from nasmove.core.errors import DomainValidationError
 from nasmove.core.model import ConnectionConfig, ConnectionProfileId, RemotePath
 from nasmove.core.ports import RemoteEntry
 from nasmove.core.states import ItemState, SourceKind
@@ -24,17 +29,45 @@ class LocalGateway:
 
 
 class SmbGateway:
-    def __init__(self, free_space: int = 1 << 40) -> None:
+    def __init__(self, free_space: int = 1 << 40, events: list[str] | None = None) -> None:
         self.free_space_value = free_space
-        self.batches: list[tuple[object, ...]] = []
+        self.list_calls: list[str] = []
+        self.events = events
 
     def list_dir(self, path: RemotePath) -> list[RemoteEntry]:
-        del path
+        self.list_calls.append(path.value)
         return []
 
     def free_space(self, path: RemotePath) -> int:
         del path
+        if self.events is not None:
+            self.events.append("free_space")
         return self.free_space_value
+
+
+class AtomicRepository:
+    def __init__(self, *, fail: bool = False, events: list[str] | None = None) -> None:
+        self.fail = fail
+        self.calls: list[str] = []
+        self.persisted: tuple[object, ...] = ()
+        self.events = events
+
+    def persist_plan(self, task: object, batches: object) -> None:
+        del task
+        self.calls.append("persist_plan")
+        if self.events is not None:
+            self.events.append("persist_plan")
+        pending: list[object] = []
+        try:
+            for batch in batches:
+                assert len(batch) <= 1000
+                pending.extend(batch)
+                if self.fail:
+                    raise RuntimeError("simulated transaction failure")
+        except Exception:
+            pending.clear()
+            raise
+        self.persisted = tuple(pending)
 
 
 def config() -> ConnectionConfig:
@@ -56,7 +89,8 @@ def test_planner_preserves_top_level_and_skips_links_and_special_files(tmp_path:
     fifo = source / "pipe"
     os.mkfifo(fifo)
 
-    planned = TaskPlanner(LocalGateway(), SmbGateway()).plan(
+    repository = AtomicRepository()
+    planned = TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
         PlanRequest(
             name="copy",
             connection=config(),
@@ -66,7 +100,7 @@ def test_planner_preserves_top_level_and_skips_links_and_special_files(tmp_path:
     )
 
     assert isinstance(planned, PlannedTask)
-    paths = {item.relative_path.as_posix(): item for item in planned.items}
+    paths = {item.relative_path.as_posix(): item for item in repository.persisted}
     assert "Source/nested/file.txt" in paths
     assert paths["Source/link.txt"].state is ItemState.SKIPPED
     assert paths["Source/pipe"].state is ItemState.SKIPPED
@@ -78,13 +112,15 @@ def test_empty_directory_is_planned() -> None:
     with tempfile.TemporaryDirectory() as directory:
         source = Path(directory) / "Empty"
         source.mkdir()
-        planned = TaskPlanner(LocalGateway(), SmbGateway()).plan(
+        repository = AtomicRepository()
+        planned = TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
             PlanRequest("copy", config(), (source,), RemotePath("incoming"))
         )
 
-    assert len(planned.items) == 1
-    assert planned.items[0].source_fingerprint.kind is SourceKind.EMPTY_DIRECTORY
-    assert planned.items[0].state is ItemState.PLANNED
+    assert planned.item_count == 1
+    item = repository.persisted[0]
+    assert item.source_fingerprint.kind is SourceKind.EMPTY_DIRECTORY
+    assert item.state is ItemState.PLANNED
 
 
 def test_planner_batches_every_thousand_items(tmp_path: Path) -> None:
@@ -92,13 +128,13 @@ def test_planner_batches_every_thousand_items(tmp_path: Path) -> None:
     source.mkdir()
     for index in range(1001):
         (source / f"{index}.txt").write_text("x")
-    sink: list[tuple[object, ...]] = []
+    repository = AtomicRepository()
 
-    TaskPlanner(LocalGateway(), SmbGateway(), batch_sink=sink.append).plan(
+    TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
         PlanRequest("copy", config(), (source,), RemotePath("incoming"))
     )
 
-    assert [len(batch) for batch in sink] == [1000, 1]
+    assert len(repository.persisted) == 1001
 
 
 def test_space_reserve_is_one_gib_or_five_percent(tmp_path: Path) -> None:
@@ -112,3 +148,127 @@ def test_space_reserve_is_one_gib_or_five_percent(tmp_path: Path) -> None:
 
     assert planned.safety_margin == 1 << 30
     assert planned.required_space == (1 << 30) + 10
+
+
+def test_space_check_precedes_persistence(tmp_path: Path) -> None:
+    source = tmp_path / "file.bin"
+    source.write_bytes(b"x")
+    repository = AtomicRepository()
+
+    with pytest.raises(DomainValidationError):
+        TaskPlanner(LocalGateway(), SmbGateway(free_space=0), repository).plan(
+            PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+        )
+
+    assert repository.calls == []
+    assert repository.persisted == ()
+
+
+def test_successful_space_check_precedes_persistence(tmp_path: Path) -> None:
+    source = tmp_path / "file.bin"
+    source.write_bytes(b"x")
+    events: list[str] = []
+    repository = AtomicRepository(events=events)
+    gateway = SmbGateway(events=events)
+
+    TaskPlanner(LocalGateway(), gateway, repository).plan(
+        PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+    )
+
+    assert events[:2] == ["free_space", "persist_plan"]
+
+
+def test_repository_failure_rolls_back_plan() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        source = Path(directory) / "file.txt"
+        source.write_text("payload")
+        repository = AtomicRepository(fail=True)
+        with pytest.raises(RuntimeError):
+            TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+                PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+            )
+    assert repository.persisted == ()
+
+
+def test_sources_must_not_overlap(tmp_path: Path) -> None:
+    directory = tmp_path / "source"
+    directory.mkdir()
+    child = directory / "child.txt"
+    child.write_text("payload")
+    subdirectory = directory / "subdirectory"
+    subdirectory.mkdir()
+
+    for sources in ((directory, directory), (directory, child), (directory, subdirectory)):
+        repository = AtomicRepository()
+        with pytest.raises(DomainValidationError):
+            TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+                PlanRequest("copy", config(), sources, RemotePath("incoming"))
+            )
+        assert repository.calls == []
+
+
+def test_remote_directory_is_listed_once(tmp_path: Path) -> None:
+    source = tmp_path / "Source"
+    (source / "nested").mkdir(parents=True)
+    (source / "nested" / "file.txt").write_text("payload")
+    gateway = SmbGateway()
+    repository = AtomicRepository()
+    TaskPlanner(LocalGateway(), gateway, repository).plan(
+        PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+    )
+
+    assert gateway.list_calls.count("incoming") == 1
+    assert gateway.list_calls.count("incoming/Source") == 1
+
+
+def test_temp_names_are_unique_across_tasks_with_same_source_name(tmp_path: Path) -> None:
+    source = tmp_path / "same-name.txt"
+    source.write_text("payload")
+    first_repository = AtomicRepository()
+    second_repository = AtomicRepository()
+
+    first = TaskPlanner(LocalGateway(), SmbGateway(), first_repository).plan(
+        PlanRequest("first", config(), (source,), RemotePath("incoming"))
+    )
+    second = TaskPlanner(LocalGateway(), SmbGateway(), second_repository).plan(
+        PlanRequest("second", config(), (source,), RemotePath("incoming"))
+    )
+
+    first_item = first_repository.persisted[0]
+    second_item = second_repository.persisted[0]
+    assert first_item.temp_path.value == f"incoming/.nasmove-{first_item.id}.part"
+    assert second_item.temp_path.value == f"incoming/.nasmove-{second_item.id}.part"
+    assert first_item.temp_path != second_item.temp_path
+    assert first.task.id != second.task.id
+
+
+def test_directory_replaced_by_symlink_is_not_followed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "Source"
+    nested = source / "nested"
+    nested.mkdir(parents=True)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret")
+    repository = AtomicRepository()
+    real_open = planner_module.os.open
+    replaced = False
+
+    def replacing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        if dir_fd is not None and path == "nested" and not replaced:
+            shutil.rmtree(nested)
+            os.symlink(outside, nested)
+            replaced = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(planner_module.os, "open", replacing_open)
+    TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+        PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+    )
+
+    items = repository.persisted
+    assert len(items) == 1
+    assert items[0].relative_path.as_posix() == "Source/nested"
+    assert items[0].state is ItemState.SKIPPED
