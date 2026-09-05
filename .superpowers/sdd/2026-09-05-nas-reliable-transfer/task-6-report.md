@@ -140,3 +140,33 @@ Success: no issues found in 18 source files
 - 路径和认证信息按行 fail-closed 可能吞掉同一行后续普通诊断文本，这是避免残片泄露的有意取舍。
 - LogRecordFactory 是进程级 logging 钩子，但只处理 `nasmove` 及其子命名空间；重复配置不会递归包装。
 - 本轮修复提交为 `3a3f3f37738bef606b09459fb8dcc2c4a76dd816`（`fix: close remaining logging bypasses`）。
+
+## 独立审查修复轮次 3／5
+
+### RED／GREEN
+
+新增动态子 logger 自有普通 FileHandler、`propagate=False` 且通过 `extra` 注入嵌套认证字段的回归测试；修复前该测试暴露 `POST_FACTORY_SECRET` 与嵌套认证值。修复后：
+
+```text
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest tests/unit/security -q
+27 passed
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest -q
+590 passed, 1 skipped
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/ruff check src/nasmove/security tests/unit/security tests/fixtures/security.py tests/conftest.py
+All checks passed!
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/mypy src/nasmove
+Success: no issues found in 18 source files
+```
+
+### 处理证据
+
+- `Logger.makeRecord` 包装器在标准实现完成 `extra` 写入后调用同一 `RedactingFilter`，因此动态 `nasmove.*` logger 的普通 handler 也只能接收清洗后的记录；非 NasMove logger 仍走原始路径。
+- 全局 LogRecordFactory 继续负责 factory 阶段的消息、参数和异常清洗；原始 factory 链被保存并复用，配置通过锁保证幂等安装，避免递归包装。
+- 回归覆盖普通 extra、嵌套 mapping 认证字段以及 formatter 实际输出，确认敏感值不落盘。
+
+### 提交
+
+本轮修复提交为 `ccd36a7097893e2dfaa5e5509dad627126c3c33c`（`fix: sanitize logging extra fields`）。
