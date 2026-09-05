@@ -110,3 +110,33 @@ Success: no issues found in 18 source files
 - macOS ACL 输出格式依赖系统 `/bin/ls -lde`，升级系统时应复核 ACL 解析测试；非 macOS 明确不执行 ACL 命令。
 - 过滤器对异常或恶意对象采用 fail-closed，极端日志对象可能只保留 `<redacted>`，这是安全优先的预期损失。
 - 实现提交仍为 `a41367f3621dc07cd448388bd372dfd23c06ffbf`；本轮修复提交为 `5f72d79d9ef44c773cb02681857613d1f82fe19d`（`fix: close credential and logging leaks`）。
+
+## 独立审查修复轮次 2／5
+
+### RED／GREEN
+
+针对最终复审的 4 项 Important 先补充回归测试；修复前安全定向测试为 `4 failed, 22 passed`。修复后：
+
+```text
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest tests/unit/security -q
+26 passed
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/ruff check src/nasmove/security tests/unit/security tests/fixtures/security.py tests/conftest.py
+All checks passed!
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/mypy src/nasmove
+Success: no issues found in 18 source files
+```
+
+### 逐项处理证据
+
+1. `task_id`、`item_id`、`error_category`、`error_code` 仅接受长度受限的安全 ASCII 标识，并仍执行完整文本 sanitizer；嵌套 mapping 与 `LogRecord` extra 中的非法值统一为 `<redacted-field>`。
+2. 敏感键值、Authorization、Bearer、Basic、NTLM 认证头统一 fail-closed 到行尾，覆盖逗号、分号、空格和 Unicode，Formatter 输出不含秘密片段。
+3. 路径处理覆盖任意 POSIX 绝对路径、`~` 路径、UNC／SMB 路径和带分隔符的相对路径；先保护 URL／认证，再整体路径替换，带空格路径不会截断泄露目录片段。
+4. configure_logging 安装一次仅作用于 `nasmove` 命名空间的全局 LogRecordFactory，保存并复用原 factory；配置后动态创建 `nasmove.*` logger 即使自带普通 handler 且 `propagate=False`，创建时记录也已完成脱敏，非 NasMove logger 不受影响。
+
+### 风险
+
+- 路径和认证信息按行 fail-closed 可能吞掉同一行后续普通诊断文本，这是避免残片泄露的有意取舍。
+- LogRecordFactory 是进程级 logging 钩子，但只处理 `nasmove` 及其子命名空间；重复配置不会递归包装。
+- 本轮修复提交为 `3a3f3f37738bef606b09459fb8dcc2c4a76dd816`（`fix: close remaining logging bypasses`）。
