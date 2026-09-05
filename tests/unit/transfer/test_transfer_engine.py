@@ -46,6 +46,27 @@ def test_verification_failure_retains_source_and_fails_task(engine_fixture) -> N
     assert engine_fixture.repository.get_item(engine_fixture.item.id).state is ItemState.VERIFY_FAILED
 
 
+def test_committer_owns_committed_transition_and_engine_continues_to_delete(engine_fixture) -> None:
+    result = engine_fixture.engine.run_task(engine_fixture.move_task.id, engine_fixture.token)
+
+    assert result.success is True
+    assert engine_fixture.repository.get_item(engine_fixture.item.id).state is ItemState.COMMITTED
+    assert engine_fixture.events[-1].state is TaskState.COMPLETED
+
+
+def test_item_enumeration_failure_is_persisted_and_published(engine_fixture) -> None:
+    def fail_list(_task_id):
+        raise OSError("database unavailable")
+
+    engine_fixture.repository.list_items = fail_list
+    result = engine_fixture.engine.run_task(engine_fixture.move_task.id, engine_fixture.token)
+
+    assert result.success is False
+    assert result.state is TaskState.FAILED
+    assert engine_fixture.repository.get_task(engine_fixture.move_task.id).state is TaskState.FAILED
+    assert engine_fixture.events[-1].error is not None
+
+
 def test_task_result_is_immutable_and_has_safe_default_error() -> None:
     result = TaskResult(success=True, state=TaskState.COMPLETED)
     assert result.error is None

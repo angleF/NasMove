@@ -743,14 +743,16 @@ class EngineCopyWriter:
 
 
 class EngineCommitter:
-    def __init__(self, trace: list[str]) -> None:
+    def __init__(self, trace: list[str], repository: TransferRepository) -> None:
         self.trace = trace
+        self.repository = repository
 
     def commit(self, item, verification):
         from nasmove.transfer.commit import CommitResult
 
         del verification
         self.trace.append("commit")
+        self.repository.transition_item(item.id, ItemState.VERIFIED, ItemState.COMMITTED)
         return CommitResult(item.final_path, item.source_fingerprint.size, "file-engine")
 
 
@@ -817,7 +819,7 @@ def engine_fixture() -> EngineFixture:
         recovery=Recovery(),
         checkpoint_writer=EngineCopyWriter(trace),
         verifier=verifier,
-        committer=EngineCommitter(trace),
+        committer=EngineCommitter(trace, repository),
         deletion_service=EngineDeletion(trace),
         session=SessionInfo("3.1.1", True, True, 1),
         event_sink=Sink(),
@@ -829,7 +831,11 @@ def engine_fixture() -> EngineFixture:
 class QueueFixture:
     coordinator: object
     completed_order: list[str]
-    max_concurrent_tasks: int = 0
+    statistics: dict[str, int]
+
+    @property
+    def max_concurrent_tasks(self) -> int:
+        return self.statistics["max_concurrent_tasks"]
 
     def enqueue(self, task_id: str) -> None:
         self.coordinator.enqueue(task_id)
@@ -837,7 +843,6 @@ class QueueFixture:
     def run_until_empty(self) -> None:
         while self.coordinator.run_next() is not None:
             pass
-        self.max_concurrent_tasks = 1 if self.completed_order else 0
 
 
 @pytest.fixture
@@ -847,18 +852,15 @@ def queue_fixture() -> QueueFixture:
 
     completed_order: list[str] = []
     active = 0
-    maximum = 0
+    statistics = {"max_concurrent_tasks": 0}
 
     class Engine:
         def run_task(self, task_id, token):
-            nonlocal active, maximum
+            nonlocal active
             active += 1
-            maximum = max(maximum, active)
+            statistics["max_concurrent_tasks"] = max(statistics["max_concurrent_tasks"], active)
             completed_order.append(str(task_id))
             active -= 1
             return TaskResult(True, TaskState.COMPLETED)
 
-    fixture = QueueFixture(QueueCoordinator(Engine()), completed_order)
-    fixture.__dict__["_active"] = lambda: active
-    fixture.__dict__["_maximum"] = lambda: maximum
-    return fixture
+    return QueueFixture(QueueCoordinator(Engine()), completed_order, statistics)

@@ -455,6 +455,13 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
             raise KeyError(f"item not found: {item_id}")
         return self._item_from_row(row)
 
+    def list_items(self, task_id: TaskId) -> list[TransferItemRecord]:
+        rows = self._connection.execute(
+            "SELECT * FROM transfer_items WHERE task_id = ? ORDER BY item_id",
+            (str(task_id),),
+        )
+        return [self._item_from_row(row) for row in rows]
+
     def next_queued_task(self) -> TaskRecord | None:
         row = self._connection.execute(
             "SELECT * FROM tasks WHERE state = ? ORDER BY queue_position, created_at, task_id LIMIT 1",

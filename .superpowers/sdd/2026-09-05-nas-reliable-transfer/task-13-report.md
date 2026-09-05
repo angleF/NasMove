@@ -66,3 +66,21 @@ git diff --check
 ## 提交
 
 提交信息：`feat: orchestrate serial reliable transfers`
+
+## 独立复审修复
+
+复审发现并修复以下问题：
+
+- `TargetCommitter.commit()` 已负责 metadata 持久化和 `VERIFIED → COMMITTED`，引擎不再重复迁移；提交后重新读取项目状态，再继续 MOVE 删除或 COPY 完成。
+- `Repository` 正式声明 `list_items(task_id)`；`SqliteTaskRepository` 按 `item_id` 稳定顺序返回项目，引擎移除 fixture-only 映射回退。枚举异常会将任务持久化为 `FAILED` 后发布事件。
+- `QueueCoordinator.run_next()` 将取任务、空队列和引擎调用统一置于 `try/finally`，任何异常或连续空队列轮询都会正确释放锁。
+- 测试夹具的提交器现在模拟真实提交器的状态 CAS，队列并发统计来自实际执行计数，不再手工伪造最大并发值。
+
+修复前新增回归测试按预期失败（7 failed）；修复后定向测试：
+
+```text
+python -m pytest tests/unit/transfer/test_transfer_engine.py tests/unit/transfer/test_queue.py tests/unit/persistence/test_repository.py -q
+52 passed
+```
+
+本轮修复提交信息：`fix: close transfer orchestration review findings`

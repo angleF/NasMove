@@ -20,6 +20,8 @@ class EventSink(Protocol):
 class Repository(Protocol):
     def get_task(self, task_id: TaskId) -> TaskRecord: ...
 
+    def list_items(self, task_id: TaskId) -> list[TransferItemRecord]: ...
+
     def get_item(self, item_id: TransferItemId) -> TransferItemRecord: ...
 
     def transition_task(self, task_id: TaskId, expected: TaskState, target: TaskState) -> None: ...
@@ -136,7 +138,10 @@ class TransferEngine:
         if task.state is TaskState.CANCELED:
             return TaskResult(False, TaskState.CANCELED)
         self._transition_task_if_needed(task, TaskState.RUNNING)
-        items = self._items_for(task_id)
+        try:
+            items = list(self._repository.list_items(task_id))
+        except Exception as error:  # noqa: BLE001 - persistence failure must be durable and visible
+            return self._fail_task(task, error, None)
         completed = 0
         warnings: list[str] = []
 
@@ -231,8 +236,9 @@ class TransferEngine:
             self._safe_item_transition(item, ItemState.VERIFIED)
             item = self._repository.get_item(item.id)
             committer.commit(item, verification)
-            self._safe_item_transition(item, ItemState.COMMITTED)
             item = self._repository.get_item(item.id)
+            if item.state is not ItemState.COMMITTED:
+                raise RuntimeError("target committer did not persist committed state")
             return self._delete_if_needed(item, task, session)
         except Exception as error:  # noqa: BLE001 - boundary failures need durable classification
             if item.state in {
@@ -268,16 +274,6 @@ class TransferEngine:
             return method(item, offset, session, token=token)
         return method(item, offset, session)
 
-    def _items_for(self, task_id: TaskId) -> list[TransferItemRecord]:
-        for name in ("list_items", "items_for_task", "get_items"):
-            method = getattr(self._repository, name, None)
-            if callable(method):
-                return list(method(task_id))
-        items = getattr(self._repository, "items", None)
-        if isinstance(items, dict):
-            return [item for item in items.values() if item.task_id == task_id]
-        raise TypeError("repository must provide list_items(task_id)")
-
     def _session_for(self, task: TaskRecord) -> SessionInfo:
         if self._session is not None:
             return self._session
@@ -308,14 +304,14 @@ class TransferEngine:
         self,
         task: TaskRecord,
         error: BaseException,
-        item: TransferItemRecord,
+        item: TransferItemRecord | None,
         *,
         state: TaskState = TaskState.FAILED,
     ) -> TaskResult:
         current = self._repository.get_task(task.id)
         if current.state is not state:
             self._transition_task_if_needed(current, state)
-        self._publish(TransferEvent(task.id, state, item.id, error, "failed"))
+        self._publish(TransferEvent(task.id, state, None if item is None else item.id, error, "failed"))
         return TaskResult(False, state, error=error)
 
     def _finish(
@@ -362,16 +358,16 @@ class QueueCoordinator:
     def run_next(self, token: CancellationToken | None = None) -> TaskResult | None:
         if not self._run_lock.acquire(blocking=False):
             raise RuntimeError("queue coordinator is already running a task")
-        task_id: TaskId | None = self._queue.pop(0) if self._queue else None
-        if task_id is None and self._repository is not None:
-            next_task = getattr(self._repository, "next_queued_task", None)
-            if not callable(next_task):
-                raise TypeError("queue repository must provide next_queued_task()")
-            task = next_task()
-            task_id = None if task is None else task.id
-        if task_id is None:
-            return None
         try:
+            task_id: TaskId | None = self._queue.pop(0) if self._queue else None
+            if task_id is None and self._repository is not None:
+                next_task = getattr(self._repository, "next_queued_task", None)
+                if not callable(next_task):
+                    raise TypeError("queue repository must provide next_queued_task()")
+                task = next_task()
+                task_id = None if task is None else task.id
+            if task_id is None:
+                return None
             return self._engine.run_task(task_id, token or CancellationToken())
         finally:
             self._run_lock.release()

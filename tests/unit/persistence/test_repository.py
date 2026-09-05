@@ -85,6 +85,17 @@ def test_task_and_item_round_trip_preserves_all_fields(tmp_path) -> None:
     repository.close()
 
 
+def test_list_items_returns_planning_order_deterministically(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "items.db")
+    task = build_task_record()
+    first = _item("item-b", task.id)
+    second = _item("item-a", task.id)
+    repository.create_task(task, [first, second])
+
+    assert [item.id for item in repository.list_items(task.id)] == [TransferItemId("item-a"), TransferItemId("item-b")]
+    repository.close()
+
+
 def test_create_task_consumes_iterable_in_batches_and_rolls_back_iteration_failure(tmp_path) -> None:
     path = tmp_path / "iter.db"
     repository = SqliteTaskRepository(path)
