@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
+
 import pytest
 
 from nasmove.core.errors import UnsafeSourceDeletion
@@ -25,6 +28,59 @@ def test_new_session_reverifies_target_before_delete(deletion_fixture) -> None:
         deletion_fixture.session,
     )
     assert deletion_fixture.verifier.full_verify_calls == 1
+
+
+@pytest.mark.parametrize(
+    "verification",
+    [
+        SimpleNamespace(matches=True, source_unchanged=True),
+        SimpleNamespace(matches=True, source_unchanged=True, full_hash_verified=True),
+        SimpleNamespace(
+            matches=True,
+            source_unchanged=True,
+            full_hash_verified=True,
+            session_generation=2,
+        ),
+    ],
+    ids=["missing-full-hash", "missing-generation", "wrong-generation"],
+)
+def test_reverification_missing_or_wrong_safety_fields_fails_closed(
+    deletion_fixture, verification
+) -> None:
+    deletion_fixture.replace_item(verified_session_generation=2)
+    deletion_fixture.replace_session(generation=3)
+    deletion_fixture.verifier.result = verification
+    with pytest.raises(UnsafeSourceDeletion):
+        deletion_fixture.service.delete_verified_source(
+            deletion_fixture.item.id,
+            deletion_fixture.session,
+        )
+    assert deletion_fixture.local.remove_calls == []
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        {"source_hash": "0" * 64},
+        {"remote_hash": "0" * 64},
+        {"source_bytes": 1},
+        {"remote_bytes": 1},
+        {"remote_file_id": "other-file"},
+    ],
+    ids=["source-hash", "remote-hash", "source-length", "remote-length", "file-id"],
+)
+def test_reverification_binding_mismatch_fails_closed(deletion_fixture, changes) -> None:
+    deletion_fixture.replace_item(verified_session_generation=2)
+    deletion_fixture.replace_session(generation=3)
+    deletion_fixture.verifier.result = replace(
+        deletion_fixture.verifier.complete_result(), **changes
+    )
+    with pytest.raises(UnsafeSourceDeletion):
+        deletion_fixture.service.delete_verified_source(
+            deletion_fixture.item.id,
+            deletion_fixture.session,
+        )
+    assert deletion_fixture.local.remove_calls == []
 
 
 def test_delete_requires_committed_target_and_marks_done(deletion_fixture) -> None:

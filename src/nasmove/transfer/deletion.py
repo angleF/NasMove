@@ -136,7 +136,9 @@ class SourceDeletionService:
         verification = None
         if verified_generation != session.session_generation:
             verification = self._reverify(item, session)
-            if not self._verification_is_safe(verification, session.session_generation):
+            if not self._verification_is_safe(
+                verification, session.session_generation, item, target_stat, target_hash
+            ):
                 raise UnsafeSourceDeletion("full verification did not confirm the committed target")
             verified_generation = session.session_generation
 
@@ -239,13 +241,45 @@ class SourceDeletionService:
         return self._verifier.verify_full(verification_item)
 
     @staticmethod
-    def _verification_is_safe(verification: object, expected_generation: int) -> bool:
+    def _verification_is_safe(
+        verification: object,
+        expected_generation: int,
+        item: TransferItemRecord,
+        target_stat: RemoteStat,
+        target_hash: str | None,
+    ) -> bool:
         matches = getattr(verification, "matches", None)
         unchanged = getattr(verification, "source_unchanged", None)
         full_hash_verified = getattr(verification, "full_hash_verified", None)
         generation = getattr(verification, "session_generation", None)
-        return matches is True and unchanged is True and full_hash_verified is not False and (
-            generation is None or generation == expected_generation
+        source_hash = getattr(verification, "source_hash", None)
+        remote_hash = getattr(verification, "remote_hash", None)
+        source_bytes = getattr(verification, "source_bytes", None)
+        remote_bytes = getattr(verification, "remote_bytes", None)
+        remote_file_id = getattr(verification, "remote_file_id", None)
+        expected_size = item.source_fingerprint.size
+        return (
+            type(matches) is bool
+            and matches is True
+            and type(unchanged) is bool
+            and unchanged is True
+            and type(full_hash_verified) is bool
+            and full_hash_verified is True
+            and type(generation) is int
+            and generation == expected_generation
+            and type(source_hash) is str
+            and type(remote_hash) is str
+            and item.sha256 is not None
+            and source_hash == item.sha256
+            and remote_hash == item.sha256
+            and remote_hash == target_hash
+            and type(source_bytes) is int
+            and type(remote_bytes) is int
+            and source_bytes == expected_size
+            and remote_bytes == expected_size
+            and target_stat.size == expected_size
+            and type(remote_file_id) is type(item.target_file_id)
+            and remote_file_id == item.target_file_id
         )
 
     def _persist_reverification(

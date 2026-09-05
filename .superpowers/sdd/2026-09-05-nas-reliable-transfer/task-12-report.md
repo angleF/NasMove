@@ -51,6 +51,30 @@ git diff --check
 
 跳过项为需要显式设置 `NASMOVE_TEST_SMB=1` 的真实 SMB 集成测试。
 
+## 独立复审修复
+
+复审发现会话变化后的 verifier 结果允许缺失 `full_hash_verified`、`session_generation` 及内容绑定字段，存在旧版或伪造 verifier 绕过当前会话安全门槛的风险。新增回归测试先确认 RED：
+
+```text
+7 failed, 9 passed
+```
+
+修复后，重校验结果必须严格为布尔成功、完整校验成功且 generation 等于当前会话；source/remote SHA-256、精确长度、远端对象 ID 同持久化记录和本次目标回读摘要一致，所有字段缺失、类型错误或不一致均 fail-closed。
+
+修复后的定向删除与故障测试：
+
+```text
+18 passed
+```
+
+本轮最终全量验证：
+
+```text
+729 passed, 1 skipped in 59.17s
+```
+
+Ruff、mypy 与 `git diff --check` 均通过。
+
 ## 风险与边界
 
 - 删除服务依赖任务项持久化的 `revision` 与状态 CAS；删除后的 `DONE` 提交若崩溃，下一次调用通过源缺失和目标摘要匹配恢复。

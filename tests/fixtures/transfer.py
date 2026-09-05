@@ -597,12 +597,31 @@ def commit_fixture() -> CommitFixture:
 class DeletionVerifier:
     full_verify_calls: int = 0
     result: object | None = None
+    source_hash: str = "0" * 64
+    remote_hash: str = "0" * 64
+    source_bytes: int = 0
+    remote_bytes: int = 0
+    session_generation: int = 1
+
+    def complete_result(self) -> object:
+        from nasmove.transfer.verification import VerificationResult
+
+        return VerificationResult(
+            matches=True,
+            source_unchanged=True,
+            source_hash=self.source_hash,
+            remote_hash=self.remote_hash,
+            source_bytes=self.source_bytes,
+            remote_bytes=self.remote_bytes,
+            session_generation=self.session_generation,
+            remote_file_id="file-final",
+        )
 
     def verify_full(self, item: TransferItemRecord) -> object:
         del item
         self.full_verify_calls += 1
         if self.result is None:
-            return type("Verification", (), {"matches": True, "source_unchanged": True})()
+            return self.complete_result()
         return self.result
 
 
@@ -623,6 +642,7 @@ class DeletionFixture:
     def replace_session(self, *, generation: int) -> None:
         self.session = replace(self.session, session_generation=generation)
         self.remote.active_generation = generation
+        self.verifier.session_generation = generation
 
 
 @pytest.fixture
@@ -650,7 +670,12 @@ def deletion_fixture() -> DeletionFixture:
     remote.files[item.final_path.value] = bytearray(content)
     remote.file_ids[item.final_path.value] = "file-final"
     repository.items[item.id] = item
-    verifier = DeletionVerifier()
+    verifier = DeletionVerifier(
+        source_hash=digest,
+        remote_hash=digest,
+        source_bytes=len(content),
+        remote_bytes=len(content),
+    )
     session = SessionInfo("3.1.1", True, True, 1)
     service = SourceDeletionService(repository, local, remote, verifier)
     return DeletionFixture(local, remote, repository, verifier, service, item, session)
