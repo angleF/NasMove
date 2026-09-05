@@ -4,6 +4,11 @@ import errno
 import socket
 
 import pytest
+from smbprotocol.exceptions import (
+    SMBAuthenticationError,
+    SMBConnectionClosed,
+    SMBUnsupportedFeature,
+)
 from smbprotocol.header import NtStatus
 
 from nasmove.core.errors import TransferErrorCategory
@@ -72,3 +77,29 @@ def test_real_ntstatus_int_is_supported() -> None:
 
     assert failure.category is TransferErrorCategory.DISK_FULL
     assert failure.code == "disk_full"
+
+
+@pytest.mark.parametrize(
+    ("error", "category", "retryable"),
+    [
+        (SMBAuthenticationError("secret must not be logged"), TransferErrorCategory.AUTHENTICATION, False),
+        (SMBConnectionClosed("server detail"), TransferErrorCategory.NETWORK, True),
+        (SMBUnsupportedFeature("dialect detail"), TransferErrorCategory.UNSUPPORTED, False),
+    ],
+)
+def test_real_smb_exception_classes_are_classified(
+    error: BaseException,
+    category: TransferErrorCategory,
+    retryable: bool,
+) -> None:
+    failure = map_smb_error(error)
+
+    assert failure.category is category
+    assert failure.retryable is retryable
+
+
+def test_temporary_dns_failure_is_retryable() -> None:
+    failure = map_smb_error(socket.gaierror(socket.EAI_AGAIN, "temporary resolver failure"))
+
+    assert failure.category is TransferErrorCategory.DNS
+    assert failure.retryable is True

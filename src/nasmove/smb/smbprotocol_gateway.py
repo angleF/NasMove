@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ipaddress
 import stat as stat_module
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
@@ -9,6 +10,7 @@ import smbclient  # type: ignore[import-untyped]
 
 from nasmove.core.model import ConnectionConfig, RemotePath
 from nasmove.core.ports import RemoteEntry, RemoteStat, SessionInfo
+from nasmove.planning.paths import normalize_remote_path, validate_remote_component
 from nasmove.smb.error_mapping import (
     RenameOutcomeUnknownError,
     StaleSmbHandleError,
@@ -73,7 +75,7 @@ def write_all(stream: BinaryIO, data: bytes) -> None:
     offset = 0
     while offset < len(data):
         written = stream.write(data[offset:])
-        if not isinstance(written, int) or written <= 0 or written > len(data) - offset:
+        if type(written) is not int or written <= 0 or written > len(data) - offset:
             raise OSError("SMB write made no progress or returned an invalid count")
         offset += written
 
@@ -88,9 +90,11 @@ class SmbProtocolGateway:
     def connect(self, config: ConnectionConfig, password: str) -> SessionInfo:
         if self._active_generation is not None:
             self.disconnect()
+        host = self._normalize_component(config.host, "host")
+        self._normalize_component(config.share, "share")
         username = f"{config.domain}\\{config.username}" if config.domain else config.username
         session = smbclient.register_session(
-            self._normalize_component(config.host, "host"),
+            host,
             username=username,
             password=password,
             port=config.port,
@@ -180,10 +184,10 @@ class SmbProtocolGateway:
                 self._unc(target),
                 **self._session_kwargs(),
             )
-        except OSError as error:
+        except Exception as error:
             try:
                 target_exists = self.stat(target) is not None
-            except OSError:
+            except Exception:  # noqa: BLE001 - failure to query leaves the outcome unknown
                 target_exists = False
             if target_exists or redacted_error_code(error) == "target_exists":
                 raise TargetExistsError("exclusive SMB rename target already exists") from error
@@ -225,7 +229,7 @@ class SmbProtocolGateway:
         config = self._require_config()
         host = self._normalize_component(config.host, "host")
         share = self._normalize_component(config.share, "share")
-        remote = path.value.replace("/", "\\")
+        remote = normalize_remote_path(path.value).value.replace("/", "\\")
         return f"\\\\{host}\\{share}\\{remote}"
 
     def _session_kwargs(self) -> dict[str, Any]:
@@ -250,7 +254,52 @@ class SmbProtocolGateway:
 
     @staticmethod
     def _normalize_component(value: str, field_name: str) -> str:
-        normalized = value.strip().strip("\\/")
-        if not normalized or "\\" in normalized or "/" in normalized:
-            raise ValueError(f"SMB {field_name} must be a single UNC component")
-        return normalized
+        if not isinstance(value, str) or not value or value != value.strip():
+            raise ValueError(f"SMB {field_name} must be a non-blank UNC component")
+        if field_name == "host":
+            return SmbProtocolGateway._normalize_host(value)
+        try:
+            return validate_remote_component(value)
+        except ValueError as error:
+            raise ValueError(f"SMB {field_name} is not a valid UNC component") from error
+
+    @staticmethod
+    def _normalize_host(value: str) -> str:
+        if any(ord(char) < 32 or ord(char) == 127 for char in value):
+            raise ValueError("SMB host must not contain control characters")
+        if value.startswith("[") and value.endswith("]"):
+            candidate = value[1:-1]
+            try:
+                ipaddress.IPv6Address(candidate)
+            except ValueError as error:
+                raise ValueError("SMB host has an invalid bracketed IPv6 address") from error
+            return value
+        if ":" in value:
+            try:
+                ipaddress.IPv6Address(value)
+            except ValueError as error:
+                raise ValueError("SMB host has an invalid IPv6 address") from error
+            return f"[{value}]"
+        if any(char in '<>:"/\\|?*' for char in value):
+            raise ValueError("SMB host contains an invalid UNC character")
+        try:
+            address = ipaddress.ip_address(value)
+        except ValueError:
+            address = None
+        if isinstance(address, ipaddress.IPv6Address):
+            return f"[{value}]"
+        if address is not None:
+            return value
+        if len(value.encode("utf-16-le")) // 2 > 255:
+            raise ValueError("SMB host exceeds the conservative UTF-16 component limit")
+        labels = value.split(".")
+        if any(
+            not label
+            or len(label) > 63
+            or label[0] == "-"
+            or label[-1] == "-"
+            or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-" for char in label)
+            for label in labels
+        ):
+            raise ValueError("SMB host is not a valid hostname, IPv4, or IPv6 address")
+        return value

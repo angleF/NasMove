@@ -5,9 +5,10 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from smbprotocol.exceptions import SMBConnectionClosed
 
 from nasmove.core.model import ConnectionConfig, ConnectionProfileId, RemotePath
-from nasmove.smb.error_mapping import TargetExistsError
+from nasmove.smb.error_mapping import RenameOutcomeUnknownError, TargetExistsError
 from nasmove.smb.smbprotocol_gateway import SmbProtocolGateway, write_all
 from tests.fixtures.fake_smb import ShortWritingStream
 
@@ -37,6 +38,17 @@ def test_write_all_retries_short_writes() -> None:
 
     assert stream.value == b"abcdefgh"
     assert stream.write_calls == 3
+
+
+class BoolWriter(BytesIO):
+    def write(self, data: bytes | bytearray) -> bool:
+        super().write(data)
+        return True
+
+
+def test_write_all_rejects_bool_write_count() -> None:
+    with pytest.raises(OSError):
+        write_all(BoolWriter(), b"payload")
 
 
 def test_gateway_uses_normalized_unc_and_resets_idempotently(
@@ -146,3 +158,72 @@ def test_rename_exclusive_does_not_call_smb_when_target_exists(
         gateway.rename_exclusive(RemotePath("folder/source"), RemotePath("folder/target"))
 
     assert rename_calls == []
+
+
+def test_rename_exclusive_classifies_non_oserror_connection_loss_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+    stat_calls = 0
+
+    def missing_target(path: str, **kwargs: Any) -> Any:
+        nonlocal stat_calls
+        stat_calls += 1
+        raise FileNotFoundError(path)
+
+    def lost_response(source: str, target: str, **kwargs: Any) -> None:
+        raise SMBConnectionClosed("server disconnected")
+
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.stat", missing_target)
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.rename", lost_response)
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "secret")
+
+    with pytest.raises(RenameOutcomeUnknownError):
+        gateway.rename_exclusive(RemotePath("folder/source"), RemotePath("folder/target"))
+
+    assert stat_calls == 2
+
+
+@pytest.mark.parametrize("value", ["bad\x00name", "bad\x7fname", "bad?name", "bad*name", "bad.", "bad "])
+def test_gateway_revalidates_remote_path_bypassing_remote_path_constructor(
+    monkeypatch: pytest.MonkeyPatch,
+    value: str,
+) -> None:
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.stat",
+        lambda *args, **kwargs: pytest.fail("invalid path reached smbclient"),
+    )
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "secret")
+    path = object.__new__(RemotePath)
+    object.__setattr__(path, "value", value)
+
+    with pytest.raises(ValueError):
+        gateway.stat(path)
+
+
+def test_gateway_revalidates_invalid_host_and_share(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+    gateway = SmbProtocolGateway()
+    config = _config()
+    config = ConnectionConfig(
+        profile_id=config.profile_id,
+        display_name=config.display_name,
+        host="nas?bad",
+        share="transfer",
+        username=config.username,
+    )
+
+    with pytest.raises(ValueError):
+        gateway.connect(config, "secret")

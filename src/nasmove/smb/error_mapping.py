@@ -4,6 +4,11 @@ import errno
 import re
 import socket
 
+try:
+    import smbprotocol.exceptions as _smb_exceptions  # type: ignore[import-untyped]
+except ImportError:  # pragma: no cover - compatibility with older smbprotocol releases
+    _smb_exceptions = None
+
 from nasmove.core.errors import TransferErrorCategory, TransferFailure
 
 
@@ -92,11 +97,30 @@ _RETRYABLE_ERRNOS = frozenset(
 )
 
 
+def _is_smb_error(error: BaseException, class_name: str) -> bool:
+    if _smb_exceptions is None:
+        return False
+    exception_class = getattr(_smb_exceptions, class_name, None)
+    return isinstance(exception_class, type) and isinstance(error, exception_class)
+
+
 def map_smb_error(error: BaseException) -> TransferFailure:
     """Map an SMB boundary exception to a safe, non-sensitive transfer failure."""
+    if _is_smb_error(error, "SMBAuthenticationError"):
+        return TransferFailure(TransferErrorCategory.AUTHENTICATION, "authentication_failed", False)
+    if _is_smb_error(error, "SMBConnectionClosed"):
+        return TransferFailure(TransferErrorCategory.NETWORK, "connection_reset", True)
+    if _is_smb_error(error, "SMBUnsupportedFeature") or isinstance(
+        error, UnsupportedSmbDialectError
+    ):
+        return TransferFailure(TransferErrorCategory.UNSUPPORTED, "unsupported", False)
     code = redacted_error_code(error)
     if isinstance(error, socket.gaierror) or code == "dns_failure":
-        return TransferFailure(TransferErrorCategory.DNS, "dns_failure", False)
+        return TransferFailure(
+            TransferErrorCategory.DNS,
+            "dns_failure",
+            isinstance(error, socket.gaierror) and error.errno == socket.EAI_AGAIN,
+        )
     if code in _CODE_CATEGORIES:
         return TransferFailure(_CODE_CATEGORIES[code], code, code in _NETWORK_CODES)
     if isinstance(error, TimeoutError):
@@ -107,6 +131,12 @@ def map_smb_error(error: BaseException) -> TransferFailure:
 
 
 def redacted_error_code(error: BaseException) -> str:
+    if _is_smb_error(error, "SMBAuthenticationError"):
+        return "authentication_failed"
+    if _is_smb_error(error, "SMBConnectionClosed"):
+        return "connection_reset"
+    if _is_smb_error(error, "SMBUnsupportedFeature"):
+        return "unsupported"
     if isinstance(error, TargetExistsError | FileExistsError):
         return "target_exists"
     if isinstance(error, RenameOutcomeUnknownError):
