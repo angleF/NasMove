@@ -1,0 +1,83 @@
+from __future__ import annotations
+
+import pytest
+
+from nasmove.core.errors import UnsafeSourceDeletion
+from nasmove.core.states import ItemState
+from nasmove.transfer.deletion import SourceDeletionService
+
+
+def test_source_is_not_removed_when_full_verification_is_missing(deletion_fixture) -> None:
+    deletion_fixture.replace_item(full_hash_verified=False)
+    with pytest.raises(UnsafeSourceDeletion):
+        deletion_fixture.service.delete_verified_source(
+            deletion_fixture.item.id,
+            deletion_fixture.session,
+        )
+    assert deletion_fixture.local.remove_calls == []
+
+
+def test_new_session_reverifies_target_before_delete(deletion_fixture) -> None:
+    deletion_fixture.replace_item(verified_session_generation=2)
+    deletion_fixture.replace_session(generation=3)
+    deletion_fixture.service.delete_verified_source(
+        deletion_fixture.item.id,
+        deletion_fixture.session,
+    )
+    assert deletion_fixture.verifier.full_verify_calls == 1
+
+
+def test_delete_requires_committed_target_and_marks_done(deletion_fixture) -> None:
+    result = deletion_fixture.service.delete_verified_source(
+        deletion_fixture.item.id,
+        deletion_fixture.session,
+    )
+    assert result.source_deleted is True
+    assert deletion_fixture.repository.get_item(deletion_fixture.item.id).state is ItemState.DONE
+    assert deletion_fixture.local.fingerprint_calls >= 2
+
+
+def test_delete_failure_retains_source_and_marks_source_retained(deletion_fixture) -> None:
+    deletion_fixture.local.remove_error = PermissionError("denied")
+    result = deletion_fixture.service.delete_verified_source(
+        deletion_fixture.item.id,
+        deletion_fixture.session,
+    )
+    assert result.source_deleted is False
+    assert deletion_fixture.repository.get_item(deletion_fixture.item.id).state is ItemState.SOURCE_RETAINED
+
+
+def test_missing_source_with_matching_target_is_idempotently_done(deletion_fixture) -> None:
+    deletion_fixture.local.source_exists = False
+    result = deletion_fixture.service.delete_verified_source(
+        deletion_fixture.item.id,
+        deletion_fixture.session,
+    )
+    assert result.already_absent is True
+    assert deletion_fixture.repository.get_item(deletion_fixture.item.id).state is ItemState.DONE
+    assert deletion_fixture.local.remove_calls == []
+
+
+def test_missing_source_without_full_verification_is_not_assumed_done(deletion_fixture) -> None:
+    deletion_fixture.local.source_exists = False
+    deletion_fixture.replace_item(full_hash_verified=False)
+    with pytest.raises(UnsafeSourceDeletion):
+        deletion_fixture.service.delete_verified_source(
+            deletion_fixture.item.id,
+            deletion_fixture.session,
+        )
+    assert deletion_fixture.repository.get_item(deletion_fixture.item.id).state is ItemState.COMMITTED
+
+
+def test_changed_final_target_is_not_deleted(deletion_fixture) -> None:
+    deletion_fixture.remote.files[deletion_fixture.item.final_path.value] = bytearray(b"tampered")
+    with pytest.raises(UnsafeSourceDeletion):
+        deletion_fixture.service.delete_verified_source(
+            deletion_fixture.item.id,
+            deletion_fixture.session,
+        )
+    assert deletion_fixture.local.remove_calls == []
+
+
+def test_deletion_service_has_expected_public_constructor() -> None:
+    assert SourceDeletionService.delete_verified_source

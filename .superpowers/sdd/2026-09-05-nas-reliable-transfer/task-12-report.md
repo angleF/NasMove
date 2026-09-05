@@ -1,0 +1,58 @@
+# Task 12 实施报告：安全源删除与幂等恢复
+
+## 状态
+
+DONE
+
+## 实施摘要
+
+- 新增 `SourceDeletionService` 与不可变 `DeletionResult`。服务每次删除前重新读取文件项、源指纹、最终目标属性和 SMB session generation。
+- 目标必须存在、为普通文件、大小／对象 ID／SHA-256 与持久化提交记录一致；只有 `authorize_source_delete()` 成功后才进入 `SOURCE_DELETE_AUTHORIZED` 并调用本地删除。
+- 会话代次变化时将验证器绑定到最终目标路径并执行完整重校验；源删除后重新确认源不存在，再迁移为 `DONE`。
+- 删除异常保留源与 NAS 目标并迁移为 `SOURCE_RETAINED`。源已不存在且最终目标摘要匹配时，恢复路径幂等迁移为 `DONE`，覆盖删除后、状态提交前崩溃窗口。
+- 目录清理只接受调用方传入的规划目录，按路径深度自底向上；删除前列出内容，非空目录保留并记录 warning，使用 `remove_empty_dir()`，不执行递归删除。
+- 扩展传输夹具记录指纹、删除调用、删除失败和状态提交崩溃；新增删除单元测试与故障窗口测试。
+
+## TDD 证据
+
+测试先运行并确认 RED：
+
+```text
+ModuleNotFoundError: No module named 'nasmove.transfer.deletion'
+```
+
+最小实现后定向删除与故障测试：
+
+```text
+10 passed
+```
+
+## 验证
+
+```text
+python -m pytest -q
+721 passed, 1 skipped in 61.41s
+```
+
+```text
+ruff check src tests
+All checks passed!
+```
+
+```text
+python -m mypy src/nasmove
+Success: no issues found in 26 source files
+```
+
+```text
+git diff --check
+通过
+```
+
+跳过项为需要显式设置 `NASMOVE_TEST_SMB=1` 的真实 SMB 集成测试。
+
+## 风险与边界
+
+- 删除服务依赖任务项持久化的 `revision` 与状态 CAS；删除后的 `DONE` 提交若崩溃，下一次调用通过源缺失和目标摘要匹配恢复。
+- 远端目标校验与本地删除不是跨系统原子事务；服务保守处理目标缺失、属性变化、摘要不匹配和本地删除失败，不删除源文件。
+- 目录清理默认不推断未记录的目录；只有明确规划目录会被尝试清理。

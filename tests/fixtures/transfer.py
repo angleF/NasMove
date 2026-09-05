@@ -26,6 +26,10 @@ class TransferLocal:
     def __init__(self, content: bytes, trace: list[str]) -> None:
         self.content = content
         self.trace = trace
+        self.remove_calls: list[Path] = []
+        self.fingerprint_calls = 0
+        self.remove_error: BaseException | None = None
+        self.source_exists = True
         self.cancel_token: TransferToken | None = None
         self.cancel_on_eof = False
         self.fingerprint_override: SourceFingerprint | None = None
@@ -33,13 +37,41 @@ class TransferLocal:
     @contextmanager
     def open_read(self, path: Path) -> Iterator[BinaryIO]:
         del path
+        if not self.source_exists:
+            raise FileNotFoundError("source is absent")
         yield _TracingLocalStream(self.content, self.trace, self.cancel_token, self.cancel_on_eof)
 
     def fingerprint(self, path: Path) -> SourceFingerprint:
         del path
+        self.fingerprint_calls += 1
+        if not self.source_exists:
+            raise FileNotFoundError("source is absent")
         if self.fingerprint_override is not None:
             return self.fingerprint_override
         return SourceFingerprint(1, 2, SourceKind.FILE, len(self.content), 1)
+
+    def remove_file(
+        self, path: Path, expected_fingerprint: SourceFingerprint | None = None
+    ) -> None:
+        del expected_fingerprint
+        self.remove_calls.append(path)
+        if self.remove_error is not None:
+            error = self.remove_error
+            if isinstance(error, RuntimeError) and str(error) == "injected crash":
+                self.remove_error = None
+            raise error
+        if not self.source_exists:
+            raise FileNotFoundError("source is absent")
+        self.source_exists = False
+
+    def remove_empty_dir(
+        self, path: Path, expected_fingerprint: SourceFingerprint | None = None
+    ) -> None:
+        self.remove_file(path, expected_fingerprint)
+
+    def list_dir(self, path: Path) -> list[Path]:
+        del path
+        return []
 
 
 class _TracingLocalStream(BytesIO):
@@ -272,6 +304,7 @@ class TransferRepository:
         self.trace = trace
         self.checkpoints: list[Checkpoint] = []
         self.items: dict[TransferItemId, TransferItemRecord] = {}
+        self.fail_done_transition_once = False
 
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
         offset = checkpoint.confirmed_offset
@@ -296,6 +329,9 @@ class TransferRepository:
         self.trace.append(f"repository.update_item@{item.final_path.value}")
 
     def transition_item(self, item_id: TransferItemId, expected: ItemState, target: ItemState) -> None:
+        if target is ItemState.DONE and self.fail_done_transition_once:
+            self.fail_done_transition_once = False
+            raise RuntimeError("injected crash")
         current = self.items[item_id]
         if current.state is not expected:
             raise RuntimeError("unexpected item state")
@@ -555,3 +591,66 @@ def commit_fixture() -> CommitFixture:
         committer=TargetCommitter(repository, remote, session_generation=1),
         item=item,
     )
+
+
+@dataclass
+class DeletionVerifier:
+    full_verify_calls: int = 0
+    result: object | None = None
+
+    def verify_full(self, item: TransferItemRecord) -> object:
+        del item
+        self.full_verify_calls += 1
+        if self.result is None:
+            return type("Verification", (), {"matches": True, "source_unchanged": True})()
+        return self.result
+
+
+@dataclass
+class DeletionFixture:
+    local: TransferLocal
+    remote: TransferRemote
+    repository: TransferRepository
+    verifier: DeletionVerifier
+    service: object
+    item: TransferItemRecord
+    session: SessionInfo
+
+    def replace_item(self, **changes: object) -> None:
+        self.item = replace(self.repository.get_item(self.item.id), **changes)
+        self.repository.items[self.item.id] = self.item
+
+    def replace_session(self, *, generation: int) -> None:
+        self.session = replace(self.session, session_generation=generation)
+        self.remote.active_generation = generation
+
+
+@pytest.fixture
+def deletion_fixture() -> DeletionFixture:
+    from nasmove.localio.hashing import sha256_stream
+    from nasmove.transfer.deletion import SourceDeletionService
+
+    trace: list[str] = []
+    content = b"verified source"
+    local = TransferLocal(content, trace)
+    remote = TransferRemote(trace)
+    repository = TransferRepository(trace)
+    item = FakeDependencies(local, remote, repository, trace, TransferToken()).item(size=len(content))
+    with local.open_read(item.source_path) as source:
+        digest = sha256_stream(source).hexdigest
+    item = replace(
+        item,
+        state=ItemState.COMMITTED,
+        sha256=digest,
+        full_hash_verified=True,
+        target_file_id="file-final",
+        final_size=len(content),
+        verified_session_generation=1,
+    )
+    remote.files[item.final_path.value] = bytearray(content)
+    remote.file_ids[item.final_path.value] = "file-final"
+    repository.items[item.id] = item
+    verifier = DeletionVerifier()
+    session = SessionInfo("3.1.1", True, True, 1)
+    service = SourceDeletionService(repository, local, remote, verifier)
+    return DeletionFixture(local, remote, repository, verifier, service, item, session)
