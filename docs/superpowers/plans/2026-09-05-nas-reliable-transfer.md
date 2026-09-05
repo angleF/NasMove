@@ -120,10 +120,10 @@ NasMove/
 
 ```python
 from pathlib import Path
-from typing import BinaryIO, ContextManager, Protocol, Sequence
+from typing import BinaryIO, ContextManager, Iterable, Protocol, Sequence
 
 class TaskRepository(Protocol):
-    def create_task(self, task: "TaskRecord", items: Sequence["TransferItemRecord"]) -> None: ...
+    def create_task(self, task: "TaskRecord", items: Iterable["TransferItemRecord"]) -> None: ...
     def get_task(self, task_id: "TaskId") -> "TaskRecord": ...
     def get_item(self, item_id: "TransferItemId") -> "TransferItemRecord": ...
     def next_queued_task(self) -> "TaskRecord | None": ...
@@ -659,6 +659,8 @@ PRAGMA busy_timeout = 5000;
 ```
 
 创建 `schema_meta`、`connection_profiles`、`tasks`、`transfer_items`、`checkpoints`、`attempts` 和 `events` 表。`save_checkpoint()` 在一个 `BEGIN IMMEDIATE` 事务内插入检查点并更新文件项确认偏移；异常时回滚两者。
+
+`create_task()` 必须在一个事务内完整消费规划器提供的 `Iterable`，每批最多 1,000 项执行批量插入；迭代、插入或提交任一阶段失败时，任务及其全部项目必须整体回滚，不得留下部分计划。
 
 - [ ] **Step 4：实现比较并交换状态迁移**
 
