@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
+from nasmove.core.model import Checkpoint
+from nasmove.localio.hashing import sha256_range
 from nasmove.transfer.recovery import RecoveryDisposition
 
 
@@ -43,3 +47,34 @@ def test_recovery_does_not_accept_checkpoint_beyond_remote_length(recovery_fixtu
     decision = recovery_fixture.coordinator.find_safe_offset(recovery_fixture.item_id)
     assert decision.disposition is RecoveryDisposition.START_OVER
     assert decision.safe_offset == 0
+
+
+@pytest.mark.parametrize(
+    ("window_start", "window_length"),
+    [
+        (124 * 1024 * 1024, 1 * 1024 * 1024),  # window does not end at offset
+        (120 * 1024 * 1024, 8 * 1024 * 1024),  # window exceeds the 4 MiB maximum
+        (128 * 1024 * 1024, 0),  # empty window after a non-zero offset
+    ],
+)
+def test_recovery_skips_non_canonical_checkpoint_windows(
+    recovery_fixture, window_start: int, window_length: int
+) -> None:
+    recovery_fixture.remote_size = 128 * 1024 * 1024
+    recovery_fixture.set_window_match(offset=64 * 1024 * 1024, matches=True)
+    with recovery_fixture.local.open_read(recovery_fixture.item.source_path) as source:
+        digest = sha256_range(source, window_start, window_length)
+    recovery_fixture.repository.checkpoints.append(
+        Checkpoint(
+            item_id=recovery_fixture.item_id,
+            confirmed_offset=128 * 1024 * 1024,
+            remote_size=128 * 1024 * 1024,
+            window_start=window_start,
+            window_length=window_length,
+            window_sha256=digest,
+            session_generation=1,
+        )
+    )
+    decision = recovery_fixture.coordinator.find_safe_offset(recovery_fixture.item_id)
+    assert decision.safe_offset == 64 * 1024 * 1024
+    assert decision.disposition is RecoveryDisposition.RESUME

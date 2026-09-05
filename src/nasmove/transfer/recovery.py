@@ -162,7 +162,8 @@ class RecoveryCoordinator:
             and checkpoint.confirmed_offset <= remote_size
             and checkpoint.confirmed_offset <= item.confirmed_offset
             and checkpoint.confirmed_offset <= item.source_fingerprint.size
-            and checkpoint.window_start + checkpoint.window_length <= checkpoint.confirmed_offset
+            and checkpoint.window_start + checkpoint.window_length == checkpoint.confirmed_offset
+            and checkpoint.window_length == min(4 * 1024 * 1024, checkpoint.confirmed_offset)
         )
 
     def _window_hash_local(self, item: TransferItemRecord, checkpoint: Checkpoint) -> str:

@@ -5,7 +5,7 @@ import math
 import pytest
 
 from nasmove.core.retry import RetryPolicy
-from nasmove.smb.error_mapping import UnsupportedSmbDialectError
+from nasmove.smb.error_mapping import StaleSmbHandleError, UnsupportedSmbDialectError, map_smb_error
 
 
 def test_retry_schedule_without_jitter() -> None:
@@ -55,3 +55,10 @@ def test_eighth_network_failure_enters_waiting_probe_interval() -> None:
     assert policy.delay_seconds(8, jitter=0.0) == 60.0
     assert policy.should_retry(error, attempt=9) is False
     assert policy.waiting_probe_seconds == 60.0
+
+
+def test_stale_smb_handle_is_a_retryable_network_failure() -> None:
+    failure = map_smb_error(StaleSmbHandleError("session invalidated"))
+    assert failure.category.value == "network"
+    assert failure.retryable is True
+    assert RetryPolicy().should_retry(StaleSmbHandleError("session invalidated"), attempt=1) is True

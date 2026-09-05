@@ -110,6 +110,8 @@ def map_smb_error(error: BaseException) -> TransferFailure:
         return TransferFailure(TransferErrorCategory.AUTHENTICATION, "authentication_failed", False)
     if _is_smb_error(error, "SMBConnectionClosed"):
         return TransferFailure(TransferErrorCategory.NETWORK, "connection_reset", True)
+    if isinstance(error, StaleSmbHandleError):
+        return TransferFailure(TransferErrorCategory.NETWORK, "stale_handle", True)
     if _is_smb_error(error, "SMBUnsupportedFeature") or isinstance(
         error, UnsupportedSmbDialectError
     ):
