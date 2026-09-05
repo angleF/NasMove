@@ -23,3 +23,13 @@ def test_commit_rejects_unverified_result(commit_fixture) -> None:
     )
     with pytest.raises(ValueError):
         commit_fixture.committer.commit(commit_fixture.item, verification)
+
+
+def test_commit_rejects_same_length_replacement_after_rename(commit_fixture) -> None:
+    commit_fixture.remote.replace_after_rename = True
+    commit_fixture.remote.replacement_content = b"wrong content"
+    with pytest.raises(OSError):
+        commit_fixture.committer.commit(
+            commit_fixture.item, commit_fixture.valid_verification()
+        )
+    assert commit_fixture.repository.get_item(commit_fixture.item.id).state.value == "verified"

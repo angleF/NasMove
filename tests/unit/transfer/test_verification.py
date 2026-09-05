@@ -32,3 +32,10 @@ def test_full_verification_reports_missing_remote_as_mismatch(verification_fixtu
     result = verification_fixture.verifier.verify_full(verification_fixture.item)
     assert result.matches is False
     assert result.remote_bytes == 0
+
+
+def test_full_verification_rejects_same_length_remote_replacement(verification_fixture) -> None:
+    verification_fixture.remote.replace_after_read = True
+    verification_fixture.remote.replacement_content = b"changed payload!"
+    result = verification_fixture.verifier.verify_full(verification_fixture.item)
+    assert result.matches is False

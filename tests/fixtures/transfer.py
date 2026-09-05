@@ -95,6 +95,11 @@ class TransferRemote:
         self.switch_generation_after_stat = False
         self.fail_stat_after_flush = False
         self.remote_read_started_at: int | None = None
+        self.file_ids: dict[str, str] = {}
+        self.next_file_id = 1
+        self.replace_after_read = False
+        self.replace_after_rename = False
+        self.replacement_content = b"corrupted payload"
         self.crash_before_rename = False
         self.crash_after_rename = False
 
@@ -105,6 +110,8 @@ class TransferRemote:
             raise FileExistsError(path.value)
         self.path = path
         self.files[path.value] = bytearray()
+        self.file_ids[path.value] = f"file-{self.next_file_id}"
+        self.next_file_id += 1
         self.pending[path.value] = bytearray()
         stream = _TracingRemoteStream(self, path)
         try:
@@ -133,7 +140,10 @@ class TransferRemote:
         if self.fail_stat_after_flush and value:
             raise OSError("stat failure after flush")
         self.trace.append(f"remote.stat@{len(value)}")
-        result = RemoteStat(len(value), False, 0, path.value)
+        result = RemoteStat(
+            len(value), False, 0, self.file_ids.setdefault(path.value, f"file-{self.next_file_id}")
+        )
+        self.next_file_id += 1
         if self.switch_generation_after_stat:
             self.active_generation += 1
             self.switch_generation_after_stat = False
@@ -147,7 +157,13 @@ class TransferRemote:
             raise FileNotFoundError(path.value)
         stream = BytesIO(bytes(value))
         self.remote_read_started_at = stream.tell()
-        yield stream
+        try:
+            yield stream
+        finally:
+            if self.replace_after_read:
+                self.files[path.value] = bytearray(self.replacement_content)
+                self.file_ids[path.value] = f"file-{self.next_file_id}"
+                self.next_file_id += 1
 
     def truncate(self, path: RemotePath, size: int) -> None:
         self.trace.append(f"remote.truncate@{size}")
@@ -164,6 +180,13 @@ class TransferRemote:
         if source.value not in self.files:
             raise FileNotFoundError(source.value)
         self.files[target.value] = self.files.pop(source.value)
+        source_file_id = self.file_ids.pop(source.value, None)
+        if source_file_id is not None:
+            self.file_ids[target.value] = source_file_id
+        if self.replace_after_rename:
+            self.files[target.value] = bytearray(self.replacement_content)
+            self.file_ids[target.value] = f"file-{self.next_file_id}"
+            self.next_file_id += 1
         if self.crash_after_rename:
             raise RuntimeError("injected crash after rename")
 
@@ -453,6 +476,7 @@ class VerificationFixture:
     @remote_bytes.setter
     def remote_bytes(self, value: bytes) -> None:
         self.remote.files[self.item.temp_path.value] = bytearray(value)
+        self.remote.file_ids.setdefault(self.item.temp_path.value, "file-verification")
 
 
 @pytest.fixture
@@ -464,6 +488,7 @@ def verification_fixture() -> VerificationFixture:
     local = TransferLocal(content, trace)
     remote = TransferRemote(trace)
     remote.files["target/.file.bin.part"] = bytearray(content)
+    remote.file_ids["target/.file.bin.part"] = "file-verification"
     repository = TransferRepository(trace)
     item = FakeDependencies(local, remote, repository, trace, TransferToken()).item(size=len(content))
     repository.items[item.id] = item
@@ -501,6 +526,7 @@ class CommitFixture:
             source_bytes=digest.byte_count,
             remote_bytes=digest.byte_count,
             session_generation=1,
+            remote_file_id=self.remote.file_ids.get(self.item.temp_path.value),
         )
 
 
@@ -513,6 +539,7 @@ def commit_fixture() -> CommitFixture:
     local = TransferLocal(content, trace)
     remote = TransferRemote(trace)
     remote.files["target/.file.bin.part"] = bytearray(content)
+    remote.file_ids["target/.file.bin.part"] = "file-commit"
     repository = TransferRepository(trace)
     item = FakeDependencies(local, remote, repository, trace, TransferToken()).item(size=len(content))
     item = replace(item, final_path=RemotePath("target/movie.mov"), state=ItemState.VERIFIED)

@@ -4,11 +4,12 @@ from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import PurePosixPath
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from nasmove.core.model import RemotePath, TransferItemRecord
 from nasmove.core.ports import RemoteEntry, RemoteStat, SessionInfo
 from nasmove.core.states import ItemState
+from nasmove.localio.hashing import sha256_stream
 from nasmove.planning.conflicts import allocate_name
 from nasmove.transfer.verification import VerificationResult
 
@@ -31,6 +32,8 @@ class SmbGateway(Protocol):
     def list_dir(self, path: RemotePath) -> list[RemoteEntry]: ...
 
     def rename_exclusive(self, source: RemotePath, target: RemotePath) -> None: ...
+
+    def open_read(self, path: RemotePath) -> AbstractContextManager[BinaryIO]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,6 +81,14 @@ class TargetCommitter:
             while True:
                 if candidate != current.final_path:
                     current = self._persist_path(current, candidate)
+                temporary_stat = self._smb.stat(current.temp_path)
+                if temporary_stat is None or temporary_stat.is_directory:
+                    raise OSError("verified temporary file is missing")
+                if (
+                    verification.remote_file_id is not None
+                    and temporary_stat.file_id != verification.remote_file_id
+                ):
+                    raise OSError("temporary file identity changed after verification")
                 try:
                     self._assert_generation()
                     self._smb.rename_exclusive(current.temp_path, candidate)
@@ -93,6 +104,10 @@ class TargetCommitter:
                     or final_stat.size != verification.source_bytes
                 ):
                     raise OSError("renamed target could not be confirmed")
+                if not self._target_identity_is_safe(final_stat, verification):
+                    raise OSError("renamed target identity does not match verified temporary file")
+                if verification.remote_file_id is None:
+                    self._verify_final_content(candidate, verification)
                 current = replace(
                     current,
                     final_path=candidate,
@@ -113,6 +128,28 @@ class TargetCommitter:
         if self._smb.stat(item.final_path) is None:
             return item.final_path
         return self._next_name(item.final_path)
+
+    def _target_identity_is_safe(
+        self, final_stat: RemoteStat, verification: VerificationResult
+    ) -> bool:
+        expected_id = verification.remote_file_id
+        if expected_id is None:
+            return True
+        return final_stat.file_id == expected_id
+
+    def _verify_final_content(
+        self, path: RemotePath, verification: VerificationResult
+    ) -> None:
+        with self._smb.open_read(path) as stream:
+            stream.seek(0)
+            result = sha256_stream(stream)
+        if (
+            result.byte_count != verification.source_bytes
+            or result.byte_count != verification.remote_bytes
+            or result.hexdigest != verification.source_hash
+            or result.hexdigest != verification.remote_hash
+        ):
+            raise OSError("renamed target content no longer matches verification")
 
     def _next_name(self, path: RemotePath) -> RemotePath:
         parent, name = self._parent_and_name(path)

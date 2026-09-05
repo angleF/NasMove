@@ -42,6 +42,7 @@ class VerificationResult:
     source_bytes: int
     remote_bytes: int
     session_generation: int
+    remote_file_id: str | None = None
 
     @property
     def sha256(self) -> str:
@@ -54,6 +55,10 @@ class VerificationResult:
     @property
     def remote_digest(self) -> str:
         return self.remote_hash
+
+    @property
+    def temporary_file_id(self) -> str | None:
+        return self.remote_file_id
 
     @property
     def full_hash_verified(self) -> bool:
@@ -104,9 +109,21 @@ class IntegrityVerifier:
         after = self._local.fingerprint(item.source_path)
         source_unchanged = before == expected and after == expected
         remote_exists = after_remote_stat is not None and not after_remote_stat.is_directory
+        stable_remote_identity = (
+            remote_stat is not None
+            and after_remote_stat is not None
+            and remote_stat.file_id == after_remote_stat.file_id
+            and (remote_stat.file_id is not None or after_remote_stat.file_id is None)
+        )
+        identity_changed = (
+            remote_stat is not None
+            and after_remote_stat is not None
+            and remote_stat.file_id != after_remote_stat.file_id
+        )
         matches = (
             source_unchanged
             and remote_exists
+            and not identity_changed
             and source_result.byte_count == expected.size
             and remote_result.byte_count == expected.size
             and source_result.byte_count == remote_result.byte_count
@@ -120,6 +137,11 @@ class IntegrityVerifier:
             source_bytes=source_result.byte_count,
             remote_bytes=remote_result.byte_count,
             session_generation=self._session.session_generation,
+            remote_file_id=(
+                remote_stat.file_id
+                if stable_remote_identity and remote_stat is not None
+                else None
+            ),
         )
 
     def _lease(self) -> AbstractContextManager[None]:
