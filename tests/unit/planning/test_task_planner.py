@@ -46,28 +46,60 @@ class SmbGateway:
 
 
 class AtomicRepository:
-    def __init__(self, *, fail: bool = False, events: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        fail: bool = False,
+        events: list[str] | None = None,
+        sample_limit: int = 20,
+    ) -> None:
         self.fail = fail
         self.calls: list[str] = []
-        self.persisted: tuple[object, ...] = ()
+        self.sample_limit = sample_limit
+        self.samples: tuple[object, ...] = ()
+        self.item_count = 0
+        self.max_batch = 0
         self.events = events
 
-    def persist_plan(self, task: object, batches: object) -> None:
+    def create_task(self, task: object, items: object) -> None:
         del task
-        self.calls.append("persist_plan")
+        self.calls.append("create_task")
         if self.events is not None:
-            self.events.append("persist_plan")
+            self.events.append("create_task")
         pending: list[object] = []
+        consumed = 0
+        current_batch = 0
         try:
-            for batch in batches:
-                assert len(batch) <= 1000
-                pending.extend(batch)
+            for item in items:
+                consumed += 1
+                current_batch += 1
+                self.max_batch = max(self.max_batch, current_batch)
+                if len(pending) < self.sample_limit:
+                    pending.append(item)
+                if current_batch == 1000:
+                    current_batch = 0
                 if self.fail:
                     raise RuntimeError("simulated transaction failure")
         except Exception:
             pending.clear()
+            self.item_count = 0
+            self.samples = ()
             raise
-        self.persisted = tuple(pending)
+        self.item_count = consumed
+        self.samples = tuple(pending)
+
+    @property
+    def persisted(self) -> tuple[object, ...]:
+        return self.samples
+
+
+class EarlyStopRepository:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def create_task(self, task: object, items: object) -> None:
+        del task, items
+        self.calls += 1
 
 
 def config() -> ConnectionConfig:
@@ -106,16 +138,13 @@ def test_planner_preserves_top_level_and_skips_links_and_special_files(tmp_path:
     assert paths["Source/pipe"].state is ItemState.SKIPPED
 
 
-def test_empty_directory_is_planned() -> None:
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as directory:
-        source = Path(directory) / "Empty"
-        source.mkdir()
-        repository = AtomicRepository()
-        planned = TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
-            PlanRequest("copy", config(), (source,), RemotePath("incoming"))
-        )
+def test_empty_directory_is_planned(tmp_path: Path) -> None:
+    source = tmp_path / "Empty"
+    source.mkdir()
+    repository = AtomicRepository()
+    planned = TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+        PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+    )
 
     assert planned.item_count == 1
     item = repository.persisted[0]
@@ -134,7 +163,8 @@ def test_planner_batches_every_thousand_items(tmp_path: Path) -> None:
         PlanRequest("copy", config(), (source,), RemotePath("incoming"))
     )
 
-    assert len(repository.persisted) == 1001
+    assert repository.item_count == 1001
+    assert repository.max_batch <= 1000
 
 
 def test_space_reserve_is_one_gib_or_five_percent(tmp_path: Path) -> None:
@@ -175,21 +205,31 @@ def test_successful_space_check_precedes_persistence(tmp_path: Path) -> None:
         PlanRequest("copy", config(), (source,), RemotePath("incoming"))
     )
 
-    assert events[:2] == ["free_space", "persist_plan"]
+    assert events[:2] == ["free_space", "create_task"]
 
 
-def test_repository_failure_rolls_back_plan() -> None:
-    import tempfile
-
-    with tempfile.TemporaryDirectory() as directory:
-        source = Path(directory) / "file.txt"
-        source.write_text("payload")
-        repository = AtomicRepository(fail=True)
-        with pytest.raises(RuntimeError):
-            TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
-                PlanRequest("copy", config(), (source,), RemotePath("incoming"))
-            )
+def test_repository_failure_rolls_back_plan(tmp_path: Path) -> None:
+    source = tmp_path / "file.txt"
+    source.write_text("payload")
+    repository = AtomicRepository(fail=True)
+    with pytest.raises(RuntimeError):
+        TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+            PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+        )
     assert repository.persisted == ()
+
+
+def test_repository_must_consume_items_completely(tmp_path: Path) -> None:
+    source = tmp_path / "file.txt"
+    source.write_text("payload")
+    repository = EarlyStopRepository()
+
+    with pytest.raises(DomainValidationError):
+        TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+            PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+        )
+
+    assert repository.calls == 1
 
 
 def test_sources_must_not_overlap(tmp_path: Path) -> None:
@@ -272,3 +312,79 @@ def test_directory_replaced_by_symlink_is_not_followed(tmp_path: Path, monkeypat
     assert len(items) == 1
     assert items[0].relative_path.as_posix() == "Source/nested"
     assert items[0].state is ItemState.SKIPPED
+
+
+def test_explicit_source_rejects_symlink_ancestor(tmp_path: Path) -> None:
+    real_parent = tmp_path / "real"
+    real_parent.mkdir()
+    source = real_parent / "file.txt"
+    source.write_text("payload")
+    alias_parent = tmp_path / "alias"
+    alias_parent.symlink_to(real_parent, target_is_directory=True)
+
+    with pytest.raises(DomainValidationError):
+        TaskPlanner(LocalGateway(), SmbGateway()).plan(
+            PlanRequest("copy", config(), (alias_parent / "file.txt",), RemotePath("incoming"))
+        )
+
+
+def test_hard_link_alias_sources_are_rejected(tmp_path: Path) -> None:
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("payload")
+    second.hardlink_to(first)
+
+    with pytest.raises(DomainValidationError):
+        TaskPlanner(LocalGateway(), SmbGateway()).plan(
+            PlanRequest("copy", config(), (first, second), RemotePath("incoming"))
+        )
+
+
+def test_file_replaced_by_symlink_after_stat_is_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    source = tmp_path / "Source"
+    source.mkdir()
+    file_path = source / "file.txt"
+    file_path.write_text("payload")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret")
+    repository = AtomicRepository()
+    real_open = planner_module.os.open
+    replaced = False
+
+    def replacing_open(path, flags, mode=0o777, *, dir_fd=None):
+        nonlocal replaced
+        if dir_fd is not None and path == "file.txt" and not replaced:
+            file_path.unlink()
+            file_path.symlink_to(outside)
+            replaced = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(planner_module.os, "open", replacing_open)
+    TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+        PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+    )
+
+    items = repository.persisted
+    assert len(items) == 1
+    assert items[0].relative_path.as_posix() == "Source/file.txt"
+    assert items[0].state is ItemState.SKIPPED
+
+
+def test_planner_scans_each_source_once(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source = tmp_path / "file.txt"
+    source.write_text("payload")
+    planner = TaskPlanner(LocalGateway(), SmbGateway(), AtomicRepository())
+    real_scan = planner._scan
+    scan_count = 0
+
+    def counting_scan(root: Path):
+        nonlocal scan_count
+        scan_count += 1
+        yield from real_scan(root)
+
+    monkeypatch.setattr(planner, "_scan", counting_scan)
+    planner.plan(PlanRequest("copy", config(), (source,), RemotePath("incoming")))
+
+    assert scan_count == 1
