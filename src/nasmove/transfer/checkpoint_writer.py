@@ -69,6 +69,8 @@ class LocalFileGateway(Protocol):
 class SmbGateway(Protocol):
     def is_generation_current(self, generation: int) -> bool: ...
 
+    def session_lease(self, generation: int) -> AbstractContextManager[None]: ...
+
     def stat(self, path: RemotePath) -> RemoteStat | None: ...
 
     def open_update(self, path: RemotePath) -> AbstractContextManager[BinaryIO]: ...
@@ -147,13 +149,18 @@ class CheckpointWriter:
                             if offset != item.source_fingerprint.size:
                                 raise OSError("local source ended before its planned size")
                             if offset != last_persisted or last_persisted == start_offset:
-                                self._persist_checkpoint(
+                                persisted = self._persist_checkpoint(
                                     item=item,
                                     offset=offset,
                                     source=source,
                                     session=session,
                                     remote=remote,
+                                    token=active_token,
                                 )
+                                if not persisted:
+                                    return CopyResult(
+                                        CopyOutcome.CANCELLED, last_persisted, last_persisted
+                                    )
                                 last_persisted = offset
                             return CopyResult(CopyOutcome.COMPLETED, offset, last_persisted)
 
@@ -163,13 +170,18 @@ class CheckpointWriter:
                             return CopyResult(CopyOutcome.CANCELLED, last_persisted, last_persisted)
                         pause = _pause_requested(active_token)
                         if offset - last_persisted >= CHECKPOINT_BYTES or pause:
-                            self._persist_checkpoint(
+                            persisted = self._persist_checkpoint(
                                 item=item,
                                 offset=offset,
                                 source=source,
                                 session=session,
                                 remote=remote,
+                                token=active_token,
                             )
+                            if not persisted:
+                                return CopyResult(
+                                    CopyOutcome.CANCELLED, last_persisted, last_persisted
+                                )
                             last_persisted = offset
                             if pause:
                                 return CopyResult(CopyOutcome.PAUSED, offset, last_persisted)
@@ -220,29 +232,36 @@ class CheckpointWriter:
         source: BinaryIO,
         session: SessionInfo,
         remote: BinaryIO,
-    ) -> None:
+        token: CancellationToken | None,
+    ) -> bool:
+        if _cancel_requested(token):
+            return False
         window_length = min(IO_BLOCK_BYTES, offset)
         window_start = offset - window_length
         digest = sha256_range(source, window_start, window_length)
         source.seek(offset)
-        self._assert_generation(session)
-        remote.flush()
-        self._assert_generation(session)
-        remote_stat = self._smb.stat(item.temp_path)
-        self._assert_generation(session)
-        if remote_stat is None or remote_stat.is_directory or remote_stat.size != offset:
-            raise OSError("remote flush length could not be confirmed")
-        self._repository.save_checkpoint(
-            Checkpoint(
-                item_id=item.id,
-                confirmed_offset=offset,
-                remote_size=remote_stat.size,
-                window_start=window_start,
-                window_length=window_length,
-                window_sha256=digest,
-                session_generation=session.session_generation,
+        if _cancel_requested(token):
+            return False
+        with self._smb.session_lease(session.session_generation):
+            self._assert_generation(session)
+            remote.flush()
+            self._assert_generation(session)
+            remote_stat = self._smb.stat(item.temp_path)
+            self._assert_generation(session)
+            if remote_stat is None or remote_stat.is_directory or remote_stat.size != offset:
+                raise OSError("remote flush length could not be confirmed")
+            self._repository.save_checkpoint(
+                Checkpoint(
+                    item_id=item.id,
+                    confirmed_offset=offset,
+                    remote_size=remote_stat.size,
+                    window_start=window_start,
+                    window_length=window_length,
+                    window_sha256=digest,
+                    session_generation=session.session_generation,
+                )
             )
-        )
+        return True
 
     def _assert_generation(self, session: SessionInfo) -> None:
         checker = getattr(self._smb, "is_generation_current", None)

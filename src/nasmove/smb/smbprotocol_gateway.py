@@ -4,6 +4,7 @@ import ipaddress
 import stat as stat_module
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
+from threading import RLock, get_ident
 from typing import Any, BinaryIO, cast
 
 import smbclient  # type: ignore[import-untyped]
@@ -86,50 +87,77 @@ class SmbProtocolGateway:
         self._config: ConnectionConfig | None = None
         self._session_generation = 0
         self._active_generation: int | None = None
+        self._lifecycle_lock = RLock()
+        self._lease_owner: int | None = None
 
     def connect(self, config: ConnectionConfig, password: str) -> SessionInfo:
-        if self._active_generation is not None:
-            self.disconnect()
-        host = self._normalize_component(config.host, "host")
-        self._normalize_component(config.share, "share")
-        username = f"{config.domain}\\{config.username}" if config.domain else config.username
-        session = smbclient.register_session(
-            host,
-            username=username,
-            password=password,
-            port=config.port,
-            encrypt=config.require_encryption,
-            connection_cache=self._connection_cache,
-            require_signing=True,
-        )
-        dialect_value = cast(int | None, session.connection.dialect)
-        minimum = _DIALECT_VALUES.get(config.minimum_dialect)
-        if minimum is None or dialect_value is None or dialect_value < minimum:
-            self._clear_connection_cache()
-            raise UnsupportedSmbDialectError("negotiated SMB dialect is below the configured minimum")
+        with self._lifecycle_lock:
+            self._ensure_lifecycle_available()
+            if self._active_generation is not None:
+                self._disconnect_unlocked()
+            host = self._normalize_component(config.host, "host")
+            self._normalize_component(config.share, "share")
+            username = f"{config.domain}\\{config.username}" if config.domain else config.username
+            session = smbclient.register_session(
+                host,
+                username=username,
+                password=password,
+                port=config.port,
+                encrypt=config.require_encryption,
+                connection_cache=self._connection_cache,
+                require_signing=True,
+            )
+            dialect_value = cast(int | None, session.connection.dialect)
+            minimum = _DIALECT_VALUES.get(config.minimum_dialect)
+            if minimum is None or dialect_value is None or dialect_value < minimum:
+                self._clear_connection_cache()
+                raise UnsupportedSmbDialectError("negotiated SMB dialect is below the configured minimum")
 
-        self._session_generation += 1
-        self._active_generation = self._session_generation
-        self._config = config
-        return SessionInfo(
-            dialect=_DIALECT_NAMES.get(dialect_value, f"0x{dialect_value:04x}"),
-            signing=bool(session.signing_required),
-            encryption=bool(session.encrypt_data),
-            session_generation=self._session_generation,
-        )
+            self._session_generation += 1
+            self._active_generation = self._session_generation
+            self._config = config
+            return SessionInfo(
+                dialect=_DIALECT_NAMES.get(dialect_value, f"0x{dialect_value:04x}"),
+                signing=bool(session.signing_required),
+                encryption=bool(session.encrypt_data),
+                session_generation=self._session_generation,
+            )
 
     def disconnect(self) -> None:
-        self._active_generation = None
-        self._config = None
-        self._clear_connection_cache()
+        with self._lifecycle_lock:
+            self._ensure_lifecycle_available()
+            self._disconnect_unlocked()
 
     def reset_connection(self) -> None:
+        with self._lifecycle_lock:
+            self._ensure_lifecycle_available()
+            self._disconnect_unlocked()
+
+    def is_generation_current(self, generation: int) -> bool:
+        with self._lifecycle_lock:
+            return self._active_generation == generation
+
+    @contextmanager
+    def session_lease(self, generation: int) -> Iterator[None]:
+        with self._lifecycle_lock:
+            if self._active_generation != generation:
+                raise StaleSmbHandleError("SMB session generation is no longer current")
+            if self._lease_owner is not None:
+                raise RuntimeError("SMB session lease is already held")
+            self._lease_owner = get_ident()
+            try:
+                yield
+            finally:
+                self._lease_owner = None
+
+    def _ensure_lifecycle_available(self) -> None:
+        if self._lease_owner == get_ident():
+            raise RuntimeError("SMB session lifecycle cannot change during a lease")
+
+    def _disconnect_unlocked(self) -> None:
         self._active_generation = None
         self._config = None
         self._clear_connection_cache()
-
-    def is_generation_current(self, generation: int) -> bool:
-        return self._active_generation == generation
 
     def stat(self, path: RemotePath) -> RemoteStat | None:
         try:

@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePosixPath
+from threading import RLock
 from typing import BinaryIO
 
 import pytest
@@ -26,11 +27,12 @@ class TransferLocal:
         self.content = content
         self.trace = trace
         self.cancel_token: TransferToken | None = None
+        self.cancel_on_eof = False
 
     @contextmanager
     def open_read(self, path: Path) -> Iterator[BinaryIO]:
         del path
-        yield _TracingLocalStream(self.content, self.trace, self.cancel_token)
+        yield _TracingLocalStream(self.content, self.trace, self.cancel_token, self.cancel_on_eof)
 
 
 class _TracingLocalStream(BytesIO):
@@ -39,10 +41,12 @@ class _TracingLocalStream(BytesIO):
         content: bytes,
         trace: list[str],
         cancel_token: TransferToken | None,
+        cancel_on_eof: bool,
     ) -> None:
         super().__init__(content)
         self._trace = trace
         self._cancel_token = cancel_token
+        self._cancel_on_eof = cancel_on_eof
         self._read_count = 0
         self._hashing = False
 
@@ -55,6 +59,8 @@ class _TracingLocalStream(BytesIO):
         result = super().read(size)
         self._read_count += 1
         if result and self._cancel_token is not None and self._read_count == 1:
+            self._cancel_token.cancel_requested = True
+        if not result and self._cancel_token is not None and self._cancel_on_eof:
             self._cancel_token.cancel_requested = True
         if self._hashing and result:
             self._trace.append("local.hash")
@@ -74,6 +80,9 @@ class TransferRemote:
         self.fail_stat = False
         self.short_write = False
         self.active_generation = 1
+        self._lifecycle_lock = RLock()
+        self._lease_owner: int | None = None
+        self.generation_switch_blocked = False
         self.pending: dict[str, bytearray] = {}
         self.switch_generation_after_flush = False
         self.switch_generation_after_stat = False
@@ -121,7 +130,33 @@ class TransferRemote:
         return result
 
     def is_generation_current(self, generation: int) -> bool:
-        return self.active_generation == generation
+        with self._lifecycle_lock:
+            return self.active_generation == generation
+
+    @contextmanager
+    def session_lease(self, generation: int) -> Iterator[None]:
+        with self._lifecycle_lock:
+            if not self.is_generation_current(generation):
+                raise OSError("stale session")
+            self._lease_owner = 1
+            try:
+                yield
+            finally:
+                self._lease_owner = None
+
+    def request_generation_switch(self) -> bool:
+        acquired = self._lifecycle_lock.acquire(blocking=False)
+        if not acquired:
+            self.generation_switch_blocked = True
+            return False
+        try:
+            if self._lease_owner is not None:
+                self.generation_switch_blocked = True
+                return False
+            self.active_generation += 1
+            return True
+        finally:
+            self._lifecycle_lock.release()
 
     def flush(self, stream: BinaryIO, offset: int) -> None:
         del stream

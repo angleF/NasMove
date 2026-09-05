@@ -119,3 +119,40 @@ def test_cancel_stops_at_block_boundary_without_checkpointing_pending_block(fake
     assert fake_dependencies.repository.checkpoints == []
     assert not any(entry.startswith("remote.flush") for entry in fake_dependencies.trace)
     assert not any(entry.startswith("repository.save_checkpoint") for entry in fake_dependencies.trace)
+
+
+def test_cancel_on_eof_skips_final_checkpoint(fake_dependencies) -> None:
+    fake_dependencies.local.cancel_token = fake_dependencies.cancellation_token
+    fake_dependencies.local.cancel_on_eof = True
+    writer = CheckpointWriter(**fake_dependencies.as_kwargs())
+
+    result = writer.copy(
+        item=fake_dependencies.item(size=IO_BLOCK_BYTES),
+        start_offset=0,
+        session=fake_dependencies.session(generation=1),
+    )
+
+    assert result.outcome.value == "cancelled"
+    assert result.confirmed_offset == 0
+    assert fake_dependencies.repository.checkpoints == []
+
+
+def test_repository_save_runs_inside_session_lease(fake_dependencies) -> None:
+    original_save = fake_dependencies.repository.save_checkpoint
+
+    def save_with_switch_request(checkpoint) -> None:
+        assert fake_dependencies.remote.request_generation_switch() is False
+        original_save(checkpoint)
+
+    fake_dependencies.repository.save_checkpoint = save_with_switch_request  # type: ignore[method-assign]
+    writer = CheckpointWriter(**fake_dependencies.as_kwargs())
+
+    result = writer.copy(
+        item=fake_dependencies.item(size=IO_BLOCK_BYTES),
+        start_offset=0,
+        session=fake_dependencies.session(generation=1),
+    )
+
+    assert result.outcome.value == "completed"
+    assert result.confirmed_offset == IO_BLOCK_BYTES
+    assert fake_dependencies.remote.generation_switch_blocked is True
