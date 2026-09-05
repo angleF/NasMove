@@ -1,1 +1,5 @@
-pytest_plugins = ("tests.fixtures.security", "tests.fixtures.transfer")
+pytest_plugins = (
+    "tests.fixtures.security",
+    "tests.fixtures.transfer",
+    "tests.fixtures.application",
+)

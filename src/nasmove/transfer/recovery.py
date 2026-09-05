@@ -10,6 +10,7 @@ from nasmove.core.model import (
     Checkpoint,
     RemotePath,
     SourceFingerprint,
+    TaskRecord,
     TransferItemId,
     TransferItemRecord,
 )
@@ -46,6 +47,10 @@ class TaskRepository(Protocol):
     def get_item(self, item_id: TransferItemId) -> TransferItemRecord: ...
 
     def checkpoints_desc(self, item_id: TransferItemId) -> list[Checkpoint]: ...
+
+    def list_incomplete_tasks(self) -> list[TaskRecord]: ...
+
+    def mark_active_tasks_interrupted(self) -> int: ...
 
 
 class LocalFileGateway(Protocol):
@@ -90,6 +95,20 @@ class RecoveryCoordinator:
         self._local = local_gateway
         self._smb = smb_gateway
         self._session = session
+
+    def mark_active_tasks_interrupted(self) -> int:
+        """Persist the restart boundary before any task is inspected."""
+        marker = getattr(self._repository, "mark_active_tasks_interrupted", None)
+        if not callable(marker):
+            raise TypeError("repository must provide mark_active_tasks_interrupted()")
+        return int(marker())
+
+    def list_incomplete_tasks(self) -> list[TaskRecord]:
+        """Return the durable queue snapshot used by application startup."""
+        listing = getattr(self._repository, "list_incomplete_tasks", None)
+        if not callable(listing):
+            raise TypeError("repository must provide list_incomplete_tasks()")
+        return list(listing())
 
     def find_safe_offset(self, item_id: TransferItemId) -> RecoveryDecision:
         item = self._repository.get_item(item_id)
