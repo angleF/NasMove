@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 from threading import RLock
@@ -94,6 +94,9 @@ class TransferRemote:
         self.switch_generation_after_flush = False
         self.switch_generation_after_stat = False
         self.fail_stat_after_flush = False
+        self.remote_read_started_at: int | None = None
+        self.crash_before_rename = False
+        self.crash_after_rename = False
 
     @contextmanager
     def create_exclusive(self, path: RemotePath) -> Iterator[BinaryIO]:
@@ -142,7 +145,9 @@ class TransferRemote:
         value = self.files.get(path.value)
         if value is None:
             raise FileNotFoundError(path.value)
-        yield BytesIO(bytes(value))
+        stream = BytesIO(bytes(value))
+        self.remote_read_started_at = stream.tell()
+        yield stream
 
     def truncate(self, path: RemotePath, size: int) -> None:
         self.trace.append(f"remote.truncate@{size}")
@@ -152,11 +157,23 @@ class TransferRemote:
 
     def rename_exclusive(self, source: RemotePath, target: RemotePath) -> None:
         self.trace.append(f"remote.rename@{target.value}")
+        if self.crash_before_rename:
+            raise RuntimeError("injected crash before rename")
         if target.value in self.files:
             raise FileExistsError(target.value)
         if source.value not in self.files:
             raise FileNotFoundError(source.value)
         self.files[target.value] = self.files.pop(source.value)
+        if self.crash_after_rename:
+            raise RuntimeError("injected crash after rename")
+
+    def list_dir(self, path: RemotePath) -> list[object]:
+        prefix = path.value + "/"
+        return [
+            type("Entry", (), {"name": name[len(prefix) :], "is_directory": False, "size": len(value)})
+            for name, value in self.files.items()
+            if name.startswith(prefix) and "/" not in name[len(prefix) :]
+        ]
 
     def is_generation_current(self, generation: int) -> bool:
         with self._lifecycle_lock:
@@ -243,6 +260,20 @@ class TransferRepository:
             key=lambda checkpoint: (checkpoint.created_at, checkpoint.confirmed_offset),
             reverse=True,
         )
+
+    def update_item_metadata(self, item: TransferItemRecord, expected_revision: int) -> None:
+        current = self.items[item.id]
+        if current.revision != expected_revision or current.state != item.state:
+            raise RuntimeError("stale item revision")
+        self.items[item.id] = replace(item, revision=expected_revision + 1)
+        self.trace.append(f"repository.update_item@{item.final_path.value}")
+
+    def transition_item(self, item_id: TransferItemId, expected: ItemState, target: ItemState) -> None:
+        current = self.items[item_id]
+        if current.state is not expected:
+            raise RuntimeError("unexpected item state")
+        self.items[item_id] = replace(current, state=target, revision=current.revision + 1)
+        self.trace.append(f"repository.transition_item@{target.value}")
 
 
 class TransferToken:
@@ -391,4 +422,105 @@ def fake_dependencies() -> FakeDependencies:
         repository=TransferRepository(trace),
         trace=trace,
         cancellation_token=TransferToken(),
+    )
+
+
+@dataclass
+class VerificationFixture:
+    local: TransferLocal
+    remote: TransferRemote
+    repository: TransferRepository
+    verifier: object
+    item: TransferItemRecord
+
+    @property
+    def source_bytes(self) -> bytes:
+        return self.local.content
+
+    @source_bytes.setter
+    def source_bytes(self, value: bytes) -> None:
+        self.local.content = value
+        self.item = replace(
+            self.item,
+            source_fingerprint=SourceFingerprint(1, 2, SourceKind.FILE, len(value), 1),
+        )
+        self.repository.items[self.item.id] = self.item
+
+    @property
+    def remote_bytes(self) -> bytes:
+        return bytes(self.remote.files.get(self.item.temp_path.value, b""))
+
+    @remote_bytes.setter
+    def remote_bytes(self, value: bytes) -> None:
+        self.remote.files[self.item.temp_path.value] = bytearray(value)
+
+
+@pytest.fixture
+def verification_fixture() -> VerificationFixture:
+    from nasmove.transfer.verification import IntegrityVerifier
+
+    trace: list[str] = []
+    content = b"verified payload"
+    local = TransferLocal(content, trace)
+    remote = TransferRemote(trace)
+    remote.files["target/.file.bin.part"] = bytearray(content)
+    repository = TransferRepository(trace)
+    item = FakeDependencies(local, remote, repository, trace, TransferToken()).item(size=len(content))
+    repository.items[item.id] = item
+    return VerificationFixture(
+        local=local,
+        remote=remote,
+        repository=repository,
+        verifier=IntegrityVerifier(repository, local, remote, session_generation=1),
+        item=item,
+    )
+
+
+@dataclass
+class CommitFixture:
+    local: TransferLocal
+    remote: TransferRemote
+    repository: TransferRepository
+    committer: object
+    item: TransferItemRecord
+
+    def occupy(self, name: str) -> None:
+        self.remote.files[f"target/{name}"] = bytearray(self.local.content)
+
+    def valid_verification(self) -> object:
+        from nasmove.localio.hashing import sha256_stream
+        from nasmove.transfer.verification import VerificationResult
+
+        with self.local.open_read(self.item.source_path) as source:
+            digest = sha256_stream(source)
+        return VerificationResult(
+            matches=True,
+            source_unchanged=True,
+            source_hash=digest.hexdigest,
+            remote_hash=digest.hexdigest,
+            source_bytes=digest.byte_count,
+            remote_bytes=digest.byte_count,
+            session_generation=1,
+        )
+
+
+@pytest.fixture
+def commit_fixture() -> CommitFixture:
+    from nasmove.transfer.commit import TargetCommitter
+
+    trace: list[str] = []
+    content = b"movie payload"
+    local = TransferLocal(content, trace)
+    remote = TransferRemote(trace)
+    remote.files["target/.file.bin.part"] = bytearray(content)
+    repository = TransferRepository(trace)
+    item = FakeDependencies(local, remote, repository, trace, TransferToken()).item(size=len(content))
+    item = replace(item, final_path=RemotePath("target/movie.mov"), state=ItemState.VERIFIED)
+    repository.items[item.id] = item
+    return CommitFixture(
+        local=local,
+        remote=remote,
+        repository=repository,
+        committer=TargetCommitter(repository, remote, session_generation=1),
+        item=item,
     )
