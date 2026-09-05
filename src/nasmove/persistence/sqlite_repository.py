@@ -110,7 +110,7 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
                 batch.append(item)
                 if len(batch) == self.BATCH_SIZE:
                     self._insert_item_batch(batch)
-                    batch.clear()
+                    batch = []
             if batch:
                 self._insert_item_batch(batch)
             self._commit()
