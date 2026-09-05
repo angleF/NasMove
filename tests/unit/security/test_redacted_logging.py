@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 import sys
+import uuid
 from pathlib import Path
 
 from nasmove.security.redacted_logging import RedactingFilter, configure_logging
@@ -290,3 +292,54 @@ def test_dynamic_child_extra_is_sanitized_before_private_handler(tmp_path: Path)
     assert "POST_FACTORY_SECRET" not in output
     assert "NESTED_SECRET" not in output
     assert "nested ordinary" not in output
+
+
+def test_make_log_record_none_name_is_compatible_after_configuration(tmp_path: Path) -> None:
+    configure_logging(tmp_path / "secure")
+    record = logging.makeLogRecord({"name": "other-component", "msg": "x", "args": ()})
+    assert record.name == "other-component"
+
+
+def test_make_log_record_post_update_for_nasmove_is_sanitized(tmp_path: Path) -> None:
+    configure_logging(tmp_path / "secure")
+    record = logging.makeLogRecord({
+        "name": "nasmove.socket",
+        "msg": "password=POST_FACTORY_SECRET",
+        "args": (),
+        "task_id": "password=EXTRA_SECRET",
+        "nested": {"authorization": "Bearer NESTED_SECRET"},
+    })
+    handler = logging.FileHandler(tmp_path / "make-record.log", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s %(task_id)s %(nested)s"))
+    handler.addFilter(RedactingFilter())
+    handler.handle(record)
+    handler.close()
+    output = (tmp_path / "make-record.log").read_text()
+    assert "POST_FACTORY_SECRET" not in output
+    assert "EXTRA_SECRET" not in output
+    assert "NESTED_SECRET" not in output
+
+
+def test_escaped_quote_sensitive_values_are_redacted_to_line_end() -> None:
+    for message in ('password="pa\\"SECRET" trailing', "passwd='pa\\'SECRET' trailing"):
+        output = _message(message)
+        assert "SECRET" not in output and "trailing" not in output
+
+
+def test_standard_tmp_symlink_ancestor_is_allowed_but_unknown_symlink_is_rejected(tmp_path: Path) -> None:
+    standard = Path("/tmp") / f"nasmove-{uuid.uuid4().hex}"
+    standard.mkdir(mode=0o700)
+    try:
+        configure_logging(standard / "nested")
+    finally:
+        shutil.rmtree(standard)
+    real = tmp_path / "real"
+    real.mkdir()
+    unknown = tmp_path / "unknown"
+    unknown.symlink_to(real, target_is_directory=True)
+    try:
+        configure_logging(unknown / "nested")
+    except OSError:
+        pass
+    else:
+        raise AssertionError("unknown symlink ancestor must be rejected")

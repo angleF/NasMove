@@ -51,7 +51,7 @@ _AUTH_HEADER_RE = re.compile(r"(?i)\b(?:authorization\s*[:=]\s*)?(?:bearer|basic
 _KEY_VALUE_RE = re.compile(
     r"(?i)(?P<key>password|passwd|passphrase|token|secret(?:[_-][^\s:=]+)?|authorization(?:[_-]header)?|"
     r"bearer|basic|ntlm(?:[_-]response)?|ticket|session[_-]?key(?:[_-]id)?|hash|username|user_name)"
-    r"\s*[:=]\s*(?:\"[^\"]*\"|'[^']*'|[^\r\n]*)"
+    r"\s*[:=][^\r\n]*"
 )
 _SMB_URL_RE = re.compile(
     r"(?i)(?P<scheme>(?:smb|cifs)://)(?P<userinfo>[^/\\\s@]+@)?(?P<host>[^/\\\s]+)(?P<path>/[^\r\n]*)?"
@@ -209,15 +209,17 @@ class RedactingFilter(logging.Filter):
 
 _ORIGINAL_FACTORY: Callable[..., logging.LogRecord] | None = None
 _ORIGINAL_MAKE_RECORD: Callable[..., logging.LogRecord] | None = None
+_ORIGINAL_MAKE_LOG_RECORD: Callable[..., logging.LogRecord] | None = None
 _FACTORY_LOCK = threading.Lock()
 _MAKE_RECORD_LOCK = threading.Lock()
+_MAKE_LOG_RECORD_LOCK = threading.Lock()
 
 
 def _nasmove_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
     if _ORIGINAL_FACTORY is None:
         raise RuntimeError("NasMove record factory is not initialized")
     record = _ORIGINAL_FACTORY(*args, **kwargs)
-    if record.name == "nasmove" or record.name.startswith("nasmove."):
+    if isinstance(record.name, str) and (record.name == "nasmove" or record.name.startswith("nasmove.")):
         RedactingFilter().filter(record)
     return record
 
@@ -249,6 +251,25 @@ def _install_make_record_wrapper() -> None:
             return
         _ORIGINAL_MAKE_RECORD = current
         logging.Logger.makeRecord = _nasmove_make_record  # type: ignore[assignment,method-assign]
+
+
+def _nasmove_make_log_record(dictionary: Mapping[str, Any]) -> logging.LogRecord:
+    if _ORIGINAL_MAKE_LOG_RECORD is None:
+        raise RuntimeError("NasMove makeLogRecord is not initialized")
+    record = _ORIGINAL_MAKE_LOG_RECORD(dictionary)
+    if isinstance(record.name, str) and (record.name == "nasmove" or record.name.startswith("nasmove.")):
+        RedactingFilter().filter(record)
+    return record
+
+
+def _install_make_log_record_wrapper() -> None:
+    global _ORIGINAL_MAKE_LOG_RECORD
+    with _MAKE_LOG_RECORD_LOCK:
+        current = logging.makeLogRecord
+        if current is _nasmove_make_log_record:
+            return
+        _ORIGINAL_MAKE_LOG_RECORD = current
+        logging.makeLogRecord = _nasmove_make_log_record  # type: ignore[assignment]
 
 
 def _run_acl_command(arguments: list[str]) -> str:
@@ -316,7 +337,17 @@ def _ensure_private_directory(path: Path) -> None:
     current = Path(path.anchor)
     for part in path.parts[1:]:
         current /= part
-        if current.is_symlink() or (current.exists() and not current.is_dir()):
+        if current.is_symlink():
+            resolved = current.resolve()
+            known_system_symlink = {
+                Path("/tmp"): Path("/private/tmp"),
+                Path("/var"): Path("/private/var"),
+            }
+            if current in known_system_symlink and resolved == known_system_symlink[current]:
+                _verify_acl(resolved)
+                continue
+            raise OSError("log directory must be a real directory")
+        if current.exists() and not current.is_dir():
             raise OSError("log directory must be a real directory")
         if current.exists():
             stat_result = current.lstat()
@@ -377,6 +408,7 @@ def configure_logging(log_dir: Path | None = None) -> logging.Logger:
     """Configure one private NasMove diagnostics handler and secure logger descendants."""
     _install_record_factory()
     _install_make_record_wrapper()
+    _install_make_log_record_wrapper()
     target_dir = Path(log_dir) if log_dir is not None else Path.home() / "Library" / "Logs" / "NasMove"
     _ensure_private_directory(target_dir)
     target = target_dir / "nasmove.log"
