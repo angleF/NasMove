@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import dataclass
-from threading import Lock
+from threading import Event, Lock
 from typing import Protocol, cast
 
 from nasmove.core.model import TaskId, TaskRecord, TransferItemId, TransferItemRecord
@@ -349,11 +349,33 @@ class QueueCoordinator:
         self._repository = repository
         self._queue: list[TaskId] = []
         self._run_lock = Lock()
+        self._active_token: CancellationToken | None = None
+        self._active_done = Event()
+        self._active_done.set()
+        self._accepting = True
 
     def enqueue(self, task_id: TaskId | str) -> None:
+        if not self._accepting:
+            raise RuntimeError("queue is stopping")
         normalized = TaskId(str(task_id))
         if normalized not in self._queue:
             self._queue.append(normalized)
+
+    def stop_accepting(self) -> None:
+        self._accepting = False
+
+    def request_pause(self) -> None:
+        token = self._active_token
+        if token is not None:
+            token.request_pause()
+
+    def wait_for_safe_boundary(self, timeout: float) -> bool:
+        """Wait until the current engine call returns after a safe block boundary."""
+        return self._active_done.wait(timeout)
+
+    def flush_and_checkpoint(self) -> None:
+        """Formal lifecycle hook; the writer flushes before each durable checkpoint."""
+        return
 
     def run_next(self, token: CancellationToken | None = None) -> TaskResult | None:
         if not self._run_lock.acquire(blocking=False):
@@ -368,7 +390,14 @@ class QueueCoordinator:
                 task_id = None if task is None else task.id
             if task_id is None:
                 return None
-            return self._engine.run_task(task_id, token or CancellationToken())
+            active_token = token or CancellationToken()
+            self._active_token = active_token
+            self._active_done.clear()
+            try:
+                return self._engine.run_task(task_id, active_token)
+            finally:
+                self._active_token = None
+                self._active_done.set()
         finally:
             self._run_lock.release()
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from threading import Event, Thread
 
 import pytest
 
@@ -95,3 +96,125 @@ def test_shutdown_rejects_new_tasks(app_fixture) -> None:
 
     with pytest.raises(RuntimeError, match="stopping"):
         app_fixture.service.enqueue("later")
+
+
+def test_real_queue_timeout_keeps_resources_until_engine_reaches_boundary(app_fixture) -> None:
+    from nasmove.core.states import TaskState
+    from nasmove.transfer.transfer_engine import QueueCoordinator, TaskResult
+
+    started = Event()
+    release = Event()
+
+    class BlockingEngine:
+        def run_task(self, task_id, token):
+            del task_id
+            started.set()
+            while not token.pause_requested:
+                release.wait(0.001)
+            release.wait()
+            return TaskResult(False, TaskState.PAUSED)
+
+    queue = QueueCoordinator(BlockingEngine())
+    app_fixture.service = type(app_fixture.service)(
+        repository=app_fixture.repository,
+        queue=queue,
+        smb_gateway=app_fixture.smb,
+        credential_store=app_fixture.credentials,
+        lock_path=app_fixture.lock_path,
+    )
+    app_fixture.service.start()
+    worker = Thread(target=queue.run_next)
+    worker.start()
+    assert started.wait(1)
+
+    first = app_fixture.service.request_shutdown(timeout=0.01)
+
+    assert first.completed is False
+    assert first.timed_out is True
+    assert app_fixture.smb.closed is False
+    assert app_fixture.repository.closed is False
+
+    release.set()
+    worker.join(1)
+    second = app_fixture.service.request_shutdown(timeout=1)
+
+    assert second.completed is True
+    from nasmove.app import SingleInstanceLock
+
+    probe = SingleInstanceLock(app_fixture.lock_path)
+    assert probe.acquire() is True
+    probe.release()
+
+
+def test_default_repository_is_lazy_until_lock_is_owned(app_fixture, monkeypatch) -> None:
+    import nasmove.app as app_module
+    from nasmove.app import ApplicationService
+
+    first_lock = ApplicationService(
+        repository=app_fixture.repository,
+        queue=app_fixture.queue,
+        lock_path=app_fixture.lock_path,
+    )
+    assert first_lock.start().started is True
+
+    created: list[object] = []
+
+    class RepositoryFactory:
+        def __init__(self, path):
+            created.append(path)
+
+    monkeypatch.setattr(app_module, "SqliteTaskRepository", RepositoryFactory)
+    second = ApplicationService(
+        queue=app_fixture.queue,
+        lock_path=app_fixture.lock_path,
+        database_path=app_fixture.lock_path.with_name("nasmove.db"),
+    )
+
+    report = second.start()
+
+    assert report.already_running is True
+    assert created == []
+    first_lock.request_shutdown(timeout=1)
+
+
+def test_flush_failure_returns_safe_result_and_releases_lock(app_fixture) -> None:
+    app_fixture.service.start()
+    app_fixture.queue.boundary_reached.set()
+    app_fixture.queue.fail_flush = True
+
+    result = app_fixture.service.request_shutdown(timeout=1)
+
+    assert result.completed is False
+    assert result.error is not None
+    from nasmove.app import SingleInstanceLock
+
+    probe = SingleInstanceLock(app_fixture.lock_path)
+    assert probe.acquire() is True
+    probe.release()
+
+
+def test_pause_persistence_failure_returns_safe_result_and_releases_lock(app_fixture) -> None:
+    app_fixture.service.start()
+    app_fixture.queue.boundary_reached.set()
+    app_fixture.repository.fail_transition = True
+
+    result = app_fixture.service.request_shutdown(timeout=1)
+
+    assert result.completed is False
+    assert result.error is not None
+    from nasmove.app import SingleInstanceLock
+
+    probe = SingleInstanceLock(app_fixture.lock_path)
+    assert probe.acquire() is True
+    probe.release()
+
+
+def test_shutdown_can_be_retried_after_timeout(app_fixture) -> None:
+    app_fixture.service.start()
+    first = app_fixture.service.request_shutdown(timeout=0.001)
+    assert first.timed_out is True
+
+    app_fixture.queue.boundary_reached.set()
+    second = app_fixture.service.request_shutdown(timeout=1)
+
+    assert second.completed is True

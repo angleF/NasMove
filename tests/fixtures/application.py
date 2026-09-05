@@ -17,6 +17,7 @@ class ApplicationRepository:
         self.trace = trace
         self.tasks: dict[TaskId, TaskRecord] = {}
         self.closed = False
+        self.fail_transition = False
 
     def seed(self, task: TaskRecord) -> None:
         self.tasks[task.id] = task
@@ -55,6 +56,8 @@ class ApplicationRepository:
 
     def transition_task(self, task_id: TaskId, expected: TaskState, target: TaskState) -> None:
         self.trace.append(f"transition:{target.value}")
+        if self.fail_transition:
+            raise OSError("injected persistence failure")
         task = self.tasks[task_id]
         if task.state is not expected:
             raise RuntimeError("unexpected task state")
@@ -75,6 +78,7 @@ class ApplicationQueue:
         self.accepting = True
         self.boundary_reached = Event()
         self.flush_called = False
+        self.fail_flush = False
 
     def enqueue(self, task_id: TaskId) -> None:
         if not self.accepting:
@@ -95,6 +99,8 @@ class ApplicationQueue:
 
     def flush_and_checkpoint(self) -> None:
         self.trace.append("flush_checkpoint")
+        if self.fail_flush:
+            raise OSError("injected flush failure")
         self.flush_called = True
 
 

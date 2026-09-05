@@ -159,9 +159,11 @@ class ApplicationService:
         database_path: Path | str | None = None,
     ) -> None:
         self._owns_repository = repository is None
-        if repository is None:
-            database = Path(database_path) if database_path is not None else Path.home() / _APPLICATION_DIR / _DEFAULT_DATABASE_NAME
-            repository = SqliteTaskRepository(database)
+        self._database_path = (
+            Path(database_path)
+            if database_path is not None
+            else Path.home() / _APPLICATION_DIR / _DEFAULT_DATABASE_NAME
+        )
         self._repository = repository
         self._recovery = recovery
         self._queue = queue if queue is not None else queue_coordinator
@@ -185,6 +187,8 @@ class ApplicationService:
         if not self._lock.acquire():
             return StartupReport(False, already_running=True, error="已有 NasMove 实例正在运行")
         try:
+            if self._repository is None:
+                self._repository = SqliteTaskRepository(self._database_path)
             self._integrity_check()
             interrupted = self._mark_interrupted()
             tasks = self._list_incomplete()
@@ -229,28 +233,48 @@ class ApplicationService:
                 timed_out=True,
                 message="仍在安全暂停中",
             )
-        self._call_optional(self._queue, "flush_and_checkpoint")
-        paused = self._pause_active_tasks()
+        failure: BaseException | None = None
         try:
-            self._close_smb()
+            self._call_optional(self._queue, "flush_and_checkpoint")
+        except Exception as error:  # noqa: BLE001 - shutdown must release the lock
+            failure = error
+        try:
+            paused = self._pause_active_tasks()
+        except Exception as error:  # noqa: BLE001 - shutdown must release the lock
+            paused = 0
+            failure = failure or error
+        try:
+            try:
+                self._close_smb()
+            except Exception as error:  # noqa: BLE001 - continue ordered cleanup
+                failure = failure or error
         finally:
             try:
-                self._close_repository()
+                try:
+                    self._close_repository()
+                except Exception as error:  # noqa: BLE001 - lock must not leak
+                    failure = failure or error
             finally:
-                self._lock.release()
-        self._started = False
+                try:
+                    self._lock.release()
+                finally:
+                    self._started = False
         return ShutdownResult(
-            True,
+            failure is None,
             paused_tasks=paused,
             message="已安全暂停并关闭",
+            error=None if failure is None else "shutdown persistence failed",
         )
 
     def _integrity_check(self) -> None:
-        checker = getattr(self._repository, "integrity_check", None)
+        repository = self._repository
+        if repository is None:
+            raise RuntimeError("repository is unavailable")
+        checker = getattr(repository, "integrity_check", None)
         if callable(checker):
             result = checker()
         else:
-            connection = getattr(self._repository, "_connection", None)
+            connection = getattr(repository, "_connection", None)
             if not isinstance(connection, sqlite3.Connection):
                 return
             row = connection.execute("PRAGMA integrity_check").fetchone()
@@ -259,19 +283,25 @@ class ApplicationService:
             raise DatabaseIntegrityError("SQLite integrity check failed")
 
     def _mark_interrupted(self) -> int:
+        repository = self._repository
+        if repository is None:
+            raise RuntimeError("repository is unavailable")
         marker = getattr(self._recovery, "mark_active_tasks_interrupted", None)
         if callable(marker):
             return int(marker())
-        marker = getattr(self._repository, "mark_active_tasks_interrupted", None)
+        marker = getattr(repository, "mark_active_tasks_interrupted", None)
         if not callable(marker):
             raise TypeError("repository must provide mark_active_tasks_interrupted()")
         return int(marker())
 
     def _list_incomplete(self) -> list[Any]:
+        repository = self._repository
+        if repository is None:
+            raise RuntimeError("repository is unavailable")
         listing = getattr(self._recovery, "list_incomplete_tasks", None)
         if callable(listing):
             return list(listing())
-        listing = getattr(self._repository, "list_incomplete_tasks", None)
+        listing = getattr(repository, "list_incomplete_tasks", None)
         if not callable(listing):
             raise TypeError("repository must provide list_incomplete_tasks()")
         return list(listing())
@@ -291,7 +321,10 @@ class ApplicationService:
             return True
         if task.state not in _ACTIVE_STATES:
             return False
-        transition = getattr(self._repository, "transition_task", None)
+        repository = self._repository
+        if repository is None:
+            return False
+        transition = getattr(repository, "transition_task", None)
         if not callable(transition):
             return False
         transition(task.id, task.state, TaskState.PAUSED)
@@ -344,7 +377,9 @@ class ApplicationService:
             self._call_optional(self._smb, "disconnect")
 
     def _close_repository(self) -> None:
-        self._call_optional(self._repository, "close")
+        repository, self._repository = self._repository, None if self._owns_repository else self._repository
+        if repository is not None:
+            self._call_optional(repository, "close")
 
     @staticmethod
     def _call_optional(target: object, method_name: str, *args: object) -> object | None:

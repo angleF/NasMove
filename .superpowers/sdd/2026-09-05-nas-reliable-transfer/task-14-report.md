@@ -56,3 +56,26 @@ git diff --check
 ## 提交
 
 提交信息：`feat: recover tasks across app restarts`
+
+## 独立复审修复
+
+复审发现并修复以下问题：
+
+- `QueueCoordinator` 现提供正式的 `stop_accepting()`、`request_pause()`、`wait_for_safe_boundary()` 和 `flush_and_checkpoint()` 生命周期协议；活动 token 由真实 `run_next()` 绑定，应用只有在 engine 返回安全边界后才会 flush、持久化暂停并关闭 SMB／SQLite／锁。超时保持资源和锁，允许后续 `request_shutdown()` 重试。
+- 默认 SQLite 仓储改为获得单实例锁后惰性创建，锁冲突不会打开或泄漏数据库；外部注入仓储仍由调用方管理。
+- flush、暂停持久化和关闭异常均转换为安全的 `ShutdownResult`，仍按 SMB → SQLite → 锁顺序清理；重复 shutdown 稳定返回，不留下僵尸锁。
+- 新增真实 QueueCoordinator 阻塞 engine 多线程测试、锁冲突下惰性仓储测试、flush／暂停异常测试、超时重试测试；强退测试使用子进程在写块／刷新／校验／重命名／删除状态窗口退出，再真实 SQLite 重开并验证进入 `INTERRUPTED` 且源文件保留。
+
+复审修复先运行 RED，再实现 GREEN：
+
+```text
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest tests/unit/test_app_recovery.py tests/unit/transfer/test_queue.py -q
+5 failed, 12 passed
+```
+
+修复后定向测试：
+
+```text
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest tests/unit/test_app_recovery.py tests/unit/transfer/test_queue.py tests/fault/test_forced_quit_recovery.py -q
+23 passed
+```
