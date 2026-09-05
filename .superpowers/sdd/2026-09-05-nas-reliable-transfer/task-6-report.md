@@ -170,3 +170,34 @@ Success: no issues found in 18 source files
 ### 提交
 
 本轮修复提交为 `ccd36a7097893e2dfaa5e5509dad627126c3c33c`（`fix: sanitize logging extra fields`）。
+
+## 独立审查修复轮次 4／5
+
+### RED／GREEN
+
+新增 `logging.makeLogRecord` 兼容、post-factory 字典更新、转义引号凭据与标准 `/tmp` symlink ancestor 回归测试；修复前安全定向测试为 `4 failed, 27 passed`。修复后：
+
+```text
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest tests/unit/security -q
+31 passed
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/python -m pytest -q
+594 passed, 1 skipped
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/ruff check src/nasmove/security tests/unit/security tests/fixtures/security.py tests/conftest.py
+All checks passed!
+
+/Users/fuzhaoliang/miniconda3/envs/nasmove-py312/bin/mypy src/nasmove
+Success: no issues found in 18 source files
+```
+
+### 逐项处理证据
+
+1. factory 对 `record.name` 做 `str` 类型判断，`name=None` 的标准 `logging.makeLogRecord` 不再抛异常；新增 `makeLogRecord` wrapper 在 post-factory 字典更新后清洗 NasMove 记录，覆盖敏感 msg 与 nested extra。
+2. 敏感键值正则改为整行匹配，转义双引号／单引号无法留下尾部 secret 或普通文本。
+3. `/tmp` 与 `/var` 的已知系统 symlink ancestor 解析到固定目标并继续 ACL 检查；未知 symlink 仍拒绝，逐级目录安全校验保持不变。
+4. LogRecordFactory 与 makeLogRecord wrapper 分别使用锁幂等安装，保留原始 factory／函数链；非 NasMove 记录走标准行为。
+
+### 提交
+
+本轮修复提交为 `5333ff8366de10d0f1bd447ef654ef35e7a42792`（`fix: harden logging compatibility edges`）。
