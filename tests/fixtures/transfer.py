@@ -95,10 +95,11 @@ class TransferRemote:
         self.switch_generation_after_stat = False
         self.fail_stat_after_flush = False
         self.remote_read_started_at: int | None = None
-        self.file_ids: dict[str, str] = {}
+        self.file_ids: dict[str, str | None] = {}
         self.next_file_id = 1
         self.replace_after_read = False
         self.replace_after_rename = False
+        self.replacement_without_file_id = False
         self.replacement_content = b"corrupted payload"
         self.crash_before_rename = False
         self.crash_after_rename = False
@@ -140,10 +141,10 @@ class TransferRemote:
         if self.fail_stat_after_flush and value:
             raise OSError("stat failure after flush")
         self.trace.append(f"remote.stat@{len(value)}")
-        result = RemoteStat(
-            len(value), False, 0, self.file_ids.setdefault(path.value, f"file-{self.next_file_id}")
-        )
-        self.next_file_id += 1
+        if path.value not in self.file_ids:
+            self.file_ids[path.value] = f"file-{self.next_file_id}"
+            self.next_file_id += 1
+        result = RemoteStat(len(value), False, 0, self.file_ids[path.value])
         if self.switch_generation_after_stat:
             self.active_generation += 1
             self.switch_generation_after_stat = False
@@ -162,8 +163,11 @@ class TransferRemote:
         finally:
             if self.replace_after_read:
                 self.files[path.value] = bytearray(self.replacement_content)
-                self.file_ids[path.value] = f"file-{self.next_file_id}"
-                self.next_file_id += 1
+                if self.replacement_without_file_id:
+                    self.file_ids[path.value] = None
+                else:
+                    self.file_ids[path.value] = f"file-{self.next_file_id}"
+                    self.next_file_id += 1
 
     def truncate(self, path: RemotePath, size: int) -> None:
         self.trace.append(f"remote.truncate@{size}")

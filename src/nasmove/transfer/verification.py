@@ -126,6 +126,9 @@ class IntegrityVerifier:
             and not identity_changed
             and source_result.byte_count == expected.size
             and remote_result.byte_count == expected.size
+            and after_remote_stat is not None
+            and after_remote_stat.size == remote_result.byte_count
+            and after_remote_stat.size == expected.size
             and source_result.byte_count == remote_result.byte_count
             and source_result.hexdigest == remote_result.hexdigest
         )

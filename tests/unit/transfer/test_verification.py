@@ -39,3 +39,14 @@ def test_full_verification_rejects_same_length_remote_replacement(verification_f
     verification_fixture.remote.replacement_content = b"changed payload!"
     result = verification_fixture.verifier.verify_full(verification_fixture.item)
     assert result.matches is False
+
+
+def test_full_verification_rejects_different_length_replacement_without_file_id(
+    verification_fixture,
+) -> None:
+    verification_fixture.remote.replace_after_read = True
+    verification_fixture.remote.replacement_without_file_id = True
+    verification_fixture.remote.replacement_content = b"different length content"
+    verification_fixture.remote.file_ids[verification_fixture.item.temp_path.value] = None
+    result = verification_fixture.verifier.verify_full(verification_fixture.item)
+    assert result.matches is False
