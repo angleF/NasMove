@@ -389,6 +389,43 @@ def test_mark_active_recovery_failure_rolls_back_generation_and_evidence(tmp_pat
     reopened.close()
 
 
+def test_permission_hardening_failure_happens_before_create_commit(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "permission-create.db"
+    repository = SqliteTaskRepository(path)
+
+    def fail_hardening():
+        raise PermissionError("injected permission failure")
+
+    monkeypatch.setattr(repository, "_harden_database_permissions", fail_hardening)
+    with pytest.raises(PermissionError):
+        repository.create_task(build_task_record(), [build_transfer_item_record()])
+    repository.close()
+    raw = sqlite3.connect(path)
+    assert raw.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+    assert raw.execute("SELECT count(*) FROM transfer_items").fetchone()[0] == 0
+    raw.close()
+
+
+def test_permission_hardening_failure_happens_before_checkpoint_commit(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "permission-checkpoint.db"
+    repository = SqliteTaskRepository(path)
+    task = build_task_record()
+    item = _item("permission-item", task.id)
+    repository.create_task(task, [item])
+
+    def fail_hardening():
+        raise PermissionError("injected permission failure")
+
+    monkeypatch.setattr(repository, "_harden_database_permissions", fail_hardening)
+    with pytest.raises(PermissionError):
+        repository.save_checkpoint(Checkpoint(item.id, 64, 128, 60, 4, "a" * 64, 1))
+    repository.close()
+    reopened = SqliteTaskRepository(path)
+    assert reopened.get_item(item.id).confirmed_offset == 0
+    assert reopened.checkpoints_desc(item.id) == []
+    reopened.close()
+
+
 def test_old_schema_version_is_rejected(tmp_path) -> None:
     path = tmp_path / "old.db"
     raw = sqlite3.connect(path)
@@ -400,14 +437,54 @@ def test_old_schema_version_is_rejected(tmp_path) -> None:
         SqliteTaskRepository(path)
 
 
-def test_database_directory_and_file_are_private(tmp_path) -> None:
+@pytest.mark.parametrize("kind", ["table", "view", "index", "trigger"])
+def test_database_with_objects_but_missing_schema_version_is_rejected(tmp_path, kind: str) -> None:
+    path = tmp_path / f"legacy-{kind}.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE legacy_data (id INTEGER PRIMARY KEY, value TEXT)")
+    raw.execute("INSERT INTO legacy_data(value) VALUES ('keep')")
+    if kind == "view":
+        raw.execute("CREATE VIEW legacy_view AS SELECT * FROM legacy_data")
+    elif kind == "index":
+        raw.execute("CREATE INDEX legacy_index ON legacy_data(value)")
+    elif kind == "trigger":
+        raw.execute("CREATE TRIGGER legacy_trigger AFTER INSERT ON legacy_data BEGIN SELECT 1; END")
+    raw.commit()
+    raw.close()
+    with pytest.raises(RuntimeError):
+        SqliteTaskRepository(path)
+    check = sqlite3.connect(path)
+    assert check.execute("SELECT value FROM legacy_data").fetchone()[0] == "keep"
+    assert check.execute(
+        "SELECT count(*) FROM sqlite_master WHERE name = 'schema_meta'"
+    ).fetchone()[0] == 0
+    check.close()
+
+
+def test_new_database_directory_and_file_are_private(tmp_path) -> None:
     database_dir = tmp_path / "state"
-    database_dir.mkdir(mode=0o755)
     database_path = database_dir / "nasmove.db"
     repository = SqliteTaskRepository(database_path)
     repository.close()
     assert stat.S_IMODE(os.stat(database_dir).st_mode) == 0o700
     assert stat.S_IMODE(os.stat(database_path).st_mode) == 0o600
+
+
+def test_existing_wide_database_directory_is_rejected_without_chmod(tmp_path) -> None:
+    database_dir = tmp_path / "Documents"
+    database_dir.mkdir(mode=0o755)
+    before = stat.S_IMODE(os.stat(database_dir).st_mode)
+    with pytest.raises(PermissionError):
+        SqliteTaskRepository(database_dir / "nasmove.db")
+    assert stat.S_IMODE(os.stat(database_dir).st_mode) == before
+
+
+def test_existing_private_database_directory_is_accepted(tmp_path) -> None:
+    database_dir = tmp_path / "state"
+    database_dir.mkdir(mode=0o700)
+    repository = SqliteTaskRepository(database_dir / "nasmove.db")
+    repository.close()
+    assert stat.S_IMODE(os.stat(database_dir).st_mode) == 0o700
 
 
 def test_symlink_parent_and_database_are_rejected(tmp_path) -> None:

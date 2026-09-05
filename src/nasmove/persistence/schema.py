@@ -164,7 +164,13 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     existing = connection.execute(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
     ).fetchone()
-    if existing is not None:
+    if existing is None:
+        user_objects = connection.execute(
+            "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+        if user_objects:
+            raise RuntimeError("database contains user objects but no schema version")
+    else:
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'version'"
         ).fetchone()

@@ -87,16 +87,21 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
     def _prepare_database_path(self) -> None:
         parent = self.database_path.parent
         self._reject_symlink_ancestors(parent)
+        created_parent = False
         try:
             parent_info = os.lstat(parent)
         except FileNotFoundError:
             parent.mkdir(parents=True, mode=0o700)
             parent_info = os.lstat(parent)
+            created_parent = True
         if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
             raise ValueError("database parent must be a real directory")
         if parent_info.st_uid != os.getuid():
             raise PermissionError("database parent must be owned by the current user")
-        os.chmod(parent, 0o700)
+        if created_parent:
+            os.chmod(parent, 0o700)
+        elif stat.S_IMODE(parent_info.st_mode) & 0o077:
+            raise PermissionError("database parent must not be accessible by group or other users")
         try:
             database_info = os.lstat(self.database_path)
         except FileNotFoundError:
@@ -155,8 +160,8 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         self._connection.execute("BEGIN IMMEDIATE")
 
     def _commit(self) -> None:
-        self._connection.commit()
         self._harden_database_permissions()
+        self._connection.commit()
 
     def _rollback(self) -> None:
         if self._connection.in_transaction:

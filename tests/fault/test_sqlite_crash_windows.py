@@ -64,6 +64,11 @@ repository.save_checkpoint(Checkpoint(r"{item.id}", 64, 1024, 60, 4, "a" * 64, 1
     result = subprocess.run([sys.executable, "-c", script], check=False, timeout=10)
     assert result.returncode in {31, 32, 33}
     reopened = SqliteTaskRepository(path)
-    assert reopened.get_item(item.id).confirmed_offset == 0
+    restored = reopened.get_item(item.id)
+    assert restored.revision == 0
+    assert restored.confirmed_offset == 0
     assert reopened.checkpoints_desc(item.id) == []
+    raw = sqlite3.connect(path)
+    assert raw.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
+    raw.close()
     reopened.close()
