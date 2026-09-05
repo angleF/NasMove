@@ -16,3 +16,7 @@ class ConcurrentStateChange(DomainValidationError):
 
 class UnsafeSourceDeletion(DomainValidationError):
     """Raised when evidence is insufficient to delete a source item."""
+
+
+class UnsafeCredentialBackend(DomainValidationError):
+    """Raised when credentials cannot be stored in the macOS Keychain backend."""
