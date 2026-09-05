@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import sqlite3
+import stat
 from collections.abc import Iterable, Sequence
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
@@ -63,19 +65,80 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
     """Durable TaskRepository implementation backed by SQLite."""
 
     BATCH_SIZE = 1_000
+    _INITIAL_TASK_STATES = frozenset({TaskState.DRAFT, TaskState.PREFLIGHT, TaskState.QUEUED})
+    _INITIAL_ITEM_STATES = frozenset({ItemState.PLANNED, ItemState.SKIPPED})
 
     def __init__(self, database_path: Path | str) -> None:
         self.database_path = Path(database_path)
-        if str(database_path) != ":memory:":
-            self.database_path.parent.mkdir(parents=True, exist_ok=True)
-        sqlite_target: Path | str = ":memory:" if str(database_path) == ":memory:" else self.database_path
-        self._connection = sqlite3.connect(sqlite_target, timeout=5.0)
+        if str(database_path) == ":memory:":
+            raise ValueError("persistent repository requires a filesystem database")
+        if not self.database_path.is_absolute():
+            raise ValueError("database path must be absolute")
+        self._prepare_database_path()
+        self._connection = sqlite3.connect(self.database_path, timeout=5.0)
         self._connection.row_factory = sqlite3.Row
-        initialize_database(self._connection)
+        try:
+            initialize_database(self._connection)
+        except BaseException:
+            self._connection.close()
+            raise
+        self._harden_database_permissions()
 
-    @property
-    def connection(self) -> sqlite3.Connection:
-        return self._connection
+    def _prepare_database_path(self) -> None:
+        parent = self.database_path.parent
+        self._reject_symlink_ancestors(parent)
+        try:
+            parent_info = os.lstat(parent)
+        except FileNotFoundError:
+            parent.mkdir(parents=True, mode=0o700)
+            parent_info = os.lstat(parent)
+        if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(parent_info.st_mode):
+            raise ValueError("database parent must be a real directory")
+        if parent_info.st_uid != os.getuid():
+            raise PermissionError("database parent must be owned by the current user")
+        os.chmod(parent, 0o700)
+        try:
+            database_info = os.lstat(self.database_path)
+        except FileNotFoundError:
+            self._validate_sidecars()
+            return
+        if stat.S_ISLNK(database_info.st_mode) or not stat.S_ISREG(database_info.st_mode):
+            raise ValueError("database target must be a regular file")
+        if database_info.st_uid != os.getuid():
+            raise PermissionError("database must be owned by the current user")
+        os.chmod(self.database_path, 0o600)
+        self._validate_sidecars()
+
+    def _validate_sidecars(self) -> None:
+        for sidecar in (Path(f"{self.database_path}-wal"), Path(f"{self.database_path}-shm")):
+            try:
+                info = os.lstat(sidecar)
+            except FileNotFoundError:
+                continue
+            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+                raise ValueError("SQLite sidecar must be a regular file")
+            if info.st_uid != os.getuid():
+                raise PermissionError("SQLite sidecar must be owned by the current user")
+            os.chmod(sidecar, 0o600)
+
+    @staticmethod
+    def _reject_symlink_ancestors(path: Path) -> None:
+        current = Path(path.anchor)
+        for component in path.parts[1:]:
+            current /= component
+            try:
+                info = os.lstat(current)
+            except FileNotFoundError:
+                break
+            if stat.S_ISLNK(info.st_mode):
+                resolved = current.resolve()
+                if current in {Path("/var"), Path("/tmp")} and resolved == Path("/private") / current.relative_to("/"):
+                    continue
+                raise ValueError("database path must not traverse a symlink")
+
+    def _harden_database_permissions(self) -> None:
+        os.chmod(self.database_path, 0o600)
+        self._validate_sidecars()
 
     def close(self) -> None:
         if self._connection is not None:
@@ -93,12 +156,15 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
 
     def _commit(self) -> None:
         self._connection.commit()
+        self._harden_database_permissions()
 
     def _rollback(self) -> None:
         if self._connection.in_transaction:
             self._connection.rollback()
 
     def create_task(self, task: TaskRecord, items: Iterable[TransferItemRecord]) -> None:
+        if task.state not in self._INITIAL_TASK_STATES:
+            raise ValueError("task has an invalid initial state")
         self._begin()
         try:
             self._insert_connection_profile(task.connection)
@@ -107,6 +173,8 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
             for item in items:
                 if item.task_id != task.id:
                     raise ValueError("transfer item belongs to a different task")
+                if item.state not in self._INITIAL_ITEM_STATES:
+                    raise ValueError("transfer item has an invalid initial state")
                 batch.append(item)
                 if len(batch) == self.BATCH_SIZE:
                     self._insert_item_batch(batch)
@@ -383,13 +451,29 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         self._begin()
         try:
             placeholders = ",".join("?" for _ in _ACTIVE_TASK_STATES)
+            unfinished_placeholders = ",".join("?" for _ in _TERMINAL_TASK_STATES)
+            active_count = int(self._connection.execute(
+                f"SELECT count(*) FROM tasks WHERE state IN ({placeholders})",
+                tuple(state.value for state in _ACTIVE_TASK_STATES),
+            ).fetchone()[0])
             result = self._connection.execute(
-                f"UPDATE tasks SET state = ?, revision = revision + 1, updated_at = ? "
-                f"WHERE state IN ({placeholders})",
-                (TaskState.INTERRUPTED.value, _encode_datetime(datetime.now(UTC)))
-                + tuple(state.value for state in _ACTIVE_TASK_STATES),
+                f"UPDATE tasks SET state = CASE WHEN state IN ({placeholders}) "
+                f"THEN ? ELSE state END, recovery_generation = recovery_generation + 1, "
+                f"revision = revision + 1, updated_at = ? WHERE state NOT IN ({unfinished_placeholders})",
+                tuple(state.value for state in _ACTIVE_TASK_STATES)
+                + (TaskState.INTERRUPTED.value, _encode_datetime(datetime.now(UTC)))
+                + tuple(state.value for state in _TERMINAL_TASK_STATES),
             )
-            count = result.rowcount
+            if result.rowcount < active_count:
+                raise ConcurrentStateChange("active task recovery update was incomplete")
+            self._connection.execute(
+                f"UPDATE transfer_items SET full_hash_verified = 0, "
+                f"verified_session_generation = NULL, revision = revision + 1 "
+                f"WHERE task_id IN (SELECT task_id FROM tasks WHERE state NOT IN ({unfinished_placeholders})) "
+                "AND (full_hash_verified <> 0 OR verified_session_generation IS NOT NULL)",
+                tuple(state.value for state in _TERMINAL_TASK_STATES),
+            )
+            count = active_count
             self._commit()
             return count
         except BaseException:

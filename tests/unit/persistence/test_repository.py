@@ -1,4 +1,6 @@
+import os
 import sqlite3
+import stat
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -96,7 +98,9 @@ def test_create_task_consumes_iterable_in_batches_and_rolls_back_iteration_failu
     reopened = SqliteTaskRepository(path)
     with pytest.raises(KeyError):
         reopened.get_task(task.id)
-    assert reopened.connection.execute("SELECT count(*) FROM transfer_items").fetchone()[0] == 0
+    raw = sqlite3.connect(path)
+    assert raw.execute("SELECT count(*) FROM transfer_items").fetchone()[0] == 0
+    raw.close()
     reopened.close()
 
 
@@ -119,8 +123,10 @@ def test_create_task_rolls_back_insert_and_commit_failures(tmp_path, monkeypatch
             repository.create_task(task, [_item(f"item-{suffix}", task.id)])
         repository.close()
         reopened = SqliteTaskRepository(path)
-        assert reopened.connection.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
-        assert reopened.connection.execute("SELECT count(*) FROM transfer_items").fetchone()[0] == 0
+        raw = sqlite3.connect(path)
+        assert raw.execute("SELECT count(*) FROM tasks").fetchone()[0] == 0
+        assert raw.execute("SELECT count(*) FROM transfer_items").fetchone()[0] == 0
+        raw.close()
         reopened.close()
 
 
@@ -209,16 +215,27 @@ def test_queue_order_and_incomplete_filter_are_deterministic(tmp_path) -> None:
         )
     ]
     for index, task in enumerate(tasks):
+        requested_state = task.state
+        task = replace(task, state=TaskState.DRAFT)
         repository.create_task(task, [_item(f"item-{index}", task.id)])
+        if requested_state is TaskState.QUEUED:
+            repository.transition_task(task.id, TaskState.DRAFT, TaskState.PREFLIGHT)
+            repository.transition_task(task.id, TaskState.PREFLIGHT, TaskState.QUEUED)
+        elif requested_state is TaskState.COMPLETED:
+            repository.transition_task(task.id, TaskState.DRAFT, TaskState.PREFLIGHT)
+            repository.transition_task(task.id, TaskState.PREFLIGHT, TaskState.QUEUED)
+            repository.transition_task(task.id, TaskState.QUEUED, TaskState.CANCELED)
     assert repository.next_queued_task().id == TaskId("task-1")
     assert [task.id for task in repository.list_incomplete_tasks()] == [TaskId("task-1"), TaskId("task-0")]
     repository.reorder_queued_tasks([TaskId("task-0"), TaskId("task-1")])
     assert repository.next_queued_task().id == TaskId("task-0")
-    before = [row[0] for row in repository.connection.execute("SELECT task_id FROM tasks ORDER BY task_id")]
+    raw = sqlite3.connect(tmp_path / "queue.db")
+    before = [row[0] for row in raw.execute("SELECT task_id FROM tasks ORDER BY task_id")]
     with pytest.raises(ValueError):
         repository.reorder_queued_tasks([TaskId("task-0"), TaskId("task-0")])
-    after = [row[0] for row in repository.connection.execute("SELECT task_id FROM tasks ORDER BY task_id")]
+    after = [row[0] for row in raw.execute("SELECT task_id FROM tasks ORDER BY task_id")]
     assert before == after
+    raw.close()
     repository.close()
 
 
@@ -226,7 +243,10 @@ def test_mark_active_tasks_interrupted_is_atomic_and_excludes_queued(tmp_path) -
     repository = SqliteTaskRepository(tmp_path / "interrupted.db")
     active = replace(build_task_record(), id=TaskId("active"), state=TaskState.RUNNING)
     queued = replace(build_task_record(), id=TaskId("queued"), state=TaskState.QUEUED)
-    repository.create_task(active, [_item("active-item", active.id)])
+    repository.create_task(replace(active, state=TaskState.DRAFT), [_item("active-item", active.id)])
+    repository.transition_task(active.id, TaskState.DRAFT, TaskState.PREFLIGHT)
+    repository.transition_task(active.id, TaskState.PREFLIGHT, TaskState.QUEUED)
+    repository.transition_task(active.id, TaskState.QUEUED, TaskState.RUNNING)
     repository.create_task(queued, [_item("queued-item", queued.id)])
     assert repository.mark_active_tasks_interrupted() == 1
     assert repository.get_task(active.id).state is TaskState.INTERRUPTED
@@ -239,14 +259,178 @@ def test_foreign_keys_and_unique_ids_are_enforced(tmp_path) -> None:
     task = build_task_record()
     item = build_transfer_item_record()
     repository.create_task(task, [item])
-    with pytest.raises(sqlite3.IntegrityError):
-        repository.connection.execute(
+    raw = sqlite3.connect(tmp_path / "constraints.db")
+    raw.execute("PRAGMA foreign_keys = ON")
+    try:
+        with pytest.raises(sqlite3.IntegrityError):
+            raw.execute(
             "INSERT INTO transfer_items(item_id, task_id, source_path, relative_path, final_path, temp_path, "
             "source_device, source_inode, source_kind, source_size, source_mtime_ns, state, confirmed_offset, "
             "retry_count, full_hash_verified, revision) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             ("other", "missing-task", "/x", "x", "target/x", "target/.x", 1, 1, "file", 0, 0, "planned", 0, 0, 0, 0),
         )
-    repository.connection.rollback()
+    finally:
+        raw.rollback()
+        raw.close()
     with pytest.raises(sqlite3.IntegrityError):
         repository.create_task(task, [])
     repository.close()
+
+
+def test_restart_increments_recovery_and_revokes_old_verification(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "recovery.db")
+    active = replace(build_task_record(), id=TaskId("active"), state=TaskState.RUNNING)
+    paused = replace(build_task_record(), id=TaskId("paused"), state=TaskState.PAUSED)
+    waiting = replace(build_task_record(), id=TaskId("waiting"), state=TaskState.WAITING_FOR_NETWORK)
+    queued = replace(build_task_record(), id=TaskId("queued"), state=TaskState.QUEUED)
+    terminal = replace(build_task_record(), id=TaskId("terminal"), state=TaskState.COMPLETED)
+    for index, task in enumerate((active, paused, waiting, queued, terminal)):
+        item = replace(
+            _item(f"item-{index}", task.id),
+            full_hash_verified=True,
+            sha256="a" * 64,
+            verified_session_generation=1,
+        )
+        seed = replace(task, state=TaskState.DRAFT)
+        repository.create_task(seed, [item])
+        if task.state is TaskState.RUNNING:
+            repository.transition_task(task.id, TaskState.DRAFT, TaskState.PREFLIGHT)
+            repository.transition_task(task.id, TaskState.PREFLIGHT, TaskState.QUEUED)
+            repository.transition_task(task.id, TaskState.QUEUED, TaskState.RUNNING)
+        elif task.state is TaskState.PAUSED:
+            repository.transition_task(task.id, TaskState.DRAFT, TaskState.PREFLIGHT)
+            repository.transition_task(task.id, TaskState.PREFLIGHT, TaskState.QUEUED)
+            repository.transition_task(task.id, TaskState.QUEUED, TaskState.PAUSED)
+        elif task.state is TaskState.WAITING_FOR_NETWORK:
+            repository.transition_task(task.id, TaskState.DRAFT, TaskState.PREFLIGHT)
+            repository.transition_task(task.id, TaskState.PREFLIGHT, TaskState.QUEUED)
+            repository.transition_task(task.id, TaskState.QUEUED, TaskState.RUNNING)
+            repository.transition_task(task.id, TaskState.RUNNING, TaskState.WAITING_FOR_NETWORK)
+        elif task.state is TaskState.COMPLETED:
+            repository.transition_task(task.id, TaskState.DRAFT, TaskState.PREFLIGHT)
+            repository.transition_task(task.id, TaskState.PREFLIGHT, TaskState.QUEUED)
+            repository.transition_task(task.id, TaskState.QUEUED, TaskState.RUNNING)
+            repository.transition_task(task.id, TaskState.RUNNING, TaskState.VERIFYING)
+            repository.transition_task(task.id, TaskState.VERIFYING, TaskState.COMMITTING)
+            repository.transition_task(task.id, TaskState.COMMITTING, TaskState.COMPLETED)
+    assert repository.mark_active_tasks_interrupted() == 1
+    assert repository.get_task(active.id).state is TaskState.INTERRUPTED
+    for task in (active, paused, waiting, queued):
+        assert repository.get_task(task.id).recovery_generation == task.recovery_generation + 1
+        item = repository.get_item(TransferItemId(f"item-{(active, paused, waiting, queued).index(task)}"))
+        assert item.full_hash_verified is False
+        assert item.verified_session_generation is None
+        assert item.revision == 1
+    assert repository.get_task(terminal.id).recovery_generation == terminal.recovery_generation
+    assert repository.get_item(TransferItemId("item-4")).full_hash_verified is True
+    repository.close()
+
+
+def test_repository_rejects_non_initial_states_and_raw_state_bypass(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "guards.db")
+    invalid_task = replace(build_task_record(), state=TaskState.RUNNING)
+    with pytest.raises(ValueError):
+        repository.create_task(invalid_task, [])
+    invalid_item_task = build_task_record()
+    invalid_item = _item("invalid", invalid_item_task.id, state=ItemState.TRANSFERRING)
+    with pytest.raises(ValueError):
+        repository.create_task(invalid_item_task, [invalid_item])
+    repository.create_task(build_task_record(), [build_transfer_item_record()])
+    raw = sqlite3.connect(tmp_path / "guards.db")
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute("UPDATE transfer_items SET state = 'done' WHERE item_id = 'item-1'")
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute("UPDATE transfer_items SET source_size = -1 WHERE item_id = 'item-1'")
+    raw.rollback()
+    raw.close()
+    repository.close()
+
+
+def test_database_transition_trigger_allows_core_edge_and_rejects_bypass(tmp_path) -> None:
+    path = tmp_path / "trigger.db"
+    repository = SqliteTaskRepository(path)
+    repository.create_task(build_task_record(), [build_transfer_item_record()])
+    raw = sqlite3.connect(path)
+    raw.execute("UPDATE transfer_items SET state = 'transferring' WHERE item_id = 'item-1'")
+    with pytest.raises(sqlite3.IntegrityError):
+        raw.execute("UPDATE transfer_items SET state = 'done' WHERE item_id = 'item-1'")
+    raw.rollback()
+    raw.close()
+    repository.close()
+
+
+def test_mark_active_recovery_failure_rolls_back_generation_and_evidence(tmp_path, monkeypatch) -> None:
+    path = tmp_path / "recovery-fault.db"
+    repository = SqliteTaskRepository(path)
+    task = replace(build_task_record(), id=TaskId("recover"), state=TaskState.DRAFT)
+    item = replace(
+        _item("recover-item", task.id),
+        full_hash_verified=True,
+        sha256="a" * 64,
+        verified_session_generation=1,
+    )
+    repository.create_task(task, [item])
+    repository.transition_task(task.id, TaskState.DRAFT, TaskState.PREFLIGHT)
+    repository.transition_task(task.id, TaskState.PREFLIGHT, TaskState.QUEUED)
+    repository.transition_task(task.id, TaskState.QUEUED, TaskState.RUNNING)
+
+    def fail_commit():
+        raise OSError("crash before recovery commit")
+
+    monkeypatch.setattr(repository, "_commit", fail_commit)
+    with pytest.raises(OSError):
+        repository.mark_active_tasks_interrupted()
+    repository.close()
+    reopened = SqliteTaskRepository(path)
+    assert reopened.get_task(task.id).state is TaskState.RUNNING
+    assert reopened.get_task(task.id).recovery_generation == 1
+    assert reopened.get_item(item.id).full_hash_verified is True
+    assert reopened.get_item(item.id).verified_session_generation == 1
+    reopened.close()
+
+
+def test_old_schema_version_is_rejected(tmp_path) -> None:
+    path = tmp_path / "old.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    raw.execute("INSERT INTO schema_meta VALUES ('version', '1')")
+    raw.commit()
+    raw.close()
+    with pytest.raises(RuntimeError):
+        SqliteTaskRepository(path)
+
+
+def test_database_directory_and_file_are_private(tmp_path) -> None:
+    database_dir = tmp_path / "state"
+    database_dir.mkdir(mode=0o755)
+    database_path = database_dir / "nasmove.db"
+    repository = SqliteTaskRepository(database_path)
+    repository.close()
+    assert stat.S_IMODE(os.stat(database_dir).st_mode) == 0o700
+    assert stat.S_IMODE(os.stat(database_path).st_mode) == 0o600
+
+
+def test_symlink_parent_and_database_are_rejected(tmp_path) -> None:
+    real_dir = tmp_path / "real"
+    real_dir.mkdir()
+    symlink_dir = tmp_path / "link"
+    symlink_dir.symlink_to(real_dir, target_is_directory=True)
+    with pytest.raises(ValueError):
+        SqliteTaskRepository(symlink_dir / "nasmove.db")
+    symlink_db = tmp_path / "db-link"
+    target = tmp_path / "target.db"
+    target.touch()
+    symlink_db.symlink_to(target)
+    with pytest.raises(ValueError):
+        SqliteTaskRepository(symlink_db)
+
+
+def test_non_directory_parent_and_non_regular_database_are_rejected(tmp_path) -> None:
+    parent_file = tmp_path / "parent"
+    parent_file.write_text("x")
+    with pytest.raises(ValueError):
+        SqliteTaskRepository(parent_file / "nasmove.db")
+    directory_target = tmp_path / "directory.db"
+    directory_target.mkdir()
+    with pytest.raises(ValueError):
+        SqliteTaskRepository(directory_target)
