@@ -6,7 +6,7 @@ from nasmove.transfer.checkpoint_writer import CHECKPOINT_BYTES, CheckpointWrite
 
 
 @pytest.mark.parametrize(
-    "failure_point", ["write", "flush_before", "flush_after", "stat", "save"]
+    "failure_point", ["write", "flush_before", "flush_after", "stat", "stat_after_flush", "save"]
 )
 def test_failure_never_reports_uncommitted_checkpoint(fake_dependencies, failure_point: str) -> None:
     remote = fake_dependencies.remote
@@ -18,6 +18,8 @@ def test_failure_never_reports_uncommitted_checkpoint(fake_dependencies, failure
         remote.fail_flush_after_write = True
     elif failure_point == "stat":
         remote.fail_stat = True
+    elif failure_point == "stat_after_flush":
+        remote.fail_stat_after_flush = True
     else:
         def fail_save(*_args, **_kwargs):
             raise OSError("save failure")
@@ -58,3 +60,22 @@ def test_database_failure_after_a_committed_checkpoint_keeps_previous_offset(fak
     assert [cp.confirmed_offset for cp in fake_dependencies.repository.checkpoints] == [
         CHECKPOINT_BYTES
     ]
+
+
+@pytest.mark.parametrize("switch_point", ["flush", "stat"])
+def test_generation_change_never_commits_checkpoint(fake_dependencies, switch_point: str) -> None:
+    if switch_point == "flush":
+        fake_dependencies.remote.switch_generation_after_flush = True
+    else:
+        fake_dependencies.remote.switch_generation_after_stat = True
+    writer = CheckpointWriter(**fake_dependencies.as_kwargs())
+
+    result = writer.copy(
+        item=fake_dependencies.item(size=CHECKPOINT_BYTES),
+        start_offset=0,
+        session=fake_dependencies.session(generation=1),
+    )
+
+    assert result.outcome.value == "interrupted"
+    assert result.confirmed_offset == 0
+    assert fake_dependencies.repository.checkpoints == []

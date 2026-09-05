@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ from typing import BinaryIO, Protocol
 from nasmove.core.model import Checkpoint, RemotePath, TransferItemRecord
 from nasmove.core.ports import RemoteStat, SessionInfo
 from nasmove.core.states import SourceKind
+from nasmove.localio.hashing import sha256_range
 from nasmove.smb.smbprotocol_gateway import write_all
 
 IO_BLOCK_BYTES = 4 * 1024 * 1024
@@ -20,6 +20,7 @@ CHECKPOINT_BYTES = 64 * 1024 * 1024
 class CopyOutcome(StrEnum):
     COMPLETED = "completed"
     PAUSED = "paused"
+    CANCELLED = "cancelled"
     INTERRUPTED = "interrupted"
 
 
@@ -36,10 +37,11 @@ class CopyResult:
 
 
 class CancellationToken:
-    """Cooperative pause token checked only after each completed I/O block."""
+    """Cooperative pause/cancel token checked only at block boundaries."""
 
     def __init__(self) -> None:
         self._pause_requested = False
+        self._cancel_requested = False
 
     @property
     def pause_requested(self) -> bool:
@@ -47,6 +49,13 @@ class CancellationToken:
 
     def request_pause(self) -> None:
         self._pause_requested = True
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_requested
+
+    def request_cancel(self) -> None:
+        self._cancel_requested = True
 
 
 class TaskRepository(Protocol):
@@ -58,6 +67,8 @@ class LocalFileGateway(Protocol):
 
 
 class SmbGateway(Protocol):
+    def is_generation_current(self, generation: int) -> bool: ...
+
     def stat(self, path: RemotePath) -> RemoteStat | None: ...
 
     def open_update(self, path: RemotePath) -> AbstractContextManager[BinaryIO]: ...
@@ -71,6 +82,17 @@ def _pause_requested(token: object | None) -> bool:
     value = getattr(token, "pause_requested", None)
     if value is None:
         value = getattr(token, "is_pause_requested", False)
+    if callable(value):
+        value = value()
+    return type(value) is bool and value
+
+
+def _cancel_requested(token: object | None) -> bool:
+    if token is None:
+        return False
+    value = getattr(token, "cancel_requested", None)
+    if value is None:
+        value = getattr(token, "is_cancel_requested", False)
     if callable(value):
         value = value()
     return type(value) is bool and value
@@ -111,11 +133,12 @@ class CheckpointWriter:
         last_persisted = start_offset
         offset = start_offset
         active_token = token if token is not None else self._token
-        pending_window = b""
+        if _cancel_requested(active_token):
+            return CopyResult(CopyOutcome.CANCELLED, start_offset, last_persisted)
         try:
             with self._local.open_read(item.source_path) as source:
                 source.seek(start_offset)
-                with self._open_remote(item, start_offset) as remote:
+                with self._open_remote(item, start_offset, session) as remote:
                     while True:
                         block = source.read(IO_BLOCK_BYTES)
                         if not isinstance(block, bytes):
@@ -127,7 +150,7 @@ class CheckpointWriter:
                                 self._persist_checkpoint(
                                     item=item,
                                     offset=offset,
-                                    window=pending_window,
+                                    source=source,
                                     session=session,
                                     remote=remote,
                                 )
@@ -136,13 +159,14 @@ class CheckpointWriter:
 
                         write_all(remote, block)
                         offset += len(block)
-                        pending_window = block[-IO_BLOCK_BYTES:]
+                        if _cancel_requested(active_token):
+                            return CopyResult(CopyOutcome.CANCELLED, last_persisted, last_persisted)
                         pause = _pause_requested(active_token)
                         if offset - last_persisted >= CHECKPOINT_BYTES or pause:
                             self._persist_checkpoint(
                                 item=item,
                                 offset=offset,
-                                window=pending_window,
+                                source=source,
                                 session=session,
                                 remote=remote,
                             )
@@ -160,18 +184,30 @@ class CheckpointWriter:
             raise ValueError("start_offset must be a non-negative integer")
         if start_offset > item.source_fingerprint.size:
             raise ValueError("start_offset must not exceed source size")
+        if start_offset > item.confirmed_offset:
+            raise ValueError("start_offset must not exceed durable item checkpoint")
         if type(session.session_generation) is not int or session.session_generation <= 0:
             raise ValueError("session generation must be positive")
 
     @contextmanager
-    def _open_remote(self, item: TransferItemRecord, start_offset: int) -> Iterator[BinaryIO]:
+    def _open_remote(
+        self,
+        item: TransferItemRecord,
+        start_offset: int,
+        session: SessionInfo,
+    ) -> Iterator[BinaryIO]:
+        self._assert_generation(session)
+        current = self._smb.stat(item.temp_path)
+        self._assert_generation(session)
         if start_offset == 0:
+            if current is not None:
+                raise OSError("remote temporary file already exists for a new copy")
             with self._smb.create_exclusive(item.temp_path) as stream:
                 yield stream
             return
-        current = self._smb.stat(item.temp_path)
         if current is None or current.is_directory or current.size != start_offset:
             raise OSError("remote temporary file does not match the durable offset")
+        self._assert_generation(session)
         with self._smb.open_update(item.temp_path) as stream:
             stream.seek(start_offset)
             yield stream
@@ -181,13 +217,19 @@ class CheckpointWriter:
         *,
         item: TransferItemRecord,
         offset: int,
-        window: bytes,
+        source: BinaryIO,
         session: SessionInfo,
         remote: BinaryIO,
     ) -> None:
-        digest = hashlib.sha256(window).hexdigest()
+        window_length = min(IO_BLOCK_BYTES, offset)
+        window_start = offset - window_length
+        digest = sha256_range(source, window_start, window_length)
+        source.seek(offset)
+        self._assert_generation(session)
         remote.flush()
+        self._assert_generation(session)
         remote_stat = self._smb.stat(item.temp_path)
+        self._assert_generation(session)
         if remote_stat is None or remote_stat.is_directory or remote_stat.size != offset:
             raise OSError("remote flush length could not be confirmed")
         self._repository.save_checkpoint(
@@ -195,12 +237,17 @@ class CheckpointWriter:
                 item_id=item.id,
                 confirmed_offset=offset,
                 remote_size=remote_stat.size,
-                window_start=offset - len(window),
-                window_length=len(window),
+                window_start=window_start,
+                window_length=window_length,
                 window_sha256=digest,
                 session_generation=session.session_generation,
             )
         )
+
+    def _assert_generation(self, session: SessionInfo) -> None:
+        checker = getattr(self._smb, "is_generation_current", None)
+        if not callable(checker) or checker(session.session_generation) is not True:
+            raise OSError("SMB session generation changed during checkpoint")
 __all__ = [
     "CHECKPOINT_BYTES",
     "IO_BLOCK_BYTES",

@@ -22,13 +22,44 @@ from nasmove.core.states import ItemState, SourceKind
 
 
 class TransferLocal:
-    def __init__(self, content: bytes) -> None:
+    def __init__(self, content: bytes, trace: list[str]) -> None:
         self.content = content
+        self.trace = trace
+        self.cancel_token: TransferToken | None = None
 
     @contextmanager
     def open_read(self, path: Path) -> Iterator[BinaryIO]:
         del path
-        yield BytesIO(self.content)
+        yield _TracingLocalStream(self.content, self.trace, self.cancel_token)
+
+
+class _TracingLocalStream(BytesIO):
+    def __init__(
+        self,
+        content: bytes,
+        trace: list[str],
+        cancel_token: TransferToken | None,
+    ) -> None:
+        super().__init__(content)
+        self._trace = trace
+        self._cancel_token = cancel_token
+        self._read_count = 0
+        self._hashing = False
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        if whence == 2:
+            self._hashing = True
+        return super().seek(offset, whence)
+
+    def read(self, size: int = -1) -> bytes:
+        result = super().read(size)
+        self._read_count += 1
+        if result and self._cancel_token is not None and self._read_count == 1:
+            self._cancel_token.cancel_requested = True
+        if self._hashing and result:
+            self._trace.append("local.hash")
+            self._hashing = False
+        return result
 
 
 class TransferRemote:
@@ -42,12 +73,20 @@ class TransferRemote:
         self.fail_flush_after_write = False
         self.fail_stat = False
         self.short_write = False
+        self.active_generation = 1
+        self.pending: dict[str, bytearray] = {}
+        self.switch_generation_after_flush = False
+        self.switch_generation_after_stat = False
+        self.fail_stat_after_flush = False
 
     @contextmanager
     def create_exclusive(self, path: RemotePath) -> Iterator[BinaryIO]:
         self.trace.append(f"remote.create@{path.value}")
+        if path.value in self.files or path.value in self.pending:
+            raise FileExistsError(path.value)
         self.path = path
         self.files[path.value] = bytearray()
+        self.pending[path.value] = bytearray()
         stream = _TracingRemoteStream(self, path)
         try:
             yield stream
@@ -58,7 +97,8 @@ class TransferRemote:
     def open_update(self, path: RemotePath) -> Iterator[BinaryIO]:
         self.trace.append(f"remote.open_update@{path.value}")
         self.path = path
-        self.files.setdefault(path.value, bytearray())
+        if path.value not in self.files:
+            raise FileNotFoundError(path.value)
         stream = _TracingRemoteStream(self, path)
         try:
             yield stream
@@ -71,8 +111,17 @@ class TransferRemote:
         value = self.files.get(path.value)
         if value is None:
             return None
+        if self.fail_stat_after_flush and value:
+            raise OSError("stat failure after flush")
         self.trace.append(f"remote.stat@{len(value)}")
-        return RemoteStat(len(value), False, 0, path.value)
+        result = RemoteStat(len(value), False, 0, path.value)
+        if self.switch_generation_after_stat:
+            self.active_generation += 1
+            self.switch_generation_after_stat = False
+        return result
+
+    def is_generation_current(self, generation: int) -> bool:
+        return self.active_generation == generation
 
     def flush(self, stream: BinaryIO, offset: int) -> None:
         del stream
@@ -90,7 +139,7 @@ class _TracingRemoteStream(BytesIO):
             raise OSError("write failure")
         payload = data[: 123 if self._remote.short_write else len(data)]
         written = super().write(payload)
-        self._remote.files[self._path.value] = bytearray(self.getvalue())
+        self._remote.pending[self._path.value] = bytearray(self.getvalue())
         return written
 
     def seek(self, offset: int, whence: int = 0) -> int:
@@ -100,8 +149,12 @@ class _TracingRemoteStream(BytesIO):
         if self._remote.fail_flush:
             raise OSError("flush failure")
         self._remote.files[self._path.value] = bytearray(self.getvalue())
+        self._remote.pending[self._path.value] = bytearray(self.getvalue())
         self._remote.trace.append(f"remote.flush@{len(self.getvalue())}")
         super().flush()
+        if self._remote.switch_generation_after_flush:
+            self._remote.active_generation += 1
+            self._remote.switch_generation_after_flush = False
         if self._remote.fail_flush_after_write:
             raise OSError("flush result unknown")
 
@@ -120,6 +173,7 @@ class TransferRepository:
 class TransferToken:
     def __init__(self, pause: bool = False) -> None:
         self.pause_requested = pause
+        self.cancel_requested = False
 
 
 @dataclass
@@ -138,7 +192,12 @@ class FakeDependencies:
             "cancellation_token": self.cancellation_token,
         }
 
-    def item(self, *, size: int | None = None) -> TransferItemRecord:
+    def item(
+        self,
+        *,
+        size: int | None = None,
+        confirmed_offset: int = 0,
+    ) -> TransferItemRecord:
         if size is None:
             size = len(self.local.content)
         content = self.local.content[:size]
@@ -152,9 +211,11 @@ class FakeDependencies:
             temp_path=RemotePath("target/.file.bin.part"),
             source_fingerprint=SourceFingerprint(1, 2, SourceKind.FILE, size, 1),
             state=ItemState.TRANSFERRING,
+            confirmed_offset=confirmed_offset,
         )
 
     def session(self, *, generation: int) -> SessionInfo:
+        self.remote.active_generation = generation
         return SessionInfo("3.1.1", True, True, generation)
 
 
@@ -162,7 +223,7 @@ class FakeDependencies:
 def fake_dependencies() -> FakeDependencies:
     trace: list[str] = []
     return FakeDependencies(
-        local=TransferLocal(bytes(range(256)) * (70 * 1024 * 1024 // 256 + 1)),
+        local=TransferLocal(bytes(range(256)) * (70 * 1024 * 1024 // 256 + 1), trace),
         remote=TransferRemote(trace),
         repository=TransferRepository(trace),
         trace=trace,
