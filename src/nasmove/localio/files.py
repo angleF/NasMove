@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import errno
+
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - only non-POSIX Python platforms
+    fcntl = None  # type: ignore[assignment]
 import os
 import stat
 from collections.abc import Iterator
@@ -74,6 +79,31 @@ def _source_fingerprint(info: os.stat_result, kind: SourceKind, size: int) -> So
     )
 
 
+def _fingerprint_for_entry(info: os.stat_result) -> SourceFingerprint | None:
+    if stat.S_ISREG(info.st_mode):
+        return _source_fingerprint(info, SourceKind.FILE, info.st_size)
+    if stat.S_ISDIR(info.st_mode):
+        return _source_fingerprint(info, SourceKind.EMPTY_DIRECTORY, 0)
+    return None
+
+
+def _changed(path: Path) -> OSError:
+    return OSError(errno.EAGAIN, "source changed before deletion", path)
+
+
+@contextmanager
+def _locked_parent(parent_fd: int) -> Iterator[None]:
+    """Serialize deletions made by this application for one parent directory."""
+    if fcntl is None:
+        yield
+        return
+    fcntl.flock(parent_fd, fcntl.LOCK_EX)
+    try:
+        yield
+    finally:
+        fcntl.flock(parent_fd, fcntl.LOCK_UN)
+
+
 class PosixLocalFileGateway:
     """Perform the local file operations used by the transfer engine.
 
@@ -116,39 +146,66 @@ class PosixLocalFileGateway:
                 os.close(fd)
                 raise
 
-    def remove_file(self, path: Path) -> None:
-        with _anchored_parent(path) as (parent_fd, name):
+    def remove_file(
+        self,
+        path: Path,
+        expected_fingerprint: SourceFingerprint | None = None,
+    ) -> None:
+        with _anchored_parent(path) as (parent_fd, name), _locked_parent(parent_fd):
             info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
                 raise _unsafe_path(path, "symbolic links are not supported")
-            if not stat.S_ISREG(info.st_mode):
-                error = errno.EISDIR if stat.S_ISDIR(info.st_mode) else errno.EINVAL
-                raise OSError(error, "source is not a regular file", path)
+            current = _fingerprint_for_entry(info)
+            if current is None:
+                raise OSError(errno.EINVAL, "source is not a regular file", path)
+            if expected_fingerprint is None:
+                expected_fingerprint = current
+            elif current != expected_fingerprint:
+                raise _changed(path)
+            if current.kind is not SourceKind.FILE:
+                raise OSError(errno.EISDIR, "source is not a regular file", path)
+
             fd = os.open(name, _file_open_flags(), dir_fd=parent_fd)
             try:
                 bound = os.fstat(fd)
+                if _fingerprint_for_entry(bound) != expected_fingerprint:
+                    raise _changed(path)
                 latest = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                if not _same_entry(info, bound) or not _same_entry(info, latest):
-                    raise OSError(errno.EAGAIN, "source changed before deletion", path)
+                if _fingerprint_for_entry(latest) != expected_fingerprint:
+                    raise _changed(path)
             finally:
                 os.close(fd)
             os.unlink(name, dir_fd=parent_fd)
 
-    def remove_empty_dir(self, path: Path) -> None:
-        with _anchored_parent(path) as (parent_fd, name):
+    def remove_empty_dir(
+        self,
+        path: Path,
+        expected_fingerprint: SourceFingerprint | None = None,
+    ) -> None:
+        with _anchored_parent(path) as (parent_fd, name), _locked_parent(parent_fd):
             info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
                 raise _unsafe_path(path, "symbolic links are not supported")
-            if not stat.S_ISDIR(info.st_mode):
+            current = _fingerprint_for_entry(info)
+            if current is None:
                 raise OSError(errno.ENOTDIR, "source is not a directory", path)
+            if expected_fingerprint is None:
+                expected_fingerprint = current
+            elif current != expected_fingerprint:
+                raise _changed(path)
+            if current.kind is not SourceKind.EMPTY_DIRECTORY:
+                raise OSError(errno.ENOTDIR, "source is not a directory", path)
+
             directory_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
             try:
                 bound = os.fstat(directory_fd)
-                latest = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
-                if not _same_entry(info, bound) or not _same_entry(info, latest):
-                    raise OSError(errno.EAGAIN, "source changed before deletion", path)
+                if _fingerprint_for_entry(bound) != expected_fingerprint:
+                    raise _changed(path)
                 if os.listdir(directory_fd):
                     raise OSError(errno.ENOTEMPTY, "directory is not empty", path)
+                latest = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if _fingerprint_for_entry(latest) != expected_fingerprint:
+                    raise _changed(path)
             finally:
                 os.close(directory_fd)
             os.rmdir(name, dir_fd=parent_fd)

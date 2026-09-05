@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+import fcntl
 import os
 from pathlib import Path
 
@@ -108,6 +110,86 @@ def test_remove_file_uses_anchored_parent_fd(monkeypatch: pytest.MonkeyPatch, tm
     PosixLocalFileGateway().remove_file(path)
 
     assert calls and calls[0] is not None
+
+
+def test_remove_file_rejects_changed_expected_fingerprint(tmp_path: Path) -> None:
+    path = tmp_path / "source.bin"
+    path.write_bytes(b"before")
+    gateway = PosixLocalFileGateway()
+    expected = gateway.fingerprint(path)
+    path.write_bytes(b"after with a different size")
+
+    with pytest.raises(OSError) as error:
+        gateway.remove_file(path, expected_fingerprint=expected)
+
+    assert error.value.errno == errno.EAGAIN
+    assert path.read_bytes() == b"after with a different size"
+
+
+def test_remove_file_rejects_expected_type_mismatch(tmp_path: Path) -> None:
+    path = tmp_path / "source"
+    path.write_bytes(b"payload")
+    gateway = PosixLocalFileGateway()
+    expected = gateway.fingerprint(path)
+    path.unlink()
+    path.mkdir()
+
+    with pytest.raises(OSError):
+        gateway.remove_file(path, expected_fingerprint=expected)
+
+    assert path.is_dir()
+
+
+def test_remove_empty_dir_rejects_changed_expected_fingerprint(tmp_path: Path) -> None:
+    path = tmp_path / "empty"
+    path.mkdir()
+    gateway = PosixLocalFileGateway()
+    expected = gateway.fingerprint(path)
+    (path / "new-child").write_bytes(b"payload")
+
+    with pytest.raises(OSError):
+        gateway.remove_empty_dir(path, expected_fingerprint=expected)
+
+    assert path.exists()
+
+
+def test_deletion_uses_parent_flock_and_dir_fd(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    file_path = tmp_path / "source.bin"
+    file_path.write_bytes(b"payload")
+    directory = tmp_path / "empty"
+    directory.mkdir()
+    flock_calls: list[tuple[int, int]] = []
+    unlink_fds: list[int | None] = []
+    rmdir_fds: list[int | None] = []
+    original_unlink = os.unlink
+    original_rmdir = os.rmdir
+    original_flock = fcntl.flock
+
+    def recording_flock(fd: int, operation: int) -> None:
+        flock_calls.append((fd, operation))
+        original_flock(fd, operation)
+
+    def recording_unlink(path_arg: os.PathLike[str] | str, *, dir_fd: int | None = None) -> None:
+        unlink_fds.append(dir_fd)
+        original_unlink(path_arg, dir_fd=dir_fd)
+
+    def recording_rmdir(path_arg: os.PathLike[str] | str, *, dir_fd: int | None = None) -> None:
+        rmdir_fds.append(dir_fd)
+        original_rmdir(path_arg, dir_fd=dir_fd)
+
+    monkeypatch.setattr(fcntl, "flock", recording_flock)
+    monkeypatch.setattr(os, "unlink", recording_unlink)
+    monkeypatch.setattr(os, "rmdir", recording_rmdir)
+    gateway = PosixLocalFileGateway()
+
+    gateway.remove_file(file_path)
+    gateway.remove_empty_dir(directory)
+
+    assert [operation for _, operation in flock_calls] == [fcntl.LOCK_EX, fcntl.LOCK_UN] * 2
+    assert unlink_fds and unlink_fds[0] is not None
+    assert rmdir_fds and rmdir_fds[0] is not None
 
 
 def test_remove_file_and_empty_directory_are_separate(tmp_path: Path) -> None:
