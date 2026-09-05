@@ -265,3 +265,28 @@ def test_non_nasmove_logger_is_not_changed_by_record_factory(tmp_path: Path) -> 
     handler.close()
     logger.removeHandler(handler)
     assert "external-secret" in (tmp_path / "other.log").read_text()
+
+
+def test_dynamic_child_extra_is_sanitized_before_private_handler(tmp_path: Path) -> None:
+    configure_logging(tmp_path / "secure")
+    child = logging.getLogger("nasmove.dynamic-extra-child")
+    child.handlers.clear()
+    child.propagate = False
+    handler = logging.FileHandler(tmp_path / "child-extra.log", encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(message)s %(task_id)s %(ordinary)s %(context)s"))
+    child.addHandler(handler)
+    child.error(
+        "safe message",
+        extra={
+            "task_id": "password=POST_FACTORY_SECRET",
+            "ordinary": "nested ordinary",
+            "context": {"authorization": "Bearer NESTED_SECRET", "value": "ok"},
+        },
+    )
+    handler.flush()
+    handler.close()
+    child.removeHandler(handler)
+    output = (tmp_path / "child-extra.log").read_text()
+    assert "POST_FACTORY_SECRET" not in output
+    assert "NESTED_SECRET" not in output
+    assert "nested ordinary" not in output

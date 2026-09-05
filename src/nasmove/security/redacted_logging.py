@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from getpass import getuser
 from io import TextIOWrapper
@@ -207,6 +208,9 @@ class RedactingFilter(logging.Filter):
 
 
 _ORIGINAL_FACTORY: Callable[..., logging.LogRecord] | None = None
+_ORIGINAL_MAKE_RECORD: Callable[..., logging.LogRecord] | None = None
+_FACTORY_LOCK = threading.Lock()
+_MAKE_RECORD_LOCK = threading.Lock()
 
 
 def _nasmove_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
@@ -220,12 +224,31 @@ def _nasmove_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
 
 def _install_record_factory() -> None:
     global _ORIGINAL_FACTORY
-    current = logging.getLogRecordFactory()
-    if current is _nasmove_record_factory:
-        return
-    if _ORIGINAL_FACTORY is None or current is not _nasmove_record_factory:
+    with _FACTORY_LOCK:
+        current = logging.getLogRecordFactory()
+        if current is _nasmove_record_factory:
+            return
         _ORIGINAL_FACTORY = current
-    logging.setLogRecordFactory(_nasmove_record_factory)
+        logging.setLogRecordFactory(_nasmove_record_factory)
+
+
+def _nasmove_make_record(logger: logging.Logger, *args: Any, **kwargs: Any) -> logging.LogRecord:
+    if _ORIGINAL_MAKE_RECORD is None:
+        raise RuntimeError("NasMove logger makeRecord is not initialized")
+    record = _ORIGINAL_MAKE_RECORD(logger, *args, **kwargs)
+    if record.name == "nasmove" or record.name.startswith("nasmove."):
+        RedactingFilter().filter(record)
+    return record
+
+
+def _install_make_record_wrapper() -> None:
+    global _ORIGINAL_MAKE_RECORD
+    with _MAKE_RECORD_LOCK:
+        current = logging.Logger.makeRecord
+        if current is _nasmove_make_record:
+            return
+        _ORIGINAL_MAKE_RECORD = current
+        logging.Logger.makeRecord = _nasmove_make_record  # type: ignore[assignment,method-assign]
 
 
 def _run_acl_command(arguments: list[str]) -> str:
@@ -353,6 +376,7 @@ def _attach_filter(logger: logging.Logger) -> None:
 def configure_logging(log_dir: Path | None = None) -> logging.Logger:
     """Configure one private NasMove diagnostics handler and secure logger descendants."""
     _install_record_factory()
+    _install_make_record_wrapper()
     target_dir = Path(log_dir) if log_dir is not None else Path.home() / "Library" / "Logs" / "NasMove"
     _ensure_private_directory(target_dir)
     target = target_dir / "nasmove.log"
