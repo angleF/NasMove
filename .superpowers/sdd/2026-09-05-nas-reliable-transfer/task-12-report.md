@@ -75,6 +75,30 @@ git diff --check
 
 Ruff、mypy 与 `git diff --check` 均通过。
 
+## 独立复审修复轮 2
+
+复审发现删除服务把 `get_task()` 视为可选，仓储无法读取任务时可能绕过 MOVE/COPY 判定。新增任务读取与 action 回归测试先确认 RED：
+
+```text
+5 failed, 17 passed
+```
+
+修复后 `TaskRepository.get_task()` 为强制协议；每次删除先读取任务，读取异常、任务缺失、字段缺失或类型错误、COPY 及其他 action 均转换为 `UnsafeSourceDeletion`，只有精确的 `TransferAction.MOVE` 才可继续。
+
+本轮最终定向测试：
+
+```text
+24 passed
+```
+
+最终全量验证：
+
+```text
+735 passed, 1 skipped in 58.40s
+```
+
+Ruff、mypy 与 `git diff --check` 均通过。
+
 ## 风险与边界
 
 - 删除服务依赖任务项持久化的 `revision` 与状态 CAS；删除后的 `DONE` 提交若崩溃，下一次调用通过源缺失和目标摘要匹配恢复。

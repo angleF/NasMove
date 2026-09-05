@@ -15,11 +15,12 @@ from nasmove.core.model import (
     RemotePath,
     SourceFingerprint,
     TaskId,
+    TaskRecord,
     TransferItemId,
     TransferItemRecord,
 )
 from nasmove.core.ports import RemoteStat, SessionInfo
-from nasmove.core.states import ItemState, SourceKind
+from nasmove.core.states import ItemState, SourceKind, TransferAction
 
 
 class TransferLocal:
@@ -304,6 +305,7 @@ class TransferRepository:
         self.trace = trace
         self.checkpoints: list[Checkpoint] = []
         self.items: dict[TransferItemId, TransferItemRecord] = {}
+        self.tasks: dict[TaskId, TaskRecord] = {}
         self.fail_done_transition_once = False
 
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
@@ -313,6 +315,9 @@ class TransferRepository:
 
     def get_item(self, item_id: TransferItemId) -> TransferItemRecord:
         return self.items[item_id]
+
+    def get_task(self, task_id: TaskId) -> TaskRecord:
+        return self.tasks[task_id]
 
     def checkpoints_desc(self, item_id: TransferItemId) -> list[Checkpoint]:
         return sorted(
@@ -670,6 +675,11 @@ def deletion_fixture() -> DeletionFixture:
     remote.files[item.final_path.value] = bytearray(content)
     remote.file_ids[item.final_path.value] = "file-final"
     repository.items[item.id] = item
+    from tests.fixtures.builders import build_task_record
+
+    repository.tasks[item.task_id] = replace(
+        build_task_record(), action=TransferAction.MOVE
+    )
     verifier = DeletionVerifier(
         source_hash=digest,
         remote_hash=digest,

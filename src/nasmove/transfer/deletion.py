@@ -11,16 +11,19 @@ from nasmove.core.model import (
     DeletionEvidence,
     RemotePath,
     SourceFingerprint,
+    TaskRecord,
     TransferItemId,
     TransferItemRecord,
 )
 from nasmove.core.ports import RemoteStat, SessionInfo
-from nasmove.core.states import ItemState, SourceKind
+from nasmove.core.states import ItemState, SourceKind, TransferAction
 from nasmove.core.transitions import authorize_source_delete
 from nasmove.localio.hashing import sha256_stream
 
 
 class TaskRepository(Protocol):
+    def get_task(self, task_id: object) -> TaskRecord: ...
+
     def get_item(self, item_id: TransferItemId) -> TransferItemRecord: ...
 
     def update_item_metadata(self, item: TransferItemRecord, expected_revision: int) -> None: ...
@@ -105,11 +108,13 @@ class SourceDeletionService:
             return DeletionResult(item.id, ItemState.DONE, True, already_absent=True)
         if item.state not in self._DELETABLE_STATES:
             raise UnsafeSourceDeletion("only committed items may delete a source")
-        get_task = getattr(self._repository, "get_task", None)
-        if get_task is not None:
-            task = get_task(item.task_id)
-            if getattr(getattr(task, "action", None), "value", None) == "copy":
-                raise UnsafeSourceDeletion("copy tasks must retain their source")
+        try:
+            task = self._repository.get_task(item.task_id)
+            action = task.action
+        except Exception as error:
+            raise UnsafeSourceDeletion("unable to confirm task action before source deletion") from error
+        if type(action) is not TransferAction or action is not TransferAction.MOVE:
+            raise UnsafeSourceDeletion("only move tasks may delete their source")
 
         source_fingerprint = self._read_source_fingerprint(item)
         target_stat, target_hash = self._read_verified_target(item, session)

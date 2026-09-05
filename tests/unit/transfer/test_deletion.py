@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from nasmove.core.errors import UnsafeSourceDeletion
-from nasmove.core.states import ItemState
+from nasmove.core.states import ItemState, TransferAction
 from nasmove.transfer.deletion import SourceDeletionService
 
 
@@ -28,6 +28,60 @@ def test_new_session_reverifies_target_before_delete(deletion_fixture) -> None:
         deletion_fixture.session,
     )
     assert deletion_fixture.verifier.full_verify_calls == 1
+
+
+class _RepositoryWithoutTask:
+    def __init__(self, base) -> None:
+        self._base = base
+
+    def get_item(self, item_id):
+        return self._base.get_item(item_id)
+
+    def update_item_metadata(self, item, expected_revision):
+        return self._base.update_item_metadata(item, expected_revision)
+
+    def transition_item(self, item_id, expected, target):
+        return self._base.transition_item(item_id, expected, target)
+
+
+def test_missing_task_reader_fails_closed_before_source_delete(deletion_fixture) -> None:
+    service = SourceDeletionService(
+        _RepositoryWithoutTask(deletion_fixture.repository),
+        deletion_fixture.local,
+        deletion_fixture.remote,
+        deletion_fixture.verifier,
+    )
+    with pytest.raises(UnsafeSourceDeletion):
+        service.delete_verified_source(deletion_fixture.item.id, deletion_fixture.session)
+    assert deletion_fixture.local.remove_calls == []
+
+
+@pytest.mark.parametrize(
+    "task_value",
+    [
+        RuntimeError("repository unavailable"),
+        None,
+        SimpleNamespace(action=TransferAction.COPY),
+        SimpleNamespace(action="move"),
+        SimpleNamespace(),
+    ],
+    ids=["read-error", "missing-task", "copy", "wrong-action-type", "missing-action"],
+)
+def test_task_action_must_be_explicit_move(deletion_fixture, task_value) -> None:
+    if isinstance(task_value, BaseException):
+        def get_task(_item_task_id):
+            raise task_value
+    else:
+        def get_task(_item_task_id):
+            return task_value
+
+    deletion_fixture.repository.get_task = get_task
+    with pytest.raises(UnsafeSourceDeletion):
+        deletion_fixture.service.delete_verified_source(
+            deletion_fixture.item.id,
+            deletion_fixture.session,
+        )
+    assert deletion_fixture.local.remove_calls == []
 
 
 @pytest.mark.parametrize(
