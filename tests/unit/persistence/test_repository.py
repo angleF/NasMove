@@ -1,3 +1,4 @@
+import hashlib
 import os
 import sqlite3
 import stat
@@ -428,11 +429,12 @@ def test_permission_hardening_failure_happens_before_checkpoint_commit(tmp_path,
     reopened.close()
 
 
-def test_old_schema_version_is_rejected(tmp_path) -> None:
-    path = tmp_path / "old.db"
+@pytest.mark.parametrize("version", ["1", "2"])
+def test_old_schema_version_is_rejected(tmp_path, version: str) -> None:
+    path = tmp_path / f"old-{version}.db"
     raw = sqlite3.connect(path)
     raw.execute("CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-    raw.execute("INSERT INTO schema_meta VALUES ('version', '1')")
+    raw.execute("INSERT INTO schema_meta VALUES ('version', ?)", (version,))
     raw.commit()
     raw.close()
     with pytest.raises(RuntimeError):
@@ -553,7 +555,8 @@ def test_empty_existing_database_is_initialized(tmp_path) -> None:
     repository = SqliteTaskRepository(path)
     repository.close()
     raw = sqlite3.connect(path)
-    assert raw.execute("SELECT value FROM schema_meta WHERE key = 'version'").fetchone()[0] == "2"
+    assert raw.execute("SELECT value FROM schema_meta WHERE key = 'version'").fetchone()[0] == "3"
+    assert len(raw.execute("SELECT value FROM schema_meta WHERE key = 'schema_hash'").fetchone()[0]) == 64
     raw.close()
 
 
@@ -569,6 +572,105 @@ def test_unknown_database_probe_does_not_create_sidecars(tmp_path) -> None:
         SqliteTaskRepository(path)
     assert not Path(f"{path}-wal").exists()
     assert not Path(f"{path}-shm").exists()
+
+
+def test_unknown_wal_database_is_copied_before_readonly_probe(tmp_path) -> None:
+    database_dir = tmp_path / "state"
+    database_dir.mkdir(mode=0o700)
+    path = database_dir / "unknown-wal.db"
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1]); "
+                "c.execute('PRAGMA journal_mode=WAL'); c.execute('CREATE TABLE legacy(value TEXT)'); "
+                "c.execute(\"INSERT INTO legacy VALUES ('preserve')\"); c.commit(); os._exit(17)"
+            ),
+            str(path),
+        ],
+        check=False,
+    )
+    assert child.returncode == 17
+    wal = Path(f"{path}-wal")
+    shm = Path(f"{path}-shm")
+    assert wal.exists() and shm.exists()
+    shm.unlink()
+    before = {
+        candidate: (hashlib.sha256(candidate.read_bytes()).digest(), stat.S_IMODE(os.stat(candidate).st_mode))
+        for candidate in (path, wal)
+    }
+    with pytest.raises(RuntimeError):
+        SqliteTaskRepository(path)
+    for candidate, (digest, mode) in before.items():
+        assert hashlib.sha256(candidate.read_bytes()).digest() == digest
+        assert stat.S_IMODE(os.stat(candidate).st_mode) == mode
+    assert not shm.exists()
+
+
+def test_valid_v3_database_with_crash_wal_is_recovered_from_copy(tmp_path) -> None:
+    path = tmp_path / "valid-wal.db"
+    repository = SqliteTaskRepository(path)
+    repository.create_task(build_task_record(), [build_transfer_item_record()])
+    repository.close()
+    child = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os, sqlite3, sys; c=sqlite3.connect(sys.argv[1]); "
+                "c.execute(\"INSERT INTO events(task_id,event_type,occurred_at) VALUES ('task-1','crash','2025-01-01T00:00:00+00:00')\"); "
+                "c.commit(); os._exit(19)"
+            ),
+            str(path),
+        ],
+        check=False,
+    )
+    assert child.returncode == 19
+    reopened = SqliteTaskRepository(path)
+    reopened.close()
+    raw = sqlite3.connect(path)
+    assert raw.execute("SELECT count(*) FROM events WHERE event_type = 'crash'").fetchone()[0] == 1
+    raw.close()
+
+
+@pytest.mark.parametrize(
+    ("object_name", "needle"),
+    [
+        ("tasks", "name TEXT NOT NULL"),
+        ("transfer_items", "REFERENCES tasks(task_id) ON DELETE CASCADE"),
+        ("idx_tasks_queue", "CREATE INDEX idx_tasks_queue"),
+        ("tasks_state_guard", "RAISE(ABORT"),
+    ],
+)
+def test_schema_identity_rejects_structure_tampering(tmp_path, object_name: str, needle: str) -> None:
+    path = tmp_path / f"tampered-{object_name}.db"
+    repository = SqliteTaskRepository(path)
+    repository.close()
+    raw = sqlite3.connect(path)
+    sql = raw.execute("SELECT sql FROM sqlite_master WHERE name = ?", (object_name,)).fetchone()[0]
+    assert needle in sql
+    raw.execute("PRAGMA writable_schema = ON")
+    raw.execute(
+        "UPDATE sqlite_master SET sql = ? WHERE name = ?",
+        (sql.replace(needle, needle + " /* tampered */", 1), object_name),
+    )
+    raw.commit()
+    raw.close()
+    with pytest.raises(RuntimeError):
+        SqliteTaskRepository(path)
+
+
+def test_schema_identity_rejects_stored_hash_tampering(tmp_path) -> None:
+    path = tmp_path / "tampered-hash.db"
+    repository = SqliteTaskRepository(path)
+    repository.close()
+    raw = sqlite3.connect(path)
+    raw.execute("UPDATE schema_meta SET value = ? WHERE key = 'schema_hash'", ("0" * 64,))
+    raw.commit()
+    raw.close()
+    with pytest.raises(RuntimeError):
+        SqliteTaskRepository(path)
 
 
 def test_acl_on_existing_parent_is_rejected_without_mutation(tmp_path) -> None:

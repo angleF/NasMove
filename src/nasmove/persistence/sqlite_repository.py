@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import stat
 import subprocess
@@ -9,6 +10,7 @@ from collections.abc import Iterable, Sequence
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
+from tempfile import TemporaryDirectory
 from typing import Self, cast
 
 from nasmove.core.errors import ConcurrentStateChange
@@ -32,7 +34,7 @@ from nasmove.core.states import (
     VerificationPolicy,
 )
 from nasmove.core.transitions import assert_item_transition, assert_task_transition
-from nasmove.persistence.schema import initialize_database
+from nasmove.persistence.schema import has_current_schema, initialize_database
 
 _TERMINAL_TASK_STATES = (
     TaskState.COMPLETED,
@@ -192,37 +194,87 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         cls._assert_no_extended_acl(path)
 
     def _is_nasmove_database(self) -> bool:
-        uri = f"{self.database_path.as_uri()}?mode=ro"
-        connection: sqlite3.Connection | None = None
+        sources = (self.database_path, Path(f"{self.database_path}-wal"), Path(f"{self.database_path}-shm"))
         try:
-            connection = sqlite3.connect(uri, uri=True)
-            connection.execute("PRAGMA query_only = ON")
-            objects = {
-                row[0]
-                for row in connection.execute(
-                    "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
-                )
-            }
-            if not objects:
-                return True
-            version = connection.execute(
-                "SELECT value FROM schema_meta WHERE key = 'version'"
-            ).fetchone()
-            required = {
-                "schema_meta",
-                "connection_profiles",
-                "tasks",
-                "transfer_items",
-                "checkpoints",
-                "attempts",
-                "events",
-            }
-            return version is not None and version[0] == "2" and required <= objects
-        except sqlite3.DatabaseError:
+            with TemporaryDirectory(dir=self.database_path.parent, prefix=".nasmove-probe-") as probe_name:
+                probe_dir = Path(probe_name)
+                self._remove_extended_acl(probe_dir)
+                os.chmod(probe_dir, 0o700)
+                self._assert_no_extended_acl(probe_dir)
+                snapshots: dict[Path, os.stat_result] = {}
+                for source in sources:
+                    try:
+                        snapshots[source] = os.lstat(source)
+                    except FileNotFoundError:
+                        continue
+                for source, info in snapshots.items():
+                    self._copy_probe_file(source, probe_dir / source.name, info)
+                for source in sources:
+                    try:
+                        current = os.lstat(source)
+                    except FileNotFoundError:
+                        if source in snapshots:
+                            return False
+                    else:
+                        if source not in snapshots or not self._same_file_snapshot(current, snapshots[source]):
+                            return False
+                probe_database = probe_dir / self.database_path.name
+                uri = f"{probe_database.as_uri()}?mode=ro"
+                connection = sqlite3.connect(uri, uri=True)
+                try:
+                    connection.execute("PRAGMA query_only = ON")
+                    if connection.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+                        return False
+                    objects = connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+                    ).fetchone()
+                    return objects is None or has_current_schema(connection)
+                finally:
+                    connection.close()
+        except (OSError, sqlite3.DatabaseError, RuntimeError, ValueError):
             return False
-        finally:
-            if connection is not None:
-                connection.close()
+
+    @staticmethod
+    def _same_file_snapshot(first: os.stat_result, second: os.stat_result) -> bool:
+        return (
+            first.st_dev == second.st_dev
+            and first.st_ino == second.st_ino
+            and first.st_mode == second.st_mode
+            and first.st_size == second.st_size
+            and first.st_mtime_ns == second.st_mtime_ns
+        )
+
+    @staticmethod
+    def _copy_probe_file(source: Path, destination: Path, expected: os.stat_result) -> None:
+        source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+        try:
+            source_info = os.fstat(source_fd)
+            if not stat.S_ISREG(source_info.st_mode) or source_info.st_uid != os.getuid():
+                raise PermissionError("SQLite probe source must be an owned regular file")
+            if not SqliteTaskRepository._same_file_snapshot(source_info, expected):
+                raise RuntimeError("SQLite probe source changed during open")
+            destination_fd = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                with (
+                    os.fdopen(source_fd, "rb", closefd=False) as source_stream,
+                    os.fdopen(destination_fd, "wb") as destination_stream,
+                ):
+                    shutil.copyfileobj(source_stream, destination_stream, length=1024 * 1024)
+                final_info = os.fstat(source_fd)
+                if not SqliteTaskRepository._same_file_snapshot(final_info, expected):
+                    raise RuntimeError("SQLite probe source changed during copy")
+            finally:
+                os.close(source_fd)
+        except BaseException:
+            try:
+                os.close(source_fd)
+            except OSError:
+                pass
+            raise
 
     @staticmethod
     def _reject_symlink_ancestors(path: Path) -> None:

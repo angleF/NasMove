@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from collections.abc import Mapping
 from typing import TypeVar
@@ -7,7 +9,19 @@ from typing import TypeVar
 from nasmove.core.states import ItemState, TaskState
 from nasmove.core.transitions import ITEM_TRANSITIONS, TASK_TRANSITIONS
 
-SCHEMA_VERSION = "2"
+SCHEMA_VERSION = "3"
+SCHEMA_HASH_KEY = "schema_hash"
+CORE_TABLES = frozenset(
+    {
+        "schema_meta",
+        "connection_profiles",
+        "tasks",
+        "transfer_items",
+        "checkpoints",
+        "attempts",
+        "events",
+    }
+)
 State = TypeVar("State", TaskState, ItemState)
 
 SCHEMA_SQL = """
@@ -137,8 +151,7 @@ def _transition_trigger[State: (TaskState, ItemState)](
             clauses.append(f"(OLD.state = '{current.value}' AND NEW.state IN ({values}))")
     allowed = " OR ".join(clauses) or "0"
     return (
-        f"DROP TRIGGER IF EXISTS {trigger_name};"
-        f"CREATE TRIGGER {trigger_name} BEFORE UPDATE OF state ON {table} "
+        f"CREATE TRIGGER IF NOT EXISTS {trigger_name} BEFORE UPDATE OF state ON {table} "
         f"WHEN OLD.state <> NEW.state AND NOT ({allowed}) "
         "BEGIN SELECT RAISE(ABORT, 'invalid state transition'); END;"
     )
@@ -148,43 +161,117 @@ def _trigger_sql() -> str:
     return (
         _transition_trigger("tasks", TASK_TRANSITIONS, "tasks_state_guard")
         + _transition_trigger("transfer_items", ITEM_TRANSITIONS, "transfer_items_state_guard")
-        + "DROP TRIGGER IF EXISTS tasks_initial_state_guard;"
-        + "CREATE TRIGGER tasks_initial_state_guard BEFORE INSERT ON tasks "
+        + "CREATE TRIGGER IF NOT EXISTS tasks_initial_state_guard BEFORE INSERT ON tasks "
         + "WHEN NEW.state NOT IN ('draft', 'preflight', 'queued') "
         + "BEGIN SELECT RAISE(ABORT, 'invalid initial task state'); END;"
-        + "DROP TRIGGER IF EXISTS transfer_items_initial_state_guard;"
-        + "CREATE TRIGGER transfer_items_initial_state_guard BEFORE INSERT ON transfer_items "
+        + "CREATE TRIGGER IF NOT EXISTS transfer_items_initial_state_guard BEFORE INSERT ON transfer_items "
         + "WHEN NEW.state NOT IN ('planned', 'skipped') "
         + "BEGIN SELECT RAISE(ABORT, 'invalid initial item state'); END;"
     )
 
 
-def initialize_database(connection: sqlite3.Connection) -> None:
-    """Configure SQLite durability and create the current schema."""
-    existing = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
-    ).fetchone()
-    if existing is None:
-        user_objects = connection.execute(
-            "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
-        ).fetchall()
-        if user_objects:
-            raise RuntimeError("database contains user objects but no schema version")
-    else:
+def schema_fingerprint(connection: sqlite3.Connection) -> str:
+    """Return a stable digest of the user schema, excluding SQLite internals."""
+    objects = sorted(
+        (
+            row[0],
+            row[1],
+            row[2] or "",
+            row[3] or "",
+        )
+        for row in connection.execute(
+            "SELECT type, name, tbl_name, sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%'"
+        )
+    )
+    payload = json.dumps(objects, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def expected_schema_fingerprint() -> str:
+    """Build the canonical schema in memory and fingerprint its SQLite objects."""
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(SCHEMA_SQL + _trigger_sql())
+        return schema_fingerprint(connection)
+    finally:
+        connection.close()
+
+
+def has_current_schema(connection: sqlite3.Connection) -> bool:
+    """Check version, stored digest, required tables, and actual schema structure."""
+    try:
         version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'version'"
         ).fetchone()
-        if version is None or version[0] != SCHEMA_VERSION:
+        stored_hash = connection.execute(
+            "SELECT value FROM schema_meta WHERE key = ?", (SCHEMA_HASH_KEY,)
+        ).fetchone()
+    except sqlite3.DatabaseError:
+        return False
+    if version is None or version[0] != SCHEMA_VERSION or stored_hash is None:
+        return False
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    }
+    if not CORE_TABLES <= tables:
+        return False
+    actual_hash = schema_fingerprint(connection)
+    return bool(actual_hash == stored_hash[0] == expected_schema_fingerprint())
+
+
+def initialize_database(connection: sqlite3.Connection) -> None:
+    """Configure SQLite durability and create the current schema."""
+    user_objects = connection.execute(
+        "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    if not user_objects:
+        is_new_database = True
+    else:
+        is_new_database = False
+        if not has_current_schema(connection):
+            has_meta_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
+            ).fetchone()
+            version = (
+                connection.execute(
+                    "SELECT value FROM schema_meta WHERE key = 'version'"
+                ).fetchone()
+                if has_meta_table is not None
+                else None
+            )
             found = "missing" if version is None else str(version[0])
-            raise RuntimeError(f"unsupported schema version: {found}")
+            raise RuntimeError(f"unsupported schema identity: {found}")
+
+    # Re-read identity immediately before any persistent PRAGMA can run.
+    if is_new_database:
+        if connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
+        ).fetchone() is not None:
+            raise RuntimeError("database schema changed during initialization")
+    elif not has_current_schema(connection):
+        raise RuntimeError("database schema changed during initialization")
+
+    expected_hash = expected_schema_fingerprint()
     connection.execute("PRAGMA journal_mode = WAL")
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
     connection.executescript(SCHEMA_SQL + _trigger_sql())
+    actual_hash = schema_fingerprint(connection)
+    if actual_hash != expected_hash:
+        raise RuntimeError("database schema does not match the current schema")
     connection.execute(
         "INSERT INTO schema_meta(key, value) VALUES ('version', ?) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (SCHEMA_VERSION,),
+    )
+    connection.execute(
+        "INSERT INTO schema_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (SCHEMA_HASH_KEY, actual_hash),
     )
     connection.commit()
