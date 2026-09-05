@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 from collections.abc import Iterable, Sequence
 from contextlib import AbstractContextManager
 from datetime import UTC, datetime
@@ -78,6 +80,7 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         self._connection = sqlite3.connect(self.database_path, timeout=5.0)
         self._connection.row_factory = sqlite3.Row
         try:
+            self._harden_database_permissions()
             initialize_database(self._connection)
         except BaseException:
             self._connection.close()
@@ -99,19 +102,26 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         if parent_info.st_uid != os.getuid():
             raise PermissionError("database parent must be owned by the current user")
         if created_parent:
+            self._remove_extended_acl(parent)
             os.chmod(parent, 0o700)
+            self._assert_no_extended_acl(parent)
         elif stat.S_IMODE(parent_info.st_mode) & 0o077:
             raise PermissionError("database parent must not be accessible by group or other users")
+        else:
+            self._assert_no_extended_acl(parent)
         try:
             database_info = os.lstat(self.database_path)
         except FileNotFoundError:
-            self._validate_sidecars()
+            if self._has_sidecars():
+                raise RuntimeError("SQLite sidecar exists without a database")
             return
         if stat.S_ISLNK(database_info.st_mode) or not stat.S_ISREG(database_info.st_mode):
             raise ValueError("database target must be a regular file")
         if database_info.st_uid != os.getuid():
             raise PermissionError("database must be owned by the current user")
-        os.chmod(self.database_path, 0o600)
+        if not self._is_nasmove_database():
+            raise RuntimeError("database is not a NasMove database")
+        self._secure_file(self.database_path)
         self._validate_sidecars()
 
     def _validate_sidecars(self) -> None:
@@ -124,7 +134,95 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
                 raise ValueError("SQLite sidecar must be a regular file")
             if info.st_uid != os.getuid():
                 raise PermissionError("SQLite sidecar must be owned by the current user")
-            os.chmod(sidecar, 0o600)
+            self._secure_file(sidecar)
+
+    def _has_sidecars(self) -> bool:
+        return any(path.exists() or path.is_symlink() for path in (
+            Path(f"{self.database_path}-wal"),
+            Path(f"{self.database_path}-shm"),
+        ))
+
+    @staticmethod
+    def _run_acl_command(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                arguments,
+                env={"LC_ALL": "C"},
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except OSError as exc:
+            raise PermissionError("unable to inspect SQLite path ACL") from exc
+
+    @classmethod
+    def _has_extended_acl(cls, path: Path) -> bool:
+        if sys.platform != "darwin":
+            return False
+        result = cls._run_acl_command(["/bin/ls", "-lde", str(path)])
+        if result.returncode != 0:
+            raise PermissionError(f"unable to inspect ACL for {path}")
+        lines = result.stdout.splitlines()
+        if not lines:
+            raise PermissionError(f"unable to inspect ACL for {path}")
+        return len(lines) > 1 or "+" in lines[0].split(maxsplit=1)[0]
+
+    @classmethod
+    def _assert_no_extended_acl(cls, path: Path) -> None:
+        if cls._has_extended_acl(path):
+            raise PermissionError(f"SQLite path has an extended ACL: {path}")
+
+    @classmethod
+    def _remove_extended_acl(cls, path: Path) -> None:
+        if sys.platform != "darwin":
+            return
+        result = cls._run_acl_command(["/bin/chmod", "-N", str(path)])
+        if result.returncode != 0:
+            raise PermissionError(f"unable to remove ACL for {path}")
+
+    @classmethod
+    def _secure_file(cls, path: Path) -> None:
+        info = os.lstat(path)
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise ValueError("SQLite path must be a regular file")
+        if info.st_uid != os.getuid():
+            raise PermissionError("SQLite path must be owned by the current user")
+        cls._remove_extended_acl(path)
+        os.chmod(path, 0o600)
+        cls._assert_no_extended_acl(path)
+
+    def _is_nasmove_database(self) -> bool:
+        uri = f"{self.database_path.as_uri()}?mode=ro"
+        connection: sqlite3.Connection | None = None
+        try:
+            connection = sqlite3.connect(uri, uri=True)
+            connection.execute("PRAGMA query_only = ON")
+            objects = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
+                )
+            }
+            if not objects:
+                return True
+            version = connection.execute(
+                "SELECT value FROM schema_meta WHERE key = 'version'"
+            ).fetchone()
+            required = {
+                "schema_meta",
+                "connection_profiles",
+                "tasks",
+                "transfer_items",
+                "checkpoints",
+                "attempts",
+                "events",
+            }
+            return version is not None and version[0] == "2" and required <= objects
+        except sqlite3.DatabaseError:
+            return False
+        finally:
+            if connection is not None:
+                connection.close()
 
     @staticmethod
     def _reject_symlink_ancestors(path: Path) -> None:
@@ -142,7 +240,7 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
                 raise ValueError("database path must not traverse a symlink")
 
     def _harden_database_permissions(self) -> None:
-        os.chmod(self.database_path, 0o600)
+        self._secure_file(self.database_path)
         self._validate_sidecars()
 
     def close(self) -> None:

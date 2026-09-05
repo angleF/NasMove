@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import stat
+import subprocess
+import sys
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -511,3 +513,147 @@ def test_non_directory_parent_and_non_regular_database_are_rejected(tmp_path) ->
     directory_target.mkdir()
     with pytest.raises(ValueError):
         SqliteTaskRepository(directory_target)
+
+
+def test_unknown_existing_database_is_rejected_without_mutation(tmp_path) -> None:
+    database_dir = tmp_path / "state"
+    database_dir.mkdir(mode=0o700)
+    path = database_dir / "unknown.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE unrelated (value TEXT)")
+    raw.execute("INSERT INTO unrelated VALUES ('preserve')")
+    raw.commit()
+    raw.close()
+    os.chmod(path, 0o640)
+    wal = Path(f"{path}-wal")
+    shm = Path(f"{path}-shm")
+    wal.touch(mode=0o640)
+    shm.touch(mode=0o640)
+    before_dir_mode = stat.S_IMODE(os.stat(database_dir).st_mode)
+    before_mode = stat.S_IMODE(os.stat(path).st_mode)
+    before_wal_mode = stat.S_IMODE(os.stat(wal).st_mode)
+    before_shm_mode = stat.S_IMODE(os.stat(shm).st_mode)
+    with pytest.raises(RuntimeError):
+        SqliteTaskRepository(path)
+    assert stat.S_IMODE(os.stat(database_dir).st_mode) == before_dir_mode
+    assert stat.S_IMODE(os.stat(path).st_mode) == before_mode
+    assert stat.S_IMODE(os.stat(wal).st_mode) == before_wal_mode
+    assert stat.S_IMODE(os.stat(shm).st_mode) == before_shm_mode
+    check = sqlite3.connect(path)
+    assert check.execute("SELECT value FROM unrelated").fetchone()[0] == "preserve"
+    assert check.execute("SELECT count(*) FROM sqlite_master WHERE name = 'schema_meta'").fetchone()[0] == 0
+    check.close()
+
+
+def test_empty_existing_database_is_initialized(tmp_path) -> None:
+    database_dir = tmp_path / "state"
+    database_dir.mkdir(mode=0o700)
+    path = database_dir / "empty.db"
+    path.touch()
+    repository = SqliteTaskRepository(path)
+    repository.close()
+    raw = sqlite3.connect(path)
+    assert raw.execute("SELECT value FROM schema_meta WHERE key = 'version'").fetchone()[0] == "2"
+    raw.close()
+
+
+def test_unknown_database_probe_does_not_create_sidecars(tmp_path) -> None:
+    database_dir = tmp_path / "state"
+    database_dir.mkdir(mode=0o700)
+    path = database_dir / "unknown.db"
+    raw = sqlite3.connect(path)
+    raw.execute("CREATE TABLE unrelated (value TEXT)")
+    raw.commit()
+    raw.close()
+    with pytest.raises(RuntimeError):
+        SqliteTaskRepository(path)
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+
+
+def test_acl_on_existing_parent_is_rejected_without_mutation(tmp_path) -> None:
+    database_dir = tmp_path / "acl-state"
+    database_dir.mkdir(mode=0o700)
+    result = subprocess.run(
+        ["/bin/chmod", "+a", "everyone allow read", str(database_dir)],
+        env={"LC_ALL": "C"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.skip("macOS ACL controls are unavailable")
+    before_mode = stat.S_IMODE(os.stat(database_dir).st_mode)
+    before_acl = subprocess.run(
+        ["/bin/ls", "-lde", str(database_dir)],
+        env={"LC_ALL": "C"},
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    try:
+        with pytest.raises(PermissionError):
+            SqliteTaskRepository(database_dir / "nasmove.db")
+        assert stat.S_IMODE(os.stat(database_dir).st_mode) == before_mode
+        after_acl = subprocess.run(
+            ["/bin/ls", "-lde", str(database_dir)],
+            env={"LC_ALL": "C"},
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+        assert after_acl == before_acl
+    finally:
+        subprocess.run(
+            ["/bin/chmod", "-N", str(database_dir)],
+            env={"LC_ALL": "C"},
+            check=False,
+        )
+
+
+def test_new_database_paths_have_no_acl_and_private_modes(tmp_path) -> None:
+    if sys.platform != "darwin":
+        pytest.skip("macOS ACL controls are unavailable")
+    probe = subprocess.run(
+        ["/bin/ls", "-lde", str(tmp_path)],
+        env={"LC_ALL": "C"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        pytest.skip("macOS ACL controls are unavailable")
+    inherited = subprocess.run(
+        ["/bin/chmod", "+a", "everyone allow read", str(tmp_path)],
+        env={"LC_ALL": "C"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if inherited.returncode != 0:
+        pytest.skip("macOS ACL controls are unavailable")
+    database_dir = tmp_path / "new-state"
+    path = database_dir / "nasmove.db"
+    try:
+        repository = SqliteTaskRepository(path)
+        repository.create_task(build_task_record(), [build_transfer_item_record()])
+        repository.close()
+        assert stat.S_IMODE(os.stat(database_dir).st_mode) == 0o700
+        assert stat.S_IMODE(os.stat(path).st_mode) == 0o600
+        for candidate in (database_dir, path, Path(f"{path}-wal"), Path(f"{path}-shm")):
+            if not candidate.exists():
+                continue
+            listing = subprocess.run(
+                ["/bin/ls", "-lde", str(candidate)],
+                env={"LC_ALL": "C"},
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            assert len(listing.splitlines()) == 1
+    finally:
+        subprocess.run(
+            ["/bin/chmod", "-N", str(tmp_path)],
+            env={"LC_ALL": "C"},
+            check=False,
+        )
