@@ -354,6 +354,7 @@ class QueueCoordinator:
         self._active_done = Event()
         self._active_done.set()
         self._accepting = True
+        self._pending_pause = False
 
     def enqueue(self, task_id: TaskId | str) -> None:
         with self._lifecycle_lock:
@@ -370,8 +371,12 @@ class QueueCoordinator:
     def request_pause(self) -> None:
         with self._lifecycle_lock:
             token = self._active_token
-        if token is not None:
-            token.request_pause()
+            if token is None:
+                # No token is published yet, so latch the request onto the
+                # next token published within this run.
+                self._pending_pause = True
+                return
+        token.request_pause()
 
     def wait_for_safe_boundary(self, timeout: float) -> bool:
         """Wait until the current engine call returns after a safe block boundary."""
@@ -386,8 +391,16 @@ class QueueCoordinator:
             raise RuntimeError("queue coordinator is already running a task")
         active_token = token or CancellationToken()
         with self._lifecycle_lock:
+            if not self._accepting:
+                # A shutdown completed inside the publication window: never
+                # start a task that would not observe the pause.
+                self._run_lock.release()
+                return None
             self._active_token = active_token
             self._active_done.clear()
+            if self._pending_pause:
+                active_token.request_pause()
+                self._pending_pause = False
         try:
             with self._lifecycle_lock:
                 task_id: TaskId | None = self._queue.pop(0) if self._queue else None

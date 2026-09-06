@@ -1,6 +1,40 @@
-from threading import Event, Thread
+import time
+from threading import Event, Lock, Thread, get_ident
 
 import pytest
+
+
+def _gate_publication(coordinator: object, gate: Event, main_thread_id: int) -> None:
+    """Park a worker between ``_run_lock`` acquisition and token publication.
+
+    The first ``_lifecycle_lock`` entry from a non-main thread (the worker's
+    publication block in ``run_next``) blocks on ``gate`` before acquiring the
+    inner lock, so lifecycle calls from the main thread land inside the
+    publication window deterministically.
+    """
+
+    class GatedLifecycleLock:
+        def __init__(self, inner: Lock) -> None:
+            self._inner = inner
+            self._armed = True
+
+        def __enter__(self) -> Lock:
+            if self._armed and get_ident() != main_thread_id:
+                self._armed = False
+                gate.wait(1)
+            return self._inner.__enter__()
+
+        def __exit__(self, *exc_info: object) -> None:
+            self._inner.__exit__(*exc_info)
+
+    coordinator._lifecycle_lock = GatedLifecycleLock(coordinator._lifecycle_lock)
+
+
+def _wait_for_run_lock(coordinator: object, timeout: float = 1.0) -> None:
+    deadline = time.monotonic() + timeout
+    while not coordinator._run_lock.locked():
+        assert time.monotonic() < deadline, "worker never acquired the run lock"
+        time.sleep(0.001)
 
 
 def test_queue_never_runs_two_tasks_at_once(queue_fixture) -> None:
@@ -135,4 +169,74 @@ def test_shutdown_observes_task_selection_as_active_and_passes_pause_token() -> 
     worker.join(1)
     assert not worker.is_alive()
     assert received and received[0].pause_requested is True
+    assert coordinator.wait_for_safe_boundary(1) is True
+
+
+def test_stopping_queue_does_not_start_task_published_after_shutdown_window() -> None:
+    from nasmove.core.states import TaskState
+    from nasmove.transfer.transfer_engine import QueueCoordinator, TaskResult
+
+    received: list[object] = []
+    results: list[object] = []
+
+    class Engine:
+        def run_task(self, task_id, token):
+            del task_id
+            received.append(token)
+            return TaskResult(False, TaskState.PAUSED)
+
+    coordinator = QueueCoordinator(Engine())
+    coordinator.enqueue("task-a")
+    gate = Event()
+    _gate_publication(coordinator, gate, get_ident())
+
+    worker = Thread(target=lambda: results.append(coordinator.run_next()))
+    worker.start()
+    _wait_for_run_lock(coordinator)
+
+    # Shutdown completes while the worker is parked between acquiring the run
+    # lock and publishing its token: no active boundary is visible yet.
+    coordinator.stop_accepting()
+    coordinator.request_pause()
+    assert coordinator.wait_for_safe_boundary(0.001) is True
+
+    gate.set()
+    worker.join(1)
+    assert not worker.is_alive()
+    assert results == [None]
+    assert received == []
+
+
+def test_pause_requested_before_publication_is_latched_onto_published_token() -> None:
+    from nasmove.core.states import TaskState
+    from nasmove.transfer.transfer_engine import QueueCoordinator, TaskResult
+
+    received: list[object] = []
+    results: list[object] = []
+
+    class Engine:
+        def run_task(self, task_id, token):
+            del task_id
+            received.append(token)
+            return TaskResult(False, TaskState.PAUSED)
+
+    coordinator = QueueCoordinator(Engine())
+    coordinator.enqueue("task-a")
+    gate = Event()
+    _gate_publication(coordinator, gate, get_ident())
+
+    worker = Thread(target=lambda: results.append(coordinator.run_next()))
+    worker.start()
+    _wait_for_run_lock(coordinator)
+
+    # Pause arrives while no token is published, so the safe-boundary wait
+    # alone cannot observe it; the request must latch onto the future token.
+    coordinator.request_pause()
+    assert coordinator.wait_for_safe_boundary(0.001) is True
+
+    gate.set()
+    worker.join(1)
+    assert not worker.is_alive()
+    assert received and received[0].pause_requested is True
+    assert results and results[0].state is TaskState.PAUSED
     assert coordinator.wait_for_safe_boundary(1) is True
