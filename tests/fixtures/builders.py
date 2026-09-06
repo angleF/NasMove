@@ -16,6 +16,25 @@ from nasmove.core.model import (
     VerificationPolicy,
 )
 from nasmove.core.states import ItemState, SourceKind, TaskState
+from nasmove.transfer.progress import ProgressSnapshot
+from nasmove.transfer.transfer_engine import TaskResult
+
+
+def snapshot(*, copy_percent: int = 0, verify_percent: int = 0, state: str = "running") -> ProgressSnapshot:
+    total = 200
+    return ProgressSnapshot(
+        total_bytes=total,
+        completed_bytes=copy_percent + verify_percent,
+        copied_bytes=copy_percent,
+        verified_bytes=verify_percent,
+        speed_bytes_per_second=100.0,
+        eta_seconds=None,
+    )
+
+
+def result_with_source_retained(name: str) -> TaskResult:
+    del name
+    return TaskResult(True, TaskState.COMPLETED_WITH_WARNINGS, warnings=("源文件仍保留",))
 
 
 def build_connection_config() -> ConnectionConfig:
