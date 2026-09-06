@@ -201,3 +201,14 @@ Success: no issues found in 18 source files
 ### 提交
 
 本轮修复提交为 `5333ff8366de10d0f1bd447ef654ef35e7a42792`（`fix: harden logging compatibility edges`）。
+
+## 最终独立复审
+
+独立审查者对提交 `2061f1ab323c0c2e3ce8bb93c6d9bbebdfd8b100..e35037752303b3098e69738d36424e7c78f47e93` 复审结论为 `CLEAN`，未发现 Critical 或 Important 问题。复审确认：
+
+- `logging.makeLogRecord()` 的 `name=None` 阶段安全兼容，且 post-factory 的 NasMove `msg`、普通 `extra` 与嵌套敏感字段均完成脱敏。
+- 动态 `nasmove.*` 子 logger 自有 handler、`propagate=False` 场景安全；原始 LogRecordFactory／makeLogRecord 链保留，重复配置不会递归包装，非 NasMove logger 行为不变。
+- 转义引号凭据整行 fail-closed；`/tmp`、`/var` 标准 macOS symlink ancestor 可用，未知 symlink 仍拒绝。
+- Keychain backend、异常上下文、权限、ACL、bytes、路径及异常处理未发现新的高优先级问题。
+
+最终验证：安全定向测试 `31 passed`；全量测试 `594 passed, 1 skipped`；Ruff 与 mypy 均通过。

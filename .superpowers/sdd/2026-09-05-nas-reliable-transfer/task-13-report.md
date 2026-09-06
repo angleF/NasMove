@@ -84,3 +84,15 @@ python -m pytest tests/unit/transfer/test_transfer_engine.py tests/unit/transfer
 ```
 
 本轮修复提交信息：`fix: close transfer orchestration review findings`
+
+## 最终独立复审
+
+结论：`CLEAN / ADDRESSED`。
+
+- 引擎不再重复执行 `VERIFIED → COMMITTED`；提交后重新读取 item，再继续 MOVE 删除。
+- `Repository.list_items()` 已成为正式契约；SQLite 按 `item_id` 稳定返回指定任务的全部条目。
+- 条目枚举异常会先持久化任务 `FAILED`，再发布 UI 事件。
+- 队列取任务、空队列返回与引擎调用均在统一 `try/finally` 内释放运行锁，异常后可重新执行。
+- 提交夹具使用真实状态 CAS，队列并发统计不再依靠手工赋值。
+
+主控侧最终验证：`750 passed, 1 skipped in 54.39s`；Ruff、mypy 与 `git diff --check` 均通过。
