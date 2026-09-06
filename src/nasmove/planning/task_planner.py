@@ -287,6 +287,7 @@ class TaskPlanner:
 
     @staticmethod
     def _open_parent(source: Path) -> int:
+        source = TaskPlanner._canonicalize_macos_system_alias(source)
         flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
         parent_fd = os.open(os.sep, flags)
         try:
@@ -300,6 +301,28 @@ class TaskPlanner:
             if exc.errno in {ELOOP, ENOTDIR}:
                 raise DomainValidationError("source path or an ancestor must not be a symlink") from exc
             raise
+
+    @staticmethod
+    def _canonicalize_macos_system_alias(source: Path) -> Path:
+        """Map Apple's safe /var and /tmp aliases to their real prefixes.
+
+        macOS exposes these two system paths as symlinks to /private.  They
+        are safe platform aliases, unlike arbitrary user-controlled symlink
+        ancestors which must remain rejected by the no-follow traversal.
+        """
+        if not source.is_absolute() or len(source.parts) < 2:
+            return source
+        alias = Path(source.anchor) / source.parts[1]
+        if alias not in {Path("/var"), Path("/tmp")}:
+            return source
+        try:
+            resolved = alias.resolve(strict=True)
+        except OSError:
+            return source
+        expected = Path("/private") / source.parts[1]
+        if resolved != expected:
+            return source
+        return resolved.joinpath(*source.parts[2:])
 
     def _scan(self, root: Path) -> Iterator[_Discovered]:
         flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)

@@ -329,6 +329,21 @@ def test_explicit_source_rejects_symlink_ancestor(tmp_path: Path) -> None:
         )
 
 
+@pytest.mark.skipif(not Path("/var").is_symlink(), reason="macOS /var alias is not present")
+def test_planner_accepts_macos_private_var_alias(tmp_path: Path) -> None:
+    real_source = tmp_path / "source.txt"
+    real_source.write_text("payload")
+    source = Path("/var") / real_source.resolve().relative_to("/private/var")
+    try:
+        repository = AtomicRepository()
+        TaskPlanner(LocalGateway(), SmbGateway(), repository).plan(
+            PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+        )
+        assert repository.item_count == 1
+    finally:
+        real_source.unlink(missing_ok=True)
+
+
 def test_hard_link_alias_sources_are_rejected(tmp_path: Path) -> None:
     first = tmp_path / "first.txt"
     second = tmp_path / "second.txt"
