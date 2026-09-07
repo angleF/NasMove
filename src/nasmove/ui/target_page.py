@@ -5,6 +5,7 @@ from typing import Any, cast
 from PySide6.QtCore import QThread, Signal, Slot
 from PySide6.QtWidgets import QLabel, QLineEdit, QListWidget, QPushButton, QVBoxLayout, QWidget
 
+from nasmove.core.model import RemotePath
 from nasmove.planning.paths import normalize_remote_path
 from nasmove.ui.view_models import RemoteBrowseReport
 from nasmove.ui.worker import BackgroundCommandWorker
@@ -12,6 +13,7 @@ from nasmove.ui.worker import BackgroundCommandWorker
 
 class TargetPage(QWidget):
     browse_ready = Signal(object)
+    create_task_requested = Signal()
 
     def __init__(self, *, gateway: object | None = None) -> None:
         super().__init__()
@@ -24,7 +26,10 @@ class TargetPage(QWidget):
         self.free_space_label = QLabel("可用空间：未查询")
         self.safety_margin_label = QLabel("安全余量：—")
         self.capability_label = QLabel("SMB 能力：未探测")
+        self.creation_status_label = QLabel("任务：尚未创建")
+        self.add_to_queue_button = QPushButton("加入队列")
         self.browse_button.clicked.connect(self.browse)
+        self.add_to_queue_button.clicked.connect(self.create_task_requested.emit)
         layout = QVBoxLayout(self)
         layout.addWidget(self.path_lineedit)
         layout.addWidget(self.browse_button)
@@ -32,6 +37,11 @@ class TargetPage(QWidget):
         layout.addWidget(self.free_space_label)
         layout.addWidget(self.safety_margin_label)
         layout.addWidget(self.capability_label)
+        layout.addWidget(self.creation_status_label)
+        layout.addWidget(self.add_to_queue_button)
+
+    def target_path(self) -> RemotePath:
+        return normalize_remote_path(self.path_lineedit.text().strip())
 
     def browse(self) -> None:
         if self._gateway is None:

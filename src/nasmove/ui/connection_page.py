@@ -122,6 +122,10 @@ class ConnectionPage(QWidget):
         self.profile_id = config.profile_id
         return config
 
+    def connection_config(self) -> ConnectionConfig:
+        """Return the validated, non-secret connection fields for task planning."""
+        return self._config()
+
     @staticmethod
     def _profile_key(host: str, share: str, username: str) -> str:
         value = f"{host}\x00{share}\x00{username}"

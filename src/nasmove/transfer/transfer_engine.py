@@ -378,6 +378,13 @@ class QueueCoordinator:
                 return
         token.request_pause()
 
+    def request_cancel(self) -> None:
+        with self._lifecycle_lock:
+            token = self._active_token
+            if token is None:
+                return
+        token.request_cancel()
+
     def wait_for_safe_boundary(self, timeout: float) -> bool:
         """Wait until the current engine call returns after a safe block boundary."""
         return self._active_done.wait(timeout)

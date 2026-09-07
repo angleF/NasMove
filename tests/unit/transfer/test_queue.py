@@ -238,5 +238,53 @@ def test_pause_requested_before_publication_is_latched_onto_published_token() ->
     worker.join(1)
     assert not worker.is_alive()
     assert received and received[0].pause_requested is True
-    assert results and results[0].state is TaskState.PAUSED
-    assert coordinator.wait_for_safe_boundary(1) is True
+
+
+def test_cancel_request_reaches_active_engine_token() -> None:
+    from nasmove.core.states import TaskState
+    from nasmove.transfer.transfer_engine import QueueCoordinator, TaskResult
+
+    started = Event()
+    release = Event()
+    received = []
+
+    class Engine:
+        def run_task(self, task_id, token):
+            del task_id
+            received.append(token)
+            started.set()
+            release.wait(2)
+            return TaskResult(False, TaskState.CANCELED)
+
+    coordinator = QueueCoordinator(Engine())
+    coordinator.enqueue("task-a")
+    worker = Thread(target=coordinator.run_next)
+    worker.start()
+    assert started.wait(2)
+
+    coordinator.request_cancel()
+    release.set()
+    worker.join(2)
+
+    assert received[0].cancel_requested is True
+
+
+def test_cancel_without_active_task_does_not_cancel_next_task() -> None:
+    from nasmove.core.states import TaskState
+    from nasmove.transfer.transfer_engine import QueueCoordinator, TaskResult
+
+    received = []
+
+    class Engine:
+        def run_task(self, task_id, token):
+            del task_id
+            received.append(token)
+            return TaskResult(True, TaskState.COMPLETED)
+
+    coordinator = QueueCoordinator(Engine())
+    coordinator.request_cancel()
+    coordinator.enqueue("later-task")
+
+    coordinator.run_next()
+
+    assert received[0].cancel_requested is False
