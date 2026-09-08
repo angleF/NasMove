@@ -1,7 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import PurePosixPath
+
 import pytest
 
+from nasmove.core.model import RemotePath
+from nasmove.core.states import SourceKind
 from nasmove.transfer.checkpoint_writer import CHECKPOINT_BYTES, IO_BLOCK_BYTES, CheckpointWriter
 
 
@@ -156,3 +161,40 @@ def test_repository_save_runs_inside_session_lease(fake_dependencies) -> None:
     assert result.outcome.value == "completed"
     assert result.confirmed_offset == IO_BLOCK_BYTES
     assert fake_dependencies.remote.generation_switch_blocked is True
+
+
+def test_empty_directory_creates_nested_parents_and_unique_temporary_directory(
+    fake_dependencies,
+) -> None:
+    item = fake_dependencies.item(size=0)
+    item = replace(
+        item,
+        relative_path=PurePosixPath("album/empty"),
+        final_path=RemotePath("target/album/empty"),
+        temp_path=RemotePath("target/album/.empty.part"),
+        source_fingerprint=replace(item.source_fingerprint, kind=SourceKind.EMPTY_DIRECTORY),
+    )
+    fake_dependencies.local.fingerprint_override = item.source_fingerprint
+    writer = CheckpointWriter(**fake_dependencies.as_kwargs())
+
+    result = writer.copy(item, 0, fake_dependencies.session(generation=1))
+
+    assert result.outcome.value == "completed"
+    assert "target/album" in fake_dependencies.remote.directories
+    assert item.temp_path.value in fake_dependencies.remote.directories
+    assert fake_dependencies.repository.checkpoints == []
+
+
+def test_file_copy_creates_missing_remote_parent_directories(fake_dependencies) -> None:
+    item = replace(
+        fake_dependencies.item(size=7),
+        relative_path=PurePosixPath("album/file.bin"),
+        final_path=RemotePath("target/album/file.bin"),
+        temp_path=RemotePath("target/album/.file.bin.part"),
+    )
+    writer = CheckpointWriter(**fake_dependencies.as_kwargs())
+
+    result = writer.copy(item, 0, fake_dependencies.session(generation=1))
+
+    assert result.outcome.value == "completed"
+    assert "target/album" in fake_dependencies.remote.directories

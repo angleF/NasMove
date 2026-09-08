@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Callable, Iterable, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, replace
@@ -19,6 +20,8 @@ from nasmove.core.ports import RemoteStat, SessionInfo
 from nasmove.core.states import ItemState, SourceKind, TransferAction
 from nasmove.core.transitions import authorize_source_delete
 from nasmove.localio.hashing import sha256_stream
+
+_EMPTY_HASH = hashlib.sha256().hexdigest()
 
 
 class TaskRepository(Protocol):
@@ -225,6 +228,12 @@ class SourceDeletionService:
             raise UnsafeSourceDeletion("SMB session generation is not current")
         with self._smb.session_lease(session.session_generation):
             target = self._smb.stat(item.final_path)
+            if item.source_fingerprint.kind is SourceKind.EMPTY_DIRECTORY:
+                if target is None or not target.is_directory:
+                    raise UnsafeSourceDeletion("committed target directory is missing")
+                if item.target_file_id is not None and target.file_id != item.target_file_id:
+                    raise UnsafeSourceDeletion("committed target identity changed")
+                return target, _EMPTY_HASH
             if target is None or target.is_directory:
                 raise UnsafeSourceDeletion("committed target is missing or not a file")
             if item.final_size is not None and target.size != item.final_size:
@@ -282,7 +291,10 @@ class SourceDeletionService:
             and type(remote_bytes) is int
             and source_bytes == expected_size
             and remote_bytes == expected_size
-            and target_stat.size == expected_size
+            and (
+                item.source_fingerprint.kind is SourceKind.EMPTY_DIRECTORY
+                or target_stat.size == expected_size
+            )
             and type(remote_file_id) is type(item.target_file_id)
             and remote_file_id == item.target_file_id
         )

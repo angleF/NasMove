@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+
+build/
+dist/
+nuitka-crash-report.xml
+
+.codegraph/
+graphify-out/

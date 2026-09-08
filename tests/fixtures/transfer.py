@@ -112,6 +112,7 @@ class TransferRemote:
     def __init__(self, trace: list[str], *, content: bytes = b"") -> None:
         self.trace = trace
         self.files: dict[str, bytearray] = {}
+        self.directories: set[str] = {"target"}
         self.content = content
         self.path: RemotePath | None = None
         self.fail_write = False
@@ -168,6 +169,12 @@ class TransferRemote:
     def stat(self, path: RemotePath) -> RemoteStat | None:
         if self.fail_stat:
             raise OSError("stat failure")
+        if path.value in self.directories:
+            self.trace.append(f"remote.stat_dir@{path.value}")
+            if path.value not in self.file_ids:
+                self.file_ids[path.value] = f"file-{self.next_file_id}"
+                self.next_file_id += 1
+            return RemoteStat(0, True, 0, self.file_ids[path.value])
         value = self.files.get(path.value)
         if value is None:
             return None
@@ -212,8 +219,15 @@ class TransferRemote:
         self.trace.append(f"remote.rename@{target.value}")
         if self.crash_before_rename:
             raise RuntimeError("injected crash before rename")
-        if target.value in self.files:
+        if target.value in self.files or target.value in self.directories:
             raise FileExistsError(target.value)
+        if source.value in self.directories:
+            self.directories.remove(source.value)
+            self.directories.add(target.value)
+            source_file_id = self.file_ids.pop(source.value, None)
+            if source_file_id is not None:
+                self.file_ids[target.value] = source_file_id
+            return
         if source.value not in self.files:
             raise FileNotFoundError(source.value)
         self.files[target.value] = self.files.pop(source.value)
@@ -229,11 +243,25 @@ class TransferRemote:
 
     def list_dir(self, path: RemotePath) -> list[object]:
         prefix = path.value + "/"
-        return [
+        files = [
             type("Entry", (), {"name": name[len(prefix) :], "is_directory": False, "size": len(value)})
             for name, value in self.files.items()
             if name.startswith(prefix) and "/" not in name[len(prefix) :]
         ]
+        directories = [
+            type("Entry", (), {"name": name[len(prefix) :], "is_directory": True, "size": 0})
+            for name in self.directories
+            if name.startswith(prefix) and "/" not in name[len(prefix) :]
+        ]
+        return files + directories
+
+    def make_dir(self, path: RemotePath) -> None:
+        self.trace.append(f"remote.mkdir@{path.value}")
+        if path.value in self.files or path.value in self.directories:
+            raise FileExistsError(path.value)
+        self.directories.add(path.value)
+        self.file_ids[path.value] = f"file-{self.next_file_id}"
+        self.next_file_id += 1
 
     def is_generation_current(self, generation: int) -> bool:
         with self._lifecycle_lock:

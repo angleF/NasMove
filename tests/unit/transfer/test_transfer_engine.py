@@ -1,7 +1,22 @@
 from dataclasses import replace
 
-from nasmove.core.states import ItemState, TaskState, TransferAction
-from nasmove.transfer.transfer_engine import TaskResult
+from nasmove.core.model import RemotePath
+from nasmove.core.ports import SessionInfo
+from nasmove.core.states import ItemState, SourceKind, TaskState, TransferAction
+from nasmove.transfer.checkpoint_writer import CancellationToken, CheckpointWriter
+from nasmove.transfer.commit import TargetCommitter
+from nasmove.transfer.deletion import SourceDeletionService
+from nasmove.transfer.recovery import RecoveryCoordinator
+from nasmove.transfer.transfer_engine import TaskResult, TransferEngine
+from nasmove.transfer.verification import IntegrityVerifier
+from tests.fixtures.builders import build_task_record
+from tests.fixtures.transfer import (
+    FakeDependencies,
+    TransferLocal,
+    TransferRemote,
+    TransferRepository,
+    TransferToken,
+)
 
 
 def test_move_item_follows_copy_verify_commit_delete_order(engine_fixture) -> None:
@@ -67,6 +82,68 @@ def test_item_enumeration_failure_is_persisted_and_published(engine_fixture) -> 
     assert engine_fixture.events[-1].error is not None
 
 
+def test_transient_network_failure_during_recovery_waits_for_network(engine_fixture) -> None:
+    def fail_recovery(_item_id):
+        raise ConnectionResetError("NAS is restarting")
+
+    engine_fixture.engine._recovery.find_safe_offset = fail_recovery
+
+    result = engine_fixture.engine.run_task(engine_fixture.move_task.id, engine_fixture.token)
+
+    assert result.success is False
+    assert result.state is TaskState.WAITING_FOR_NETWORK
+    assert (
+        engine_fixture.repository.get_task(engine_fixture.move_task.id).state
+        is TaskState.WAITING_FOR_NETWORK
+    )
+    assert engine_fixture.repository.get_item(engine_fixture.item.id).state is ItemState.PLANNED
+
+
 def test_task_result_is_immutable_and_has_safe_default_error() -> None:
     result = TaskResult(success=True, state=TaskState.COMPLETED)
     assert result.error is None
+
+
+def test_move_empty_directory_runs_create_verify_commit_delete_protocol() -> None:
+    trace: list[str] = []
+    local = TransferLocal(b"", trace)
+    remote = TransferRemote(trace)
+    repository = TransferRepository(trace)
+    support = FakeDependencies(local, remote, repository, trace, TransferToken())
+    item = support.item(size=0)
+    item = replace(
+        item,
+        source_fingerprint=replace(item.source_fingerprint, kind=SourceKind.EMPTY_DIRECTORY),
+        final_path=RemotePath("target/empty"),
+        temp_path=RemotePath("target/.empty.part"),
+        state=ItemState.PLANNED,
+    )
+    local.fingerprint_override = item.source_fingerprint
+    task = replace(
+        build_task_record(),
+        id=item.task_id,
+        action=TransferAction.MOVE,
+        state=TaskState.QUEUED,
+        total_files=1,
+        total_bytes=0,
+    )
+    repository.items[item.id] = item
+    repository.tasks[task.id] = task
+    session = SessionInfo("3.1.1", True, True, 1)
+    verifier = IntegrityVerifier(repository, local, remote, session)
+    engine = TransferEngine(
+        repository,
+        recovery=RecoveryCoordinator(repository, local, remote, session),
+        checkpoint_writer=CheckpointWriter(repository, local, remote),
+        verifier=verifier,
+        committer=TargetCommitter(repository, remote, session),
+        deletion_service=SourceDeletionService(repository, local, remote, verifier),
+        session=session,
+    )
+
+    result = engine.run_task(task.id, CancellationToken())
+
+    assert result.success is True
+    assert repository.get_item(item.id).state is ItemState.DONE
+    assert "target/empty" in remote.directories
+    assert local.source_exists is False

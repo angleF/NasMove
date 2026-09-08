@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from nasmove.core.model import Checkpoint
+from nasmove.core.states import SourceKind
 from nasmove.localio.hashing import sha256_range
 from nasmove.transfer.recovery import RecoveryDisposition
 
@@ -78,3 +81,22 @@ def test_recovery_skips_non_canonical_checkpoint_windows(
     decision = recovery_fixture.coordinator.find_safe_offset(recovery_fixture.item_id)
     assert decision.safe_offset == 64 * 1024 * 1024
     assert decision.disposition is RecoveryDisposition.RESUME
+
+
+def test_recovery_reuses_unique_temporary_empty_directory(recovery_fixture) -> None:
+    item = recovery_fixture.repository.get_item(recovery_fixture.item_id)
+    item = replace(
+        item,
+        source_fingerprint=replace(
+            item.source_fingerprint, kind=SourceKind.EMPTY_DIRECTORY, size=0
+        ),
+        confirmed_offset=0,
+    )
+    recovery_fixture.repository.items[item.id] = item
+    recovery_fixture.local.fingerprint_override = item.source_fingerprint
+    recovery_fixture.remote.directories.add(item.temp_path.value)
+
+    decision = recovery_fixture.coordinator.find_safe_offset(item.id)
+
+    assert decision.disposition is RecoveryDisposition.RESUME
+    assert decision.safe_offset == 0

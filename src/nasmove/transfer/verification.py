@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import BinaryIO, Protocol
 
 from nasmove.core.model import RemotePath, SourceFingerprint, TransferItemRecord
-from nasmove.core.ports import RemoteStat, SessionInfo
+from nasmove.core.ports import RemoteEntry, RemoteStat, SessionInfo
+from nasmove.core.states import SourceKind
 from nasmove.localio.hashing import HashResult, sha256_stream
 
 _EMPTY_HASH = hashlib.sha256().hexdigest()
@@ -31,6 +32,8 @@ class SmbGateway(Protocol):
     def stat(self, path: RemotePath) -> RemoteStat | None: ...
 
     def open_read(self, path: RemotePath) -> AbstractContextManager[BinaryIO]: ...
+
+    def list_dir(self, path: RemotePath) -> list[RemoteEntry]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +93,8 @@ class IntegrityVerifier:
 
     def verify_full(self, item: TransferItemRecord) -> VerificationResult:
         expected = item.source_fingerprint
+        if expected.kind is SourceKind.EMPTY_DIRECTORY:
+            return self._verify_empty_directory(item)
         before = self._local.fingerprint(item.source_path)
         with self._local.open_read(item.source_path) as source:
             source.seek(0)
@@ -143,6 +148,54 @@ class IntegrityVerifier:
             remote_file_id=(
                 remote_stat.file_id
                 if stable_remote_identity and remote_stat is not None
+                else None
+            ),
+        )
+
+    def _verify_empty_directory(self, item: TransferItemRecord) -> VerificationResult:
+        expected = item.source_fingerprint
+        before = self._local.fingerprint(item.source_path)
+        with self._lease():
+            remote_before = self._smb.stat(item.temp_path)
+            entries_before = (
+                self._smb.list_dir(item.temp_path)
+                if remote_before is not None and remote_before.is_directory
+                else [RemoteEntry("invalid", False, 0)]
+            )
+            remote_after = self._smb.stat(item.temp_path)
+            entries_after = (
+                self._smb.list_dir(item.temp_path)
+                if remote_after is not None and remote_after.is_directory
+                else [RemoteEntry("invalid", False, 0)]
+            )
+        after = self._local.fingerprint(item.source_path)
+        stable_remote_identity = (
+            remote_before is not None
+            and remote_after is not None
+            and remote_before.file_id == remote_after.file_id
+        )
+        matches = (
+            before == expected
+            and after == expected
+            and remote_before is not None
+            and remote_before.is_directory
+            and remote_after is not None
+            and remote_after.is_directory
+            and stable_remote_identity
+            and not entries_before
+            and not entries_after
+        )
+        return VerificationResult(
+            matches=matches,
+            source_unchanged=before == expected and after == expected,
+            source_hash=_EMPTY_HASH,
+            remote_hash=_EMPTY_HASH,
+            source_bytes=0,
+            remote_bytes=0,
+            session_generation=self._session.session_generation,
+            remote_file_id=(
+                remote_before.file_id
+                if stable_remote_identity and remote_before is not None
                 else None
             ),
         )

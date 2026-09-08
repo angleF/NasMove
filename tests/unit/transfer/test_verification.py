@@ -1,4 +1,7 @@
+import hashlib
 from dataclasses import replace
+
+from nasmove.core.states import SourceKind
 
 
 def test_full_verification_hashes_source_and_remote_from_zero(verification_fixture) -> None:
@@ -50,3 +53,25 @@ def test_full_verification_rejects_different_length_replacement_without_file_id(
     verification_fixture.remote.file_ids[verification_fixture.item.temp_path.value] = None
     result = verification_fixture.verifier.verify_full(verification_fixture.item)
     assert result.matches is False
+
+
+def test_empty_directory_verification_checks_local_fingerprint_and_remote_temp_directory(
+    verification_fixture,
+) -> None:
+    item = replace(
+        verification_fixture.item,
+        source_fingerprint=replace(
+            verification_fixture.item.source_fingerprint,
+            kind=SourceKind.EMPTY_DIRECTORY,
+            size=0,
+        ),
+    )
+    verification_fixture.local.fingerprint_override = item.source_fingerprint
+    verification_fixture.remote.files.pop(item.temp_path.value)
+    verification_fixture.remote.directories.add(item.temp_path.value)
+
+    result = verification_fixture.verifier.verify_full(item)
+
+    assert result.matches is True
+    assert result.source_hash == hashlib.sha256().hexdigest()
+    assert result.source_bytes == result.remote_bytes == 0

@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import hashlib
 from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 
 from nasmove.core.errors import UnsafeSourceDeletion
-from nasmove.core.states import ItemState, TransferAction
+from nasmove.core.states import ItemState, SourceKind, TransferAction
 from nasmove.transfer.deletion import SourceDeletionService
 
 
@@ -191,3 +192,27 @@ def test_changed_final_target_is_not_deleted(deletion_fixture) -> None:
 
 def test_deletion_service_has_expected_public_constructor() -> None:
     assert SourceDeletionService.delete_verified_source
+
+
+def test_committed_empty_directory_is_rechecked_then_removed(deletion_fixture) -> None:
+    digest = hashlib.sha256().hexdigest()
+    item = replace(
+        deletion_fixture.item,
+        source_fingerprint=replace(
+            deletion_fixture.item.source_fingerprint,
+            kind=SourceKind.EMPTY_DIRECTORY,
+            size=0,
+        ),
+        sha256=digest,
+        final_size=0,
+    )
+    deletion_fixture.local.fingerprint_override = item.source_fingerprint
+    deletion_fixture.remote.files.pop(item.final_path.value)
+    deletion_fixture.remote.directories.add(item.final_path.value)
+    deletion_fixture.remote.file_ids[item.final_path.value] = item.target_file_id
+    deletion_fixture.repository.items[item.id] = item
+
+    result = deletion_fixture.service.delete_verified_source(item.id, deletion_fixture.session)
+
+    assert result.source_deleted is True
+    assert deletion_fixture.repository.get_item(item.id).state is ItemState.DONE

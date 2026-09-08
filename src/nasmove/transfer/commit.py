@@ -8,7 +8,7 @@ from typing import BinaryIO, Protocol
 
 from nasmove.core.model import RemotePath, TransferItemRecord
 from nasmove.core.ports import RemoteEntry, RemoteStat, SessionInfo
-from nasmove.core.states import ItemState
+from nasmove.core.states import ItemState, SourceKind
 from nasmove.localio.hashing import sha256_stream
 from nasmove.planning.conflicts import allocate_name
 from nasmove.transfer.verification import VerificationResult
@@ -82,8 +82,9 @@ class TargetCommitter:
                 if candidate != current.final_path:
                     current = self._persist_path(current, candidate)
                 temporary_stat = self._smb.stat(current.temp_path)
-                if temporary_stat is None or temporary_stat.is_directory:
-                    raise OSError("verified temporary file is missing")
+                is_directory = current.source_fingerprint.kind is SourceKind.EMPTY_DIRECTORY
+                if temporary_stat is None or temporary_stat.is_directory is not is_directory:
+                    raise OSError("verified temporary object is missing or has the wrong type")
                 if (
                     verification.remote_file_id is not None
                     and temporary_stat.file_id != verification.remote_file_id
@@ -100,21 +101,24 @@ class TargetCommitter:
                 final_stat = self._smb.stat(candidate)
                 if (
                     final_stat is None
-                    or final_stat.is_directory
-                    or final_stat.size != verification.source_bytes
+                    or final_stat.is_directory is not is_directory
+                    or (not is_directory and final_stat.size != verification.source_bytes)
                 ):
                     raise OSError("renamed target could not be confirmed")
                 if not self._target_identity_is_safe(final_stat, verification):
                     raise OSError("renamed target identity does not match verified temporary file")
-                if verification.remote_file_id is None:
+                if verification.remote_file_id is None and not is_directory:
                     self._verify_final_content(candidate, verification)
+                if is_directory and self._smb.list_dir(candidate):
+                    raise OSError("renamed target directory is no longer empty")
+                final_size = 0 if is_directory else final_stat.size
                 current = replace(
                     current,
                     final_path=candidate,
                     sha256=verification.source_hash,
                     full_hash_verified=True,
                     target_file_id=final_stat.file_id,
-                    final_size=final_stat.size,
+                    final_size=final_size,
                     committed_at=datetime.now(UTC),
                     verified_session_generation=verification.session_generation,
                 )
@@ -122,7 +126,7 @@ class TargetCommitter:
                 self._repository.transition_item(
                     current.id, ItemState.VERIFIED, ItemState.COMMITTED
                 )
-                return CommitResult(candidate, final_stat.size, final_stat.file_id)
+                return CommitResult(candidate, final_size, final_stat.file_id)
 
     def _choose_initial_path(self, item: TransferItemRecord) -> RemotePath:
         if self._smb.stat(item.final_path) is None:

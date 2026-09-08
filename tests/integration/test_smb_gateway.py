@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import errno
+from contextlib import contextmanager
 from io import BytesIO
 from types import SimpleNamespace
 from typing import Any
@@ -8,7 +10,11 @@ import pytest
 from smbprotocol.exceptions import SMBConnectionClosed
 
 from nasmove.core.model import ConnectionConfig, ConnectionProfileId, RemotePath
-from nasmove.smb.error_mapping import RenameOutcomeUnknownError, TargetExistsError
+from nasmove.smb.error_mapping import (
+    RenameOutcomeUnknownError,
+    StaleSmbHandleError,
+    TargetExistsError,
+)
 from nasmove.smb.smbprotocol_gateway import SmbProtocolGateway, write_all
 from tests.fixtures.fake_smb import ShortWritingStream
 
@@ -74,6 +80,54 @@ def test_gateway_uses_normalized_unc_and_resets_idempotently(
     assert [name for name, _ in calls] == ["reset", "reset", "reset", "reset"]
 
 
+def test_gateway_passes_explicit_ntlm_auth_protocol(monkeypatch: pytest.MonkeyPatch) -> None:
+    registered: dict[str, Any] = {}
+
+    def register_session(*args: Any, **kwargs: Any) -> SimpleNamespace:
+        registered.update(kwargs)
+        return _session()
+
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        register_session,
+    )
+    gateway = SmbProtocolGateway(auth_protocol="ntlm")
+
+    gateway.connect(_config(), "secret")
+
+    assert registered["auth_protocol"] == "ntlm"
+
+
+def test_probe_share_opens_share_root_with_explicit_credentials(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    opened: dict[str, Any] = {}
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+
+    @contextmanager
+    def scandir(path: str, **kwargs: Any):
+        opened.update(path=path, **kwargs)
+        yield iter(())
+
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.scandir", scandir)
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "secret")
+
+    gateway.probe_share()
+
+    assert opened["path"] == r"\\nas.example.test\transfer"
+    assert opened["username"] == "tester"
+    assert opened["password"] == "secret"
+
+
+def test_gateway_rejects_unknown_auth_protocol() -> None:
+    with pytest.raises(ValueError, match="authentication protocol"):
+        SmbProtocolGateway(auth_protocol="plaintext")
+
+
 def test_open_update_exposes_binary_context_and_short_write(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -97,6 +151,95 @@ def test_open_update_exposes_binary_context_and_short_write(
     assert opened["path"] == r"\\nas.example.test\transfer\folder\file.part"
     assert opened["mode"] == "r+b"
     assert opened["buffering"] == 0
+    assert opened["username"] == "tester"
+    assert opened["password"] == "secret"
+    assert opened["auth_protocol"] == "negotiate"
+
+
+def test_open_stream_maps_live_bad_descriptor_to_stale_smb_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DisconnectedStream(BytesIO):
+        def write(self, data: bytes | bytearray) -> int:
+            del data
+            raise OSError(errno.EBADF, "transport descriptor was closed")
+
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.open_file",
+        lambda *args, **kwargs: DisconnectedStream(),
+    )
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "secret")
+
+    with (
+        gateway.open_update(RemotePath("folder/file.part")) as stream,
+        pytest.raises(StaleSmbHandleError) as raised,
+    ):
+        stream.write(b"payload")
+
+    assert isinstance(raised.value.__cause__, OSError)
+
+
+def test_open_stream_maps_bad_descriptor_during_close_to_stale_smb_handle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class DisconnectOnClose(BytesIO):
+        def close(self) -> None:
+            raise OSError(errno.EBADF, "transport descriptor was closed")
+
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.open_file",
+        lambda *args, **kwargs: DisconnectOnClose(),
+    )
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "secret")
+
+    with (
+        pytest.raises(StaleSmbHandleError) as raised,
+        gateway.open_update(RemotePath("folder/file.part")),
+    ):
+        pass
+
+    assert isinstance(raised.value.__cause__, OSError)
+
+
+def test_list_dir_stats_children_with_explicit_session_parameters(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stat_calls: list[tuple[str, dict[str, Any]]] = []
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+
+    @contextmanager
+    def scandir(*_args: Any, **_kwargs: Any):
+        yield iter((SimpleNamespace(name="child.bin"),))
+
+    def stat(path: str, **kwargs: Any) -> SimpleNamespace:
+        stat_calls.append((path, kwargs))
+        return SimpleNamespace(st_size=7, st_mode=0o100644, st_mtime_ns=0, st_ino=1)
+
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.scandir", scandir)
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.stat", stat)
+    gateway = SmbProtocolGateway(auth_protocol="ntlm")
+    gateway.connect(_config(), "secret")
+
+    entries = gateway.list_dir(RemotePath("folder"))
+
+    assert entries[0].name == "child.bin"
+    assert stat_calls[0][0] == r"\\nas.example.test\transfer\folder\child.bin"
+    assert stat_calls[0][1]["username"] == "tester"
+    assert stat_calls[0][1]["password"] == "secret"
+    assert stat_calls[0][1]["auth_protocol"] == "ntlm"
 
 
 def test_rename_exclusive_checks_target_before_and_after_failure(

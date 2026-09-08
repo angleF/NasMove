@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import errno
 import ipaddress
 import stat as stat_module
 from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from threading import RLock, get_ident
-from typing import Any, BinaryIO, cast
+from typing import Any, BinaryIO, Literal, cast
 
 import smbclient  # type: ignore[import-untyped]
 
@@ -30,6 +31,11 @@ _DIALECT_NAMES = {
 _DIALECT_VALUES = {name: value for value, name in _DIALECT_NAMES.items()}
 
 
+def _raise_stale_handle_on_bad_descriptor(error: OSError) -> None:
+    if error.errno == errno.EBADF:
+        raise StaleSmbHandleError("SMB transport closed the active handle") from error
+
+
 class _GenerationCheckedStream:
     def __init__(self, gateway: SmbProtocolGateway, raw: BinaryIO, generation: int) -> None:
         self._gateway = gateway
@@ -44,31 +50,33 @@ class _GenerationCheckedStream:
         if not self._gateway.is_generation_current(self._generation):
             raise StaleSmbHandleError("SMB handle belongs to an invalidated session")
 
-    def read(self, size: int = -1) -> bytes:
+    def _invoke(self, operation: Any, *args: Any) -> Any:
         self._check_current()
-        return self._raw.read(size)
+        try:
+            return operation(*args)
+        except OSError as error:
+            _raise_stale_handle_on_bad_descriptor(error)
+            raise
+
+    def read(self, size: int = -1) -> bytes:
+        return cast(bytes, self._invoke(self._raw.read, size))
 
     def write(self, data: bytes) -> int:
-        self._check_current()
-        return self._raw.write(data)
+        return cast(int, self._invoke(self._raw.write, data))
 
     def seek(self, offset: int, whence: int = 0) -> int:
-        self._check_current()
-        return self._raw.seek(offset, whence)
+        return cast(int, self._invoke(self._raw.seek, offset, whence))
 
     def tell(self) -> int:
-        self._check_current()
-        return self._raw.tell()
+        return cast(int, self._invoke(self._raw.tell))
 
     def flush(self) -> None:
-        self._check_current()
-        self._raw.flush()
+        self._invoke(self._raw.flush)
 
     def truncate(self, size: int | None = None) -> int:
-        self._check_current()
         if size is None:
-            return self._raw.truncate()
-        return self._raw.truncate(size)
+            return cast(int, self._invoke(self._raw.truncate))
+        return cast(int, self._invoke(self._raw.truncate, size))
 
 
 def write_all(stream: BinaryIO, data: bytes) -> None:
@@ -82,9 +90,17 @@ def write_all(stream: BinaryIO, data: bytes) -> None:
 
 
 class SmbProtocolGateway:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        auth_protocol: Literal["negotiate", "ntlm", "kerberos"] = "negotiate",
+    ) -> None:
+        if auth_protocol not in {"negotiate", "ntlm", "kerberos"}:
+            raise ValueError("unsupported SMB authentication protocol")
         self._connection_cache: dict[str, Any] = {}
+        self._auth_protocol = auth_protocol
         self._config: ConnectionConfig | None = None
+        self._password: str | None = None
         self._session_generation = 0
         self._active_generation: int | None = None
         self._lifecycle_lock = RLock()
@@ -105,6 +121,7 @@ class SmbProtocolGateway:
                 port=config.port,
                 encrypt=config.require_encryption,
                 connection_cache=self._connection_cache,
+                auth_protocol=self._auth_protocol,
                 require_signing=True,
             )
             dialect_value = cast(int | None, session.connection.dialect)
@@ -116,6 +133,7 @@ class SmbProtocolGateway:
             self._session_generation += 1
             self._active_generation = self._session_generation
             self._config = config
+            self._password = password
             return SessionInfo(
                 dialect=_DIALECT_NAMES.get(dialect_value, f"0x{dialect_value:04x}"),
                 signing=bool(session.signing_required),
@@ -157,6 +175,7 @@ class SmbProtocolGateway:
     def _disconnect_unlocked(self) -> None:
         self._active_generation = None
         self._config = None
+        self._password = None
         self._clear_connection_cache()
 
     def stat(self, path: RemotePath) -> RemoteStat | None:
@@ -177,15 +196,28 @@ class SmbProtocolGateway:
         entries: list[RemoteEntry] = []
         with smbclient.scandir(self._unc(path), **self._session_kwargs()) as iterator:
             for entry in iterator:
-                entry_stat = entry.stat()
+                name = validate_remote_component(entry.name)
+                child = RemotePath(f"{path.value}/{name}")
+                entry_stat = smbclient.stat(self._unc(child), **self._session_kwargs())
                 entries.append(
                     RemoteEntry(
-                        name=entry.name,
-                        is_directory=entry.is_dir(),
+                        name=name,
+                        is_directory=stat_module.S_ISDIR(entry_stat.st_mode),
                         size=entry_stat.st_size,
                     )
                 )
         return entries
+
+    def probe_share(self) -> None:
+        """Open and enumerate the share root to prove tree-connect authorization."""
+        config = self._require_config()
+        host = self._normalize_component(config.host, "host")
+        share = self._normalize_component(config.share, "share")
+        with smbclient.scandir(
+            f"\\\\{host}\\{share}",
+            **self._session_kwargs(),
+        ) as iterator:
+            next(iterator, None)
 
     def open_read(self, path: RemotePath) -> AbstractContextManager[BinaryIO]:
         return self._open(path, "rb")
@@ -244,13 +276,18 @@ class SmbProtocolGateway:
             ),
         )
         stream = _GenerationCheckedStream(self, raw, generation)
+        body_failed = False
         try:
             yield cast(BinaryIO, stream)
+        except BaseException:
+            body_failed = True
+            raise
         finally:
             try:
                 raw.close()
-            except OSError:
-                if self.is_generation_current(generation):
+            except OSError as error:
+                if not body_failed and self.is_generation_current(generation):
+                    _raise_stale_handle_on_bad_descriptor(error)
                     raise
 
     def _unc(self, path: RemotePath) -> str:
@@ -262,7 +299,16 @@ class SmbProtocolGateway:
 
     def _session_kwargs(self) -> dict[str, Any]:
         config = self._require_config()
-        return {"port": config.port, "connection_cache": self._connection_cache}
+        if self._password is None:
+            raise ConnectionError("SMB credentials are unavailable")
+        username = f"{config.domain}\\{config.username}" if config.domain else config.username
+        return {
+            "username": username,
+            "password": self._password,
+            "port": config.port,
+            "auth_protocol": self._auth_protocol,
+            "connection_cache": self._connection_cache,
+        }
 
     def _require_config(self) -> ConnectionConfig:
         if self._config is None or self._active_generation is None:

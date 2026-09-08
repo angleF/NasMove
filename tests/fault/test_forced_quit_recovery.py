@@ -194,9 +194,12 @@ class DiskSmb:
         yield
     def stat(self, path):
         try:
-            return RemoteStat(disk_path(path).stat().st_size, False, 0, str(disk_path(path).stat().st_ino))
+            stat = disk_path(path).stat()
+            return RemoteStat(stat.st_size, disk_path(path).is_dir(), 0, str(stat.st_ino))
         except FileNotFoundError:
             return None
+    def make_dir(self, path):
+        disk_path(path).mkdir()
     def open_read(self, path):
         if window == "verify":
             os._exit(23)

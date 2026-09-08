@@ -241,16 +241,31 @@ class TransferEngine:
                 raise RuntimeError("target committer did not persist committed state")
             return self._delete_if_needed(item, task, session)
         except Exception as error:  # noqa: BLE001 - boundary failures need durable classification
+            retryable = self._retry_policy.is_retryable(error) and item.state not in {
+                ItemState.COMMITTED,
+                ItemState.SOURCE_DELETE_AUTHORIZED,
+            }
             if item.state in {
                 ItemState.TRANSFERRING,
                 ItemState.TRANSFERRED,
                 ItemState.VERIFYING,
                 ItemState.VERIFIED,
             }:
-                self._safe_item_transition(item, ItemState.INTERRUPTED)
+                retry_state = (
+                    ItemState.WAITING_RETRY
+                    if retryable
+                    and item.state in {ItemState.TRANSFERRING, ItemState.VERIFYING}
+                    else ItemState.INTERRUPTED
+                )
+                self._safe_item_transition(item, retry_state)
             elif item.state is ItemState.SOURCE_DELETE_AUTHORIZED:
                 self._safe_item_transition(item, ItemState.SOURCE_RETAINED)
-            return self._fail_task(task, error, item)
+            return self._fail_task(
+                task,
+                error,
+                item,
+                state=TaskState.WAITING_FOR_NETWORK if retryable else TaskState.FAILED,
+            )
 
     def _delete_if_needed(self, item: TransferItemRecord, task: TaskRecord, session: SessionInfo) -> str | None:
         if task.action is not TransferAction.MOVE:

@@ -15,6 +15,7 @@ from nasmove.core.model import (
     TransferItemRecord,
 )
 from nasmove.core.ports import RemoteStat, SessionInfo
+from nasmove.core.states import SourceKind
 from nasmove.localio.hashing import sha256_range, sha256_stream
 
 
@@ -119,6 +120,17 @@ class RecoveryCoordinator:
         checkpoints = self._repository.checkpoints_desc(item_id)
         with self._lease():
             final_stat = self._smb.stat(item.final_path)
+            if item.source_fingerprint.kind is SourceKind.EMPTY_DIRECTORY:
+                if final_stat is not None:
+                    return RecoveryDecision(0, False, RecoveryDisposition.FINAL_UNSAFE)
+                temporary_stat = self._smb.stat(item.temp_path)
+                if temporary_stat is None:
+                    return RecoveryDecision(0, False, RecoveryDisposition.START_OVER)
+                if temporary_stat.is_directory:
+                    return RecoveryDecision(0, False, RecoveryDisposition.RESUME)
+                return self._isolate_and_start_over(
+                    item, ValueError("temporary directory path is occupied by a file")
+                )
             if final_stat is not None:
                 return self._check_final_file(item, final_stat, current_fingerprint)
 

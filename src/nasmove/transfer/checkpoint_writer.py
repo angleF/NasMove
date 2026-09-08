@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import BinaryIO, Protocol
 
 from nasmove.core.model import Checkpoint, RemotePath, TransferItemRecord
@@ -77,6 +77,8 @@ class SmbGateway(Protocol):
 
     def create_exclusive(self, path: RemotePath) -> AbstractContextManager[BinaryIO]: ...
 
+    def make_dir(self, path: RemotePath) -> None: ...
+
 
 def _pause_requested(token: object | None) -> bool:
     if token is None:
@@ -138,6 +140,10 @@ class CheckpointWriter:
         if _cancel_requested(active_token):
             return CopyResult(CopyOutcome.CANCELLED, start_offset, last_persisted)
         try:
+            self._ensure_parent_directories(item.temp_path, session)
+            if item.source_fingerprint.kind is SourceKind.EMPTY_DIRECTORY:
+                self._prepare_empty_directory(item, session)
+                return CopyResult(CopyOutcome.COMPLETED, 0, 0)
             with self._local.open_read(item.source_path) as source:
                 source.seek(start_offset)
                 with self._open_remote(item, start_offset, session) as remote:
@@ -190,8 +196,8 @@ class CheckpointWriter:
 
     @staticmethod
     def _validate_request(item: TransferItemRecord, start_offset: int, session: SessionInfo) -> None:
-        if item.source_fingerprint.kind is not SourceKind.FILE:
-            raise ValueError("checkpoint writer accepts regular files only")
+        if item.source_fingerprint.kind not in {SourceKind.FILE, SourceKind.EMPTY_DIRECTORY}:
+            raise ValueError("checkpoint writer accepts regular files and empty directories only")
         if type(start_offset) is not int or start_offset < 0:
             raise ValueError("start_offset must be a non-negative integer")
         if start_offset > item.source_fingerprint.size:
@@ -200,6 +206,49 @@ class CheckpointWriter:
             raise ValueError("start_offset must not exceed durable item checkpoint")
         if type(session.session_generation) is not int or session.session_generation <= 0:
             raise ValueError("session generation must be positive")
+
+    def _ensure_parent_directories(self, path: RemotePath, session: SessionInfo) -> None:
+        parent = PurePosixPath(path.value).parent
+        if str(parent) == ".":
+            return
+        current_parts: list[str] = []
+        with self._smb.session_lease(session.session_generation):
+            for component in parent.parts:
+                current_parts.append(component)
+                current = RemotePath("/".join(current_parts))
+                self._assert_generation(session)
+                remote_stat = self._smb.stat(current)
+                if remote_stat is None:
+                    try:
+                        self._smb.make_dir(current)
+                    except Exception:
+                        remote_stat = self._smb.stat(current)
+                        if remote_stat is None:
+                            raise
+                    else:
+                        remote_stat = self._smb.stat(current)
+                if remote_stat is None or not remote_stat.is_directory:
+                    raise OSError(f"remote parent is not a directory: {current.value}")
+            self._assert_generation(session)
+
+    def _prepare_empty_directory(
+        self, item: TransferItemRecord, session: SessionInfo
+    ) -> None:
+        with self._smb.session_lease(session.session_generation):
+            self._assert_generation(session)
+            remote_stat = self._smb.stat(item.temp_path)
+            if remote_stat is None:
+                try:
+                    self._smb.make_dir(item.temp_path)
+                except Exception:
+                    remote_stat = self._smb.stat(item.temp_path)
+                    if remote_stat is None:
+                        raise
+                else:
+                    remote_stat = self._smb.stat(item.temp_path)
+            self._assert_generation(session)
+            if remote_stat is None or not remote_stat.is_directory:
+                raise OSError("remote temporary directory could not be confirmed")
 
     @contextmanager
     def _open_remote(
