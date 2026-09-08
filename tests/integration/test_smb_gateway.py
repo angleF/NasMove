@@ -123,6 +123,32 @@ def test_probe_share_opens_share_root_with_explicit_credentials(
     assert opened["password"] == "secret"
 
 
+def test_gateway_lists_share_root_for_directory_picker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+
+    @contextmanager
+    def scandir(path: str, **kwargs: Any):
+        del path, kwargs
+        yield iter((SimpleNamespace(name="照片"),))
+
+    monkeypatch.setattr("nasmove.smb.smbprotocol_gateway.smbclient.scandir", scandir)
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.stat",
+        lambda *args, **kwargs: SimpleNamespace(st_mode=0o040755, st_size=0),
+    )
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "secret")
+
+    entries = gateway.list_share_root()
+
+    assert [(entry.name, entry.is_directory) for entry in entries] == [("照片", True)]
+
+
 def test_gateway_rejects_unknown_auth_protocol() -> None:
     with pytest.raises(ValueError, match="authentication protocol"):
         SmbProtocolGateway(auth_protocol="plaintext")

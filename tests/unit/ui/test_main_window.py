@@ -9,9 +9,13 @@ def test_main_window_navigation_reaches_each_transfer_step(qtbot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
 
+    assert "1  连接 NAS" in window.step_label.text()
+    assert window.page_title_label.text() == "连接 NAS"
+
     assert window.pages.currentWidget() is window.connection_page
     window.next_button.click()
     assert window.pages.currentWidget() is window.source_page
+    assert window.page_title_label.text() == "选择本地文件"
     window.next_button.click()
     assert window.pages.currentWidget() is window.target_page
     window.next_button.click()

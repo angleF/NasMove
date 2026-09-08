@@ -27,13 +27,21 @@ from nasmove.ui.worker import BackgroundCommandWorker
 class ConnectionPage(QWidget):
     report_ready = Signal(object)
 
-    def __init__(self, *, tester: object | None = None, credential_store: object | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        tester: object | None = None,
+        credential_store: object | None = None,
+        profile_store: object | None = None,
+    ) -> None:
         super().__init__()
         self._tester = tester
         self._credential_store = credential_store
+        self._profile_store = profile_store
         self._thread: QThread | None = None
         self._worker: BackgroundCommandWorker | None = None
         self.profile_id: ConnectionProfileId | None = None
+        self._tested_config: ConnectionConfig | None = None
 
         self.display_name_lineedit = QLineEdit()
         self.address_lineedit = QLineEdit()
@@ -64,6 +72,7 @@ class ConnectionPage(QWidget):
         self.address_lineedit.textEdited.connect(self._split_address)
         self.test_button.clicked.connect(self.test_connection)
         self.error_details_button.toggled.connect(self.error_details.setVisible)
+        self._restore_last_successful_connection()
 
     def _build_ui(self) -> None:
         form = QFormLayout()
@@ -148,6 +157,7 @@ class ConnectionPage(QWidget):
             self._show_error(str(error))
             return
         request = ConnectionRequest(config=config, password=self.password_lineedit.text())
+        self._tested_config = config
         tester = cast(Any, self._tester)
         if tester is None:
             self._show_error("未配置连接测试服务")
@@ -179,6 +189,7 @@ class ConnectionPage(QWidget):
             if not stage.success and stage.error_code:
                 self.error_details.append(stage.error_code)
         if report.success:
+            self._save_successful_profile()
             self._save_password()
         self.report_ready.emit(report)
 
@@ -196,6 +207,48 @@ class ConnectionPage(QWidget):
             if callable(deleter):
                 deleter(self.profile_id)
             self.password_lineedit.clear()
+
+    def _save_successful_profile(self) -> None:
+        store = self._profile_store
+        config = self._tested_config
+        if store is None or config is None:
+            return
+        saver = getattr(store, "save_successful_connection", None)
+        if callable(saver):
+            try:
+                saver(config)
+            except Exception:  # noqa: BLE001 - connection remains valid if local history fails
+                self.error_details.append("无法保存最近连接配置")
+
+    def _restore_last_successful_connection(self) -> None:
+        store = self._profile_store
+        loader = getattr(store, "last_successful_connection", None)
+        if not callable(loader):
+            return
+        try:
+            config = loader()
+        except Exception:  # noqa: BLE001 - startup must remain usable
+            self.error_details.setPlainText("无法读取最近连接配置")
+            return
+        if not isinstance(config, ConnectionConfig):
+            return
+        self.profile_id = config.profile_id
+        self.display_name_lineedit.setText(config.display_name)
+        self.address_lineedit.setText(config.host)
+        self.port_spinbox.setValue(config.port)
+        self.share_lineedit.setText(config.share)
+        self.username_lineedit.setText(config.username)
+        self.domain_lineedit.setText(config.domain or "")
+        self.require_encryption_checkbox.setChecked(config.require_encryption)
+        getter = getattr(self._credential_store, "get_password", None)
+        if callable(getter):
+            try:
+                password = getter(config.profile_id)
+            except Exception:  # noqa: BLE001 - never expose Keychain details
+                self.error_details.setPlainText("无法从 macOS Keychain 读取密码")
+            else:
+                if password:
+                    self.password_lineedit.setText(password)
 
     def _show_error(self, message: object) -> None:
         self.error_details.setPlainText(str(message))

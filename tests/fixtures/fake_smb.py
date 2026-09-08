@@ -89,6 +89,18 @@ class RecordingSmbGateway:
             if name.startswith(prefix)
         ]
 
+    def list_share_root(self) -> list[RemoteEntry]:
+        roots: dict[str, RemoteEntry] = {}
+        for name, value in self.files.items():
+            root, separator, remainder = name.partition("/")
+            roots[root] = RemoteEntry(
+                name=root,
+                is_directory=bool(separator),
+                size=0 if separator else len(value),
+            )
+            del remainder
+        return list(roots.values())
+
     @contextmanager
     def open_read(self, path: RemotePath) -> Iterator[BinaryIO]:
         self.calls.append("open_read")
@@ -149,6 +161,9 @@ class RecordingSmbGateway:
 
     def free_space(self, path: RemotePath) -> int:
         del path
+        return 1 << 40
+
+    def free_space_share_root(self) -> int:
         return 1 << 40
 
 

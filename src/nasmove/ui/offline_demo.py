@@ -131,6 +131,12 @@ class OfflineApplication:
 
 
 class OfflineGateway:
+    def list_share_root(self) -> tuple[object, ...]:
+        return ()
+
+    def free_space_share_root(self) -> int:
+        return 1 << 40
+
     def list_dir(self, path: object) -> tuple[object, ...]:
         del path
         return ()

@@ -3,8 +3,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, cast
 
-from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QCheckBox, QFileDialog, QListWidget, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtCore import QEvent, QObject, Qt, Signal
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QFileDialog,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 
 class SourcePage(QWidget):
@@ -19,15 +28,33 @@ class SourcePage(QWidget):
         self.verify_checkbox = QCheckBox("完整校验")
         self.verify_checkbox.setChecked(True)
         self.verify_checkbox.setEnabled(True)
-        self.add_button = QPushButton("选择文件或目录")
+        self.add_files_button = QPushButton("添加文件")
+        self.add_directory_button = QPushButton("添加文件夹")
+        self.remove_button = QPushButton("移除选中")
+        self.clear_button = QPushButton("清空")
+        self.add_button = self.add_files_button
         self.list_widget = QListWidget()
-        self.add_button.clicked.connect(self.choose_sources)
+        self.list_widget.setAlternatingRowColors(True)
+        self.list_widget.installEventFilter(self)
+        self.add_files_button.clicked.connect(self.choose_files)
+        self.add_directory_button.clicked.connect(self.choose_directory)
+        self.remove_button.clicked.connect(self.remove_selected_sources)
+        self.clear_button.clicked.connect(lambda: self.set_sources([]))
         self.move_checkbox.toggled.connect(self._move_toggled)
         layout = QVBoxLayout(self)
+        layout.addWidget(QLabel("选择要迁移的本地文件或文件夹，也可以直接拖入下方列表。"))
         layout.addWidget(self.preserve_hierarchy_checkbox)
         layout.addWidget(self.move_checkbox)
         layout.addWidget(self.verify_checkbox)
-        layout.addWidget(self.add_button)
+        buttons = QHBoxLayout()
+        for button in (
+            self.add_files_button,
+            self.add_directory_button,
+            self.remove_button,
+            self.clear_button,
+        ):
+            buttons.addWidget(button)
+        layout.addLayout(buttons)
         layout.addWidget(self.list_widget)
         self.setAcceptDrops(True)
 
@@ -36,9 +63,41 @@ class SourcePage(QWidget):
         self.verify_checkbox.setEnabled(not checked)
 
     def choose_sources(self) -> None:
+        self.choose_files()
+
+    def choose_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(self, "选择源文件")
+        self.add_sources([Path(value) for value in files])
+
+    def choose_directory(self) -> None:
         directory = QFileDialog.getExistingDirectory(self, "选择源目录")
-        self.set_sources([Path(value) for value in files] + ([Path(directory)] if directory else []))
+        if directory:
+            self.add_sources([Path(directory)])
+
+    def add_sources(self, sources: list[Path]) -> None:
+        self.set_sources([*self.sources, *sources])
+
+    def remove_selected_sources(self) -> None:
+        selected_rows = sorted(
+            {self.list_widget.row(item) for item in self.list_widget.selectedItems()},
+            reverse=True,
+        )
+        updated = list(self.sources)
+        for row in selected_rows:
+            if 0 <= row < len(updated):
+                updated.pop(row)
+        self.set_sources(updated)
+
+    def eventFilter(self, watched: QObject, event: QEvent) -> bool:
+        if (
+            watched is self.list_widget
+            and isinstance(event, QEvent)
+            and event.type() is QEvent.Type.KeyPress
+            and cast(Any, event).key() in {Qt.Key.Key_Delete, Qt.Key.Key_Backspace}
+        ):
+            self.remove_selected_sources()
+            return True
+        return super().eventFilter(watched, event)
 
     def set_sources(self, sources: list[Path]) -> None:
         self.sources = list(dict.fromkeys(sources))
@@ -56,5 +115,5 @@ class SourcePage(QWidget):
         qt_event = cast(Any, event)
         mime = qt_event.mimeData()
         urls = [] if mime is None else mime.urls()
-        self.set_sources([Path(url.toLocalFile()) for url in urls if url.isLocalFile()])
+        self.add_sources([Path(url.toLocalFile()) for url in urls if url.isLocalFile()])
         qt_event.acceptProposedAction()

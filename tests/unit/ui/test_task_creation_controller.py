@@ -54,7 +54,7 @@ def test_create_move_task_plans_persists_then_enqueues(qtbot, tmp_path: Path) ->
     connection.username_lineedit.setText("operator")
     sources.set_sources([source])
     sources.move_checkbox.setChecked(True)
-    target.path_lineedit.setText("incoming")
+    target.set_selected_path("incoming")
     planner = Planner()
     repository = Repository()
     application = Application()
@@ -94,7 +94,7 @@ def test_declined_move_confirmation_does_not_plan_or_enqueue(qtbot, tmp_path: Pa
         qtbot.addWidget(page)
     sources.set_sources([source])
     sources.move_checkbox.setChecked(True)
-    target.path_lineedit.setText("incoming")
+    target.set_selected_path("incoming")
     planner = Planner()
     application = Application()
     TaskCreationController(
@@ -114,13 +114,12 @@ def test_declined_move_confirmation_does_not_plan_or_enqueue(qtbot, tmp_path: Pa
     assert target.creation_status_label.text() == "已取消创建移动任务"
 
 
-def test_invalid_task_input_is_reported_without_starting_worker(qtbot) -> None:
+def test_task_cannot_start_before_target_directory_is_selected(qtbot) -> None:
     connection = ConnectionPage()
     sources = SourcePage()
     target = TargetPage()
     for page in (connection, sources, target):
         qtbot.addWidget(page)
-    target.path_lineedit.setText("../escape")
     application = Application()
     TaskCreationController(
         connection,
@@ -131,9 +130,8 @@ def test_invalid_task_input_is_reported_without_starting_worker(qtbot) -> None:
         application=application,
     )
 
-    target.add_to_queue_button.click()
+    assert target.add_to_queue_button.isEnabled() is False
 
-    assert "失败" in target.creation_status_label.text()
     assert application.enqueued == []
 
 
@@ -146,7 +144,7 @@ def test_new_task_is_appended_after_existing_queue_positions(qtbot, tmp_path: Pa
     for page in (connection, sources, target):
         qtbot.addWidget(page)
     sources.set_sources([source])
-    target.path_lineedit.setText("incoming")
+    target.set_selected_path("incoming")
     planner = Planner()
     repository = Repository()
     repository.tasks = [SimpleNamespace(queue_position=2), SimpleNamespace(queue_position=7)]

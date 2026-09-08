@@ -10,7 +10,7 @@
 | --- | --- | --- |
 | Python 版本 | 通过：3.12 | 必须保持 3.12 |
 | 依赖锁哈希 | 通过 | `requirements.lock` 变化后必须显式更新哈希并评审 |
-| 全量 pytest | 通过：840 passed，11 skipped | 退出码 0 |
+| 全量 pytest | 通过：849 passed，11 skipped | 退出码 0 |
 | Ruff | 通过 | 退出码 0 |
 | mypy strict | 通过：44 个源码文件 | 退出码 0 |
 | 应用包生成 | 通过 | `dist/NasMove.app` 存在 |

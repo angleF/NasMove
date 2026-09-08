@@ -71,9 +71,17 @@ class ThreadRecordingSmbGateway:
             self.list_dir_gate.wait(self.LIST_DIR_TIMEOUT_SECONDS)
         return self.inner.list_dir(path)  # type: ignore[arg-type]
 
+    def list_share_root(self) -> list[Any]:
+        self.thread_ids.append(int(QThread.currentThreadId()))
+        return self.inner.list_share_root()
+
     def free_space(self, path: object) -> int:
         self.thread_ids.append(int(QThread.currentThreadId()))
         return self.inner.free_space(path)  # type: ignore[arg-type]
+
+    def free_space_share_root(self) -> int:
+        self.thread_ids.append(int(QThread.currentThreadId()))
+        return self.inner.free_space_share_root()
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.inner, name)

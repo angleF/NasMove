@@ -9,7 +9,7 @@ def test_offline_demo_completes_ui_flow_without_nas(qtbot, tmp_path: Path) -> No
     source = tmp_path / "demo.bin"
     source.write_bytes(b"demo")
     window.source_page.set_sources([source])
-    window.target_page.path_lineedit.setText("offline-target")
+    window.target_page.set_selected_path("offline-target")
 
     window.target_page.add_to_queue_button.click()
 

@@ -208,6 +208,22 @@ class SmbProtocolGateway:
                 )
         return entries
 
+    def list_share_root(self) -> list[RemoteEntry]:
+        entries: list[RemoteEntry] = []
+        with smbclient.scandir(self._share_unc(), **self._session_kwargs()) as iterator:
+            for entry in iterator:
+                name = validate_remote_component(entry.name)
+                child = RemotePath(name)
+                entry_stat = smbclient.stat(self._unc(child), **self._session_kwargs())
+                entries.append(
+                    RemoteEntry(
+                        name=name,
+                        is_directory=stat_module.S_ISDIR(entry_stat.st_mode),
+                        size=entry_stat.st_size,
+                    )
+                )
+        return entries
+
     def probe_share(self) -> None:
         """Open and enumerate the share root to prove tree-connect authorization."""
         config = self._require_config()
@@ -263,6 +279,10 @@ class SmbProtocolGateway:
         volume = smbclient.stat_volume(self._unc(path), **self._session_kwargs())
         return cast(int, volume.caller_available_size)
 
+    def free_space_share_root(self) -> int:
+        volume = smbclient.stat_volume(self._share_unc(), **self._session_kwargs())
+        return cast(int, volume.caller_available_size)
+
     @contextmanager
     def _open(self, path: RemotePath, mode: str) -> Iterator[BinaryIO]:
         generation = self._require_generation()
@@ -291,11 +311,13 @@ class SmbProtocolGateway:
                     raise
 
     def _unc(self, path: RemotePath) -> str:
+        return f"{self._share_unc()}\\{normalize_remote_path(path.value).value.replace('/', '\\')}"
+
+    def _share_unc(self) -> str:
         config = self._require_config()
         host = self._normalize_component(config.host, "host")
         share = self._normalize_component(config.share, "share")
-        remote = normalize_remote_path(path.value).value.replace("/", "\\")
-        return f"\\\\{host}\\{share}\\{remote}"
+        return f"\\\\{host}\\{share}"
 
     def _session_kwargs(self) -> dict[str, Any]:
         config = self._require_config()

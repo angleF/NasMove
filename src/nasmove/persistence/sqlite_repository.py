@@ -341,6 +341,39 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
             self._rollback()
             raise
 
+    def save_successful_connection(self, config: ConnectionConfig) -> None:
+        self._begin()
+        try:
+            self._insert_connection_profile(config)
+            self._connection.execute(
+                "UPDATE connection_profiles SET last_test_ok = 1, last_test_at = ? "
+                "WHERE profile_id = ?",
+                (_encode_datetime(datetime.now(UTC)), str(config.profile_id)),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+
+    def last_successful_connection(self) -> ConnectionConfig | None:
+        row = self._connection.execute(
+            "SELECT * FROM connection_profiles WHERE last_test_ok = 1 "
+            "ORDER BY last_test_at DESC, profile_id LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return ConnectionConfig(
+            profile_id=ConnectionProfileId(row["profile_id"]),
+            display_name=row["display_name"],
+            host=row["host"],
+            port=row["port"],
+            share=row["share"],
+            username=row["username"],
+            domain=row["domain"],
+            require_encryption=bool(row["require_encryption"]),
+            minimum_dialect=row["minimum_dialect"],
+        )
+
     def _insert_connection_profile(self, config: ConnectionConfig) -> None:
         self._connection.execute(
             """INSERT INTO connection_profiles(

@@ -85,6 +85,23 @@ def test_task_and_item_round_trip_preserves_all_fields(tmp_path) -> None:
     repository.close()
 
 
+def test_last_successful_connection_round_trips_without_a_task(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "profiles.db")
+    config = replace(
+        build_task_record().connection,
+        display_name="家庭 NAS",
+        host="nas.home",
+        share="迁移",
+        username="operator",
+    )
+
+    assert repository.last_successful_connection() is None
+    repository.save_successful_connection(config)
+
+    assert repository.last_successful_connection() == config
+    repository.close()
+
+
 def test_list_items_returns_planning_order_deterministically(tmp_path) -> None:
     repository = SqliteTaskRepository(tmp_path / "items.db")
     task = build_task_record()
