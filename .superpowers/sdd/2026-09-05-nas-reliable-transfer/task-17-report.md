@@ -20,7 +20,7 @@
 ```text
 真实 TCP 断网恢复：5 passed（128 MiB × 5；每轮 3 次断连）
 真实 NAS 重启恢复：1 passed（512 MiB）
-默认故障套件：55 passed, 2 skipped
+最新真实 NAS 故障回归：36 passed, 1 skipped（skip 为需显式授权的 DSM 重启；该用例已单独运行通过）
 真实嵌套目录／空目录：1 passed
 真实小文件缩放：1 passed（1,000 文件）
 最大重复传输：≤ 68 MiB
