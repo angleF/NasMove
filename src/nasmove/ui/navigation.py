@@ -29,6 +29,7 @@ class AppNavigation(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setObjectName("appNavigation")
         self.buttons: dict[AppDestination, QPushButton] = {}
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 16, 12, 16)

@@ -34,3 +34,14 @@ def test_every_theme_keeps_explicit_failure_and_recovery_tokens(tmp_path) -> Non
 
         assert "#B42318" in stylesheet
         assert "#B54708" in stylesheet
+
+
+def test_theme_styles_navigation_surfaces_and_form_controls(tmp_path) -> None:
+    settings = QSettings(str(tmp_path / "appearance.ini"), QSettings.Format.IniFormat)
+
+    stylesheet = ThemeController(settings).stylesheet()
+
+    assert "#appNavigation" in stylesheet
+    assert 'QPushButton[themeRole="selected"]' in stylesheet
+    assert "QLineEdit, QSpinBox, QComboBox" in stylesheet
+    assert "#recoveryCard" in stylesheet

@@ -90,9 +90,24 @@ class ThemeController(QObject):
     def stylesheet(self) -> str:
         palette = _PALETTES[self._selected]
         return f"""
-            QMainWindow, QWidget {{
+            QMainWindow {{ background: {palette.window}; }}
+            QWidget {{
+                font-size: 14px;
                 background: {palette.window};
                 color: {palette.text};
+            }}
+            QWidget#appNavigation {{
+                background: {palette.surface};
+                border-right: 1px solid {palette.surface_border};
+            }}
+            QLabel#navigationBrand {{
+                font-size: 20px;
+                font-weight: 700;
+                padding: 4px 8px 10px 8px;
+            }}
+            QLabel#pageTitle, QLabel#workspaceTitle {{
+                font-size: 22px;
+                font-weight: 700;
             }}
             QWidget[themeRole="surface"] {{
                 background: {palette.surface};
@@ -100,16 +115,67 @@ class ThemeController(QObject):
                 border-radius: 12px;
             }}
             QLabel[themeRole="muted"] {{ color: {palette.muted_text}; }}
+            QPushButton {{
+                background: transparent;
+                border: 1px solid transparent;
+                border-radius: 8px;
+                color: {palette.text};
+                min-height: 30px;
+                padding: 5px 10px;
+                text-align: left;
+            }}
+            QPushButton:hover {{ background: {palette.selected}; }}
             QPushButton[themeRole="primary"] {{
                 background: {palette.primary};
                 color: white;
                 border: none;
                 border-radius: 8px;
                 padding: 7px 12px;
+                text-align: center;
             }}
             QPushButton[themeRole="primary"]:hover {{ background: {palette.primary_hover}; }}
-            QPushButton[themeRole="selected"] {{ background: {palette.selected}; }}
-            QProgressBar::chunk {{ background: {palette.progress}; }}
+            QPushButton[themeRole="selected"] {{
+                background: {palette.selected};
+                color: {palette.primary};
+                font-weight: 700;
+            }}
+            QLineEdit, QSpinBox, QComboBox, QListWidget, QTextEdit {{
+                background: {palette.surface};
+                border: 1px solid {palette.surface_border};
+                border-radius: 8px;
+                padding: 5px 8px;
+                selection-background-color: {palette.selected};
+            }}
+            QComboBox#themeSelector {{ min-width: 110px; }}
+            QScrollArea {{ border: none; background: transparent; }}
+            QListWidget::item {{
+                padding: 10px 8px;
+                border-bottom: 1px solid {palette.surface_border};
+            }}
+            QListWidget::item:selected {{
+                background: {palette.selected};
+                color: {palette.primary};
+            }}
+            QProgressBar {{
+                border: 1px solid {palette.surface_border};
+                border-radius: 6px;
+                min-height: 22px;
+                text-align: center;
+            }}
+            QProgressBar::chunk {{
+                background: {palette.progress};
+                border-radius: 5px;
+            }}
+            QWidget#taskDetail {{
+                background: {palette.surface};
+                border-radius: 12px;
+            }}
+            QFrame#recoveryCard {{
+                background: #FFF7E5;
+                border: 1px solid #F2CD7D;
+                border-radius: 12px;
+            }}
+            QLabel#recoveryTitle {{ color: #B54708; font-weight: 700; }}
             QLabel[taskState="running"] {{ color: #175CD3; }}
             QLabel[taskState="recovered"] {{ color: #067647; }}
             QLabel[taskState="warning"] {{ color: #B54708; }}
