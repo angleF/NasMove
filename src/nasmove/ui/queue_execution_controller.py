@@ -4,12 +4,13 @@ from typing import Any, cast
 
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
+from nasmove.smb.error_mapping import redacted_error_code
 from nasmove.ui.task_controller import TaskController
 
 
 class _QueueWorker(QObject):
     result_ready = Signal(object)
-    failed = Signal()
+    failed = Signal(object)
     finished = Signal()
 
     def __init__(self, queue: object) -> None:
@@ -24,9 +25,12 @@ class _QueueWorker(QObject):
                 if result is None:
                     return
                 self.result_ready.emit(result)
-        except Exception:  # noqa: BLE001 - details belong in the redacted logger
-            self.failed.emit()
+        except Exception as error:  # noqa: BLE001 - send only an allowlisted code
+            self.failed.emit((getattr(self._queue, "last_task_id", None), redacted_error_code(error)))
         finally:
+            release = getattr(self._queue, "release_thread_connection", None)
+            if callable(release):
+                release()
             self.finished.emit()
 
 
@@ -39,6 +43,8 @@ class QueueExecutionController(QObject):
         self._tasks = task_controller
         self._thread: QThread | None = None
         self._worker: _QueueWorker | None = None
+        self._restart_requested = False
+        task_controller.resume_execution.connect(self.start)
 
     @property
     def running(self) -> bool:
@@ -47,6 +53,7 @@ class QueueExecutionController(QObject):
     @Slot()
     def start(self) -> None:
         if self._thread is not None:
+            self._restart_requested = True
             return
         worker = _QueueWorker(self._queue)
         thread = QThread(self)
@@ -65,6 +72,14 @@ class QueueExecutionController(QObject):
     def _thread_finished(self) -> None:
         self._worker = None
         self._thread = None
+        restart, self._restart_requested = self._restart_requested, False
+        pending = getattr(self._queue, "has_pending_tasks", None)
+        if restart and callable(pending):
+            try:
+                if pending():
+                    self.start()
+            except Exception as error:  # noqa: BLE001 - startup failure is user-visible
+                self._tasks.publish_execution_error((None, redacted_error_code(error)))
 
 
 __all__ = ["QueueExecutionController"]

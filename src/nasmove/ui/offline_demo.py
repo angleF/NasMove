@@ -99,7 +99,7 @@ class OfflineQueue:
             current = self._repository.get_task(task_id)
             self._repository.transition_task(task_id, current.state, state)
         self._publish_progress(task.total_bytes, task.total_bytes, task.total_bytes)
-        return TaskResult(True, TaskState.COMPLETED, completed_items=1)
+        return TaskResult(True, TaskState.COMPLETED, completed_items=1, task_id=task_id)
 
     def _publish_progress(self, size: int, copied: int, verified: int) -> None:
         if self._progress_sink is None:

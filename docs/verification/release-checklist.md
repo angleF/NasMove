@@ -10,9 +10,9 @@
 | --- | --- | --- |
 | Python 版本 | 通过：3.12 | 必须保持 3.12 |
 | 依赖锁哈希 | 通过 | `requirements.lock` 变化后必须显式更新哈希并评审 |
-| 全量 pytest | 通过：849 passed，11 skipped | 退出码 0 |
+| pytest（功能与包检查分开执行） | 通过：功能 859 passed，12 skipped；包检查 2 passed | 两次退出码均为 0 |
 | Ruff | 通过 | 退出码 0 |
-| mypy strict | 通过：44 个源码文件 | 退出码 0 |
+| mypy strict | 通过：45 个源码文件 | 退出码 0 |
 | 应用包生成 | 通过 | `dist/NasMove.app` 存在 |
 | bundle ID | 通过：`com.nasmove.app` | 不得变化，否则 Keychain 身份和升级路径需重新验证 |
 | 实际凭据扫描 | 通过 | 构建产物不得包含测试环境中的真实密码值或凭据环境变量名 |
@@ -23,7 +23,7 @@
 | 50 GiB／10 次断连 | 阻塞：未执行 | 必须通过 |
 | 100,000 个小文件 | 阻塞：未执行 | 必须通过 |
 
-最近一次验证日期：2026-09-08。真实 NAS 故障回归为 `36 passed, 1 skipped`；该 skip 是需要显式授权的 DSM 重启。本轮之前已单独完成真实 DSM 重启恢复验证，详见 Synology 验证矩阵。
+最近一次验证日期：2026-09-09。任务工作台真实 NAS 桌面流程 `1 passed`，应用重新构建、签名、凭据扫描与启动检查通过，详见 [任务工作台验证记录](task-workbench-verification.md)。此前真实 NAS 故障回归为 `36 passed, 1 skipped`；该 skip 是需要显式授权的 DSM 重启。本轮未重复执行 NAS 重启故障注入，历史结果见 Synology 验证矩阵。
 
 ## 人工验收
 

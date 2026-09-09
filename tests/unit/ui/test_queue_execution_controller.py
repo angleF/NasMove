@@ -49,7 +49,8 @@ def test_queue_execution_failure_is_reported_without_raw_error(qtbot) -> None:
     execution.start()
 
     qtbot.waitUntil(lambda: execution.running is False)
-    assert page.status_label.text() == "执行失败，请查看脱敏日志"
+    assert page.status_label.text() == "执行已停止 · 需要处理"
+    assert "unexpected_error" in page.error_details.toPlainText()
     assert "secret" not in page.error_details.toPlainText()
 
 

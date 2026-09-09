@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Event, Lock
 from typing import Protocol, cast
 
@@ -56,6 +56,8 @@ class TransferEvent:
     item_id: TransferItemId | None = None
     error: BaseException | None = None
     kind: str = "state"
+    retry_attempt: int | None = None
+    retry_delay: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +67,7 @@ class TaskResult:
     error: BaseException | None = None
     warnings: tuple[str, ...] = ()
     completed_items: int = 0
+    task_id: TaskId | None = None
 
     @property
     def completed(self) -> bool:
@@ -203,6 +206,7 @@ class TransferEngine:
                 }:
                     self._safe_item_transition(item, ItemState.TRANSFERRING)
                     item = self._repository.get_item(item.id)
+                self._publish(TransferEvent(task.id, TaskState.RUNNING, item.id))
                 copy_result = self._copy(item, decision.safe_offset, session, token)
                 copied = getattr(copy_result, "bytes_copied", 0)
                 if type(copied) is int:
@@ -226,6 +230,7 @@ class TransferEngine:
 
             self._safe_item_transition(item, ItemState.VERIFYING)
             item = self._repository.get_item(item.id)
+            self._publish(TransferEvent(task.id, TaskState.VERIFYING, item.id))
             verification = verifier.verify_full(item)
             self._record_progress("record_verification", getattr(verification, "remote_bytes", 0))
             if getattr(verification, "matches", False) is not True or getattr(
@@ -235,6 +240,7 @@ class TransferEngine:
                 return self._fail_task(task, RuntimeError("full verification failed"), item)
             self._safe_item_transition(item, ItemState.VERIFIED)
             item = self._repository.get_item(item.id)
+            self._publish(TransferEvent(task.id, TaskState.COMMITTING, item.id))
             committer.commit(item, verification)
             item = self._repository.get_item(item.id)
             if item.state is not ItemState.COMMITTED:
@@ -275,6 +281,7 @@ class TransferEngine:
         if self._deletion is None:
             raise RuntimeError("source deletion service is unavailable")
         deletion = self._deletion
+        self._publish(TransferEvent(task.id, TaskState.DELETING_SOURCE, item.id))
         deletion_result = deletion.delete_verified_source(item.id, session)
         if getattr(deletion_result, "state", None) is ItemState.SOURCE_RETAINED:
             return "source retained because deletion failed"
@@ -370,6 +377,7 @@ class QueueCoordinator:
         self._active_done.set()
         self._accepting = True
         self._pending_pause = False
+        self.last_task_id: TaskId | None = None
 
     def enqueue(self, task_id: TaskId | str) -> None:
         with self._lifecycle_lock:
@@ -382,6 +390,18 @@ class QueueCoordinator:
     def stop_accepting(self) -> None:
         with self._lifecycle_lock:
             self._accepting = False
+
+    def release_thread_connection(self) -> None:
+        release = getattr(self._repository, "release_thread_connection", None)
+        if callable(release):
+            release()
+
+    def has_pending_tasks(self) -> bool:
+        next_task = getattr(self._repository, "next_queued_task", None)
+        if callable(next_task):
+            return next_task() is not None
+        with self._lifecycle_lock:
+            return bool(self._queue)
 
     def request_pause(self) -> None:
         with self._lifecycle_lock:
@@ -424,17 +444,29 @@ class QueueCoordinator:
                 active_token.request_pause()
                 self._pending_pause = False
         try:
-            with self._lifecycle_lock:
-                task_id: TaskId | None = self._queue.pop(0) if self._queue else None
-            if task_id is None and self._repository is not None:
-                next_task = getattr(self._repository, "next_queued_task", None)
-                if not callable(next_task):
-                    raise TypeError("queue repository must provide next_queued_task()")
+            self.last_task_id = None
+            task_id: TaskId | None = None
+            next_task = getattr(self._repository, "next_queued_task", None)
+            if callable(next_task):
                 task = next_task()
                 task_id = None if task is None else task.id
+                with self._lifecycle_lock:
+                    if task_id in self._queue:
+                        self._queue.remove(task_id)
+            else:
+                with self._lifecycle_lock:
+                    task_id = self._queue.pop(0) if self._queue else None
+                if task_id is None and self._repository is not None:
+                    raise TypeError("queue repository must provide next_queued_task()")
             if task_id is None:
                 return None
-            return self._engine.run_task(task_id, active_token)
+            self.last_task_id = task_id
+            getter = getattr(self._repository, "get_task", None)
+            if callable(getter):
+                task = getter(task_id)
+                if task.state in {TaskState.PAUSED, TaskState.CANCELED}:
+                    return TaskResult(False, task.state, task_id=task_id)
+            return replace(self._engine.run_task(task_id, active_token), task_id=task_id)
         finally:
             with self._lifecycle_lock:
                 self._active_token = None

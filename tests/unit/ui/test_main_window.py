@@ -9,6 +9,9 @@ def test_main_window_navigation_reaches_each_transfer_step(qtbot) -> None:
     window = MainWindow()
     qtbot.addWidget(window)
 
+    assert window.pages.currentWidget() is window.task_page
+    window.new_task_button.click()
+
     assert "1  连接 NAS" in window.step_label.text()
     assert window.page_title_label.text() == "连接 NAS"
 
@@ -18,12 +21,11 @@ def test_main_window_navigation_reaches_each_transfer_step(qtbot) -> None:
     assert window.page_title_label.text() == "选择本地文件"
     window.next_button.click()
     assert window.pages.currentWidget() is window.target_page
-    window.next_button.click()
+    window.workbench_button.click()
     assert window.pages.currentWidget() is window.task_page
     assert window.next_button.isEnabled() is False
 
-    window.back_button.click()
-    assert window.pages.currentWidget() is window.target_page
+    assert window.back_button.isHidden()
 
 
 def test_main_window_wires_task_page_to_commands(qtbot) -> None:

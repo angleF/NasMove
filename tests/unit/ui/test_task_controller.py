@@ -64,6 +64,7 @@ def test_worker_thread_events_are_applied_on_qt_thread(qtbot) -> None:
 
 
 def test_queue_reorder_is_persisted_as_complete_permutation(qtbot) -> None:
+    from dataclasses import replace
     page = TaskPage()
 
     class Repository:
@@ -76,7 +77,7 @@ def test_queue_reorder_is_persisted_as_complete_permutation(qtbot) -> None:
     repository = Repository()
     controller = TaskController(page, repository=repository)
     qtbot.addWidget(page)
-    first = build_task_record()
+    first = replace(build_task_record(), state=TaskState.QUEUED)
     second = type(first)(
         **{**{field: getattr(first, field) for field in first.__dataclass_fields__}, "id": TaskId("task-2"), "name": "Second"}
     )

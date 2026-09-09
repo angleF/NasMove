@@ -10,7 +10,7 @@ from nasmove.core.ports import SessionInfo
 from nasmove.core.retry import RetryPolicy
 from nasmove.core.states import TaskState
 from nasmove.transfer.checkpoint_writer import CancellationToken
-from nasmove.transfer.transfer_engine import TaskResult
+from nasmove.transfer.transfer_engine import TaskResult, TransferEvent
 
 
 class Engine(Protocol):
@@ -30,6 +30,7 @@ class RetryingTaskRunner:
         retry_policy: RetryPolicy | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         jitter: Callable[[], float] = lambda: random.uniform(-0.2, 0.2),
+        event_sink: Any = None,
     ) -> None:
         self._repository = repository
         self._smb = smb_gateway
@@ -38,6 +39,7 @@ class RetryingTaskRunner:
         self._policy = retry_policy or RetryPolicy()
         self._sleep = sleeper
         self._jitter = jitter
+        self._events = event_sink
 
     def run_task(self, task_id: TaskId, token: CancellationToken) -> TaskResult:
         attempt = 0
@@ -46,6 +48,8 @@ class RetryingTaskRunner:
             if interrupted is not None:
                 return interrupted
             task = self._repository.get_task(task_id)
+            if self._events is not None:
+                self._events.publish(TransferEvent(task_id, task.state))
             password = self._credentials.get_password(task.connection.profile_id)
             if not password:
                 return self._finish(task_id, TaskState.PAUSED)
@@ -60,7 +64,7 @@ class RetryingTaskRunner:
                 self._move_to_waiting(task_id)
                 attempt += 1
                 self._smb.reset_connection()
-                self._wait(attempt)
+                self._wait(attempt, task_id)
                 continue
 
             result = self._engine_factory(session).run_task(task_id, token)
@@ -70,11 +74,15 @@ class RetryingTaskRunner:
                 return result
             attempt += 1
             self._smb.reset_connection()
-            self._wait(attempt)
+            self._wait(attempt, task_id)
 
-    def _wait(self, attempt: int) -> None:
+    def _wait(self, attempt: int, task_id: TaskId | None = None) -> None:
         delay = self._policy.delay_seconds(attempt, self._jitter())
-        self._sleep(self._policy.waiting_probe_seconds if delay is None else delay)
+        wait = self._policy.waiting_probe_seconds if delay is None else delay
+        if self._events is not None and task_id is not None:
+            self._events.publish(TransferEvent(task_id, TaskState.WAITING_FOR_NETWORK,
+                kind="retry", retry_attempt=attempt, retry_delay=wait))
+        self._sleep(wait)
 
     def _move_to_waiting(self, task_id: TaskId) -> None:
         task = self._repository.get_task(task_id)

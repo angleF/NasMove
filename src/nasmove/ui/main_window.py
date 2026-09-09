@@ -80,6 +80,23 @@ class MainWindow(QMainWindow):
         buttons.addWidget(self.next_button)
         root = QWidget()
         layout = QVBoxLayout(root)
+        layout.setContentsMargins(20, 16, 20, 16)
+        toolbar = QHBoxLayout()
+        brand = QLabel("NasMove")
+        brand.setStyleSheet("font-size: 22px; font-weight: 700; color: #172b4d;")
+        toolbar.addWidget(brand)
+        self.connection_status_label = QLabel("NAS：未测试连接")
+        toolbar.addWidget(self.connection_status_label)
+        toolbar.addStretch()
+        self.workbench_button = QPushButton("查看任务")
+        self.workbench_button.clicked.connect(lambda: self.pages.setCurrentWidget(self.task_page))
+        self.new_task_button = QPushButton("＋ 新建任务")
+        self.new_task_button.setObjectName("primaryAction")
+        self.new_task_button.clicked.connect(lambda: self.pages.setCurrentWidget(self.connection_page))
+        self.task_page.connection_requested.connect(lambda: self.pages.setCurrentWidget(self.connection_page))
+        toolbar.addWidget(self.workbench_button)
+        toolbar.addWidget(self.new_task_button)
+        layout.addLayout(toolbar)
         self.step_label = QLabel()
         self.step_label.setObjectName("stepLabel")
         self.page_title_label = QLabel()
@@ -96,6 +113,7 @@ class MainWindow(QMainWindow):
         self.pages.currentChanged.connect(self._update_navigation)
         self.connection_page.report_ready.connect(self._connection_reported)
         self._update_navigation(0)
+        self.pages.setCurrentWidget(self.task_page)
         self.setStyleSheet(
             """
             QMainWindow { background: #f4f6f8; }
@@ -106,6 +124,13 @@ class MainWindow(QMainWindow):
             #locationLabel, #selectedPathLabel { font-weight: 600; color: #0052cc; }
             QPushButton { min-height: 30px; padding: 4px 12px; }
             QListWidget { background: white; border: 1px solid #dfe1e6; border-radius: 6px; }
+            QListWidget::item { padding: 16px 10px; border-bottom: 1px solid #edf0f5; }
+            QListWidget::item:selected { background: #eaf2ff; color: #164c96; }
+            #taskDetail { background: white; border-radius: 12px; }
+            #taskName { font-size: 20px; font-weight: 600; color: #172b4d; }
+            #primaryAction { background: #175cd3; color: white; border: none; border-radius: 6px; }
+            QProgressBar { border: 1px solid #dfe5ed; border-radius: 5px; min-height: 24px; text-align: center; }
+            QProgressBar::chunk { background: #93c5fd; border-radius: 4px; }
             """
         )
 
@@ -130,10 +155,21 @@ class MainWindow(QMainWindow):
         self.page_description_label.setText(descriptions[index])
         self.back_button.setEnabled(index > 0)
         self.next_button.setEnabled(index < self.pages.count() - 1)
+        workbench = index == 3
+        self.back_button.setVisible(not workbench)
+        self.next_button.setVisible(not workbench and index != 2)
+        self.step_label.setVisible(not workbench)
+        self.workbench_button.setVisible(not workbench)
+        self.page_title_label.setVisible(not workbench)
+        self.page_description_label.setVisible(not workbench)
+        self.next_button.setText("选择本地文件 →" if index == 0 else "选择 NAS 目标目录 →")
 
     def _connection_reported(self, report: object) -> None:
         if bool(getattr(report, "success", False)):
+            self.connection_status_label.setText("NAS：连接测试成功")
             self.target_page.start_browsing()
+        else:
+            self.connection_status_label.setText("NAS：连接测试失败")
 
     def _task_created(self, task: object) -> None:
         self.task_controller.append_task(task)

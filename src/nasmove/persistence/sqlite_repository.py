@@ -11,6 +11,7 @@ from contextlib import AbstractContextManager
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
+from threading import Lock, local
 from typing import Self, cast
 
 from nasmove.core.errors import ConcurrentStateChange
@@ -79,7 +80,12 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         if not self.database_path.is_absolute():
             raise ValueError("database path must be absolute")
         self._prepare_database_path()
-        self._connection = sqlite3.connect(self.database_path, timeout=5.0)
+        self._thread_connections = local()
+        self._connection_lock = Lock()
+        self._all_connections: list[sqlite3.Connection] = []
+        self._closed = False
+        self._connection = sqlite3.connect(self.database_path, timeout=5.0, check_same_thread=False)
+        self._all_connections.append(self._connection)
         self._connection.row_factory = sqlite3.Row
         try:
             self._harden_database_permissions()
@@ -295,10 +301,44 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         self._secure_file(self.database_path)
         self._validate_sidecars()
 
+    @property
+    def _connection(self) -> sqlite3.Connection:
+        if self._closed:
+            raise sqlite3.ProgrammingError("repository is closed")
+        connection = getattr(self._thread_connections, "connection", None)
+        if connection is None:
+            with self._connection_lock:
+                if self._closed:
+                    raise sqlite3.ProgrammingError("repository is closed")
+                connection = sqlite3.connect(self.database_path, timeout=5.0, check_same_thread=False)
+                connection.row_factory = sqlite3.Row
+                connection.execute("PRAGMA synchronous = FULL")
+                connection.execute("PRAGMA foreign_keys = ON")
+                connection.execute("PRAGMA busy_timeout = 5000")
+                self._thread_connections.connection = connection
+                self._all_connections.append(connection)
+        return cast(sqlite3.Connection, connection)
+
+    @_connection.setter
+    def _connection(self, connection: sqlite3.Connection) -> None:
+        self._thread_connections.connection = connection
+
+    def release_thread_connection(self) -> None:
+        """Called by a worker after its last operation, before its thread exits."""
+        with self._connection_lock:
+            connection = getattr(self._thread_connections, "connection", None)
+            if connection is not None and connection in self._all_connections:
+                connection.close()
+                self._all_connections.remove(connection)
+            self._thread_connections.connection = None
+
     def close(self) -> None:
-        if self._connection is not None:
-            self._connection.close()
-            self._connection = cast(sqlite3.Connection, None)
+        # Application shutdown waits for workers before closing their connections.
+        with self._connection_lock:
+            self._closed = True
+            for connection in self._all_connections:
+                connection.close()
+            self._all_connections.clear()
 
     def __enter__(self) -> Self:
         return self
@@ -641,6 +681,36 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
             tuple(state.value for state in _TERMINAL_TASK_STATES),
         )
         return [self._task_from_row(row) for row in rows]
+
+    def list_tasks(self) -> list[TaskRecord]:
+        return [self._task_from_row(row) for row in self._connection.execute(
+            "SELECT * FROM tasks ORDER BY queue_position, created_at, task_id"
+        )]
+
+    def list_item_page(self, task_id: TaskId, offset: int = 0) -> list[TransferItemRecord]:
+        return [self._item_from_row(row) for row in self._connection.execute(
+            "SELECT * FROM transfer_items WHERE task_id = ? ORDER BY item_id LIMIT 100 OFFSET ?",
+            (task_id, max(0, offset)),
+        )]
+
+    def record_ui_error(self, task_id: TaskId | None, code: str) -> None:
+        self._begin()
+        try:
+            self._connection.execute(
+                "INSERT INTO events(task_id,event_type,error_code,occurred_at) VALUES(?,?,?,?)",
+                (task_id, "execution_error", code, _encode_datetime(datetime.now(UTC))),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+
+    def last_ui_error(self, task_id: TaskId | None) -> str | None:
+        row = self._connection.execute(
+            "SELECT error_code FROM events WHERE task_id IS ? AND event_type = ? "
+            "ORDER BY event_id DESC LIMIT 1", (task_id, "execution_error"),
+        ).fetchone()
+        return None if row is None else str(row[0])
 
     def mark_active_tasks_interrupted(self) -> int:
         self._begin()

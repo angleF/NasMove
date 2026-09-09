@@ -11,6 +11,7 @@ from nasmove.planning.task_planner import PlanRequest
 from nasmove.ui.connection_page import ConnectionPage
 from nasmove.ui.source_page import SourcePage
 from nasmove.ui.target_page import TargetPage
+from nasmove.ui.task_presentation import ERROR_TEXT, safe_code
 from nasmove.ui.worker import BackgroundCommandWorker
 
 
@@ -58,12 +59,19 @@ class TaskCreationController(QObject):
             return
         self._target_page.add_to_queue_button.setEnabled(False)
         self._target_page.creation_status_label.setText("正在规划任务…")
-        worker = BackgroundCommandWorker(lambda: cast(Any, self._planner).plan(request))
+        def plan() -> object:
+            try:
+                return cast(Any, self._planner).plan(request)
+            finally:
+                release = getattr(self._repository, "release_thread_connection", None)
+                if callable(release):
+                    release()
+        worker = BackgroundCommandWorker(plan)
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.succeeded.connect(self._persist_and_enqueue)
-        worker.failed.connect(self._show_error)
+        worker.failed_code.connect(self._show_error)
         worker.finished.connect(thread.quit)
         worker.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
@@ -128,8 +136,7 @@ class TaskCreationController(QObject):
 
     @Slot(str)
     def _show_error(self, error: str) -> None:
-        del error
-        self._target_page.creation_status_label.setText("任务创建失败，请查看脱敏日志")
+        self._target_page.creation_status_label.setText("任务未创建：" + ERROR_TEXT[safe_code(error)])
 
     @Slot()
     def _thread_finished(self) -> None:

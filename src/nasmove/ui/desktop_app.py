@@ -143,7 +143,6 @@ def build_desktop_runtime(
 
     def build_engine(session: SessionInfo) -> TransferEngine:
         protocol_repository = cast(Any, repository)
-        verifier = IntegrityVerifier(protocol_repository, local, gateway, session)
         active = next(
             (
                 task
@@ -158,10 +157,27 @@ def build_desktop_runtime(
                 snapshot
             ),
         )
+        copied: dict[object, int] = {}
+        verified: dict[object, int] = {}
+        if active is not None:
+            for item in repository.list_items(active.id):
+                if item.state.value in {"committed", "source_delete_authorized", "done", "source_retained"}:
+                    copied[item.id] = item.source_fingerprint.size
+                    verified[item.id] = item.source_fingerprint.size
+
+        def copy_progress(item: Any, offset: int) -> None:
+            copied[item.id] = offset
+            progress.update(copied_bytes=sum(copied.values()), verified_bytes=sum(verified.values()))
+
+        def verify_progress(item: Any, offset: int) -> None:
+            verified[item.id] = offset
+            progress.update(copied_bytes=sum(copied.values()), verified_bytes=sum(verified.values()))
+
+        verifier = IntegrityVerifier(protocol_repository, local, gateway, session, progress=verify_progress)
         return TransferEngine(
             repository,
             recovery=RecoveryCoordinator(protocol_repository, local, gateway, session),
-            checkpoint_writer=CheckpointWriter(repository, local, gateway),
+            checkpoint_writer=CheckpointWriter(repository, local, gateway, progress=copy_progress),
             verifier=verifier,
             committer=TargetCommitter(protocol_repository, gateway, session),
             deletion_service=SourceDeletionService(
@@ -170,10 +186,9 @@ def build_desktop_runtime(
             smb_gateway=gateway,
             session=session,
             event_sink=events,
-            progress_tracker=progress,
         )
 
-    runner = RetryingTaskRunner(repository, gateway, credentials, build_engine)
+    runner = RetryingTaskRunner(repository, gateway, credentials, build_engine, event_sink=events)
     queue = QueueCoordinator(cast(TransferEngine, runner), repository)
     application = ApplicationService(
         repository=repository,
@@ -204,11 +219,11 @@ def main() -> int:
     if not startup.started:
         QMessageBox.warning(None, "NasMove", startup.error or "应用启动失败")
         return 2
-    runtime.window.task_controller.load_queue(tuple(runtime.repository.list_incomplete_tasks()))
+    runtime.window.task_controller.load_queue(tuple(runtime.repository.list_tasks()))
     if runtime.window.queue_execution is not None:
         runtime.window.queue_execution.start()
     qt_application.aboutToQuit.connect(runtime.application.request_shutdown)
-    runtime.window.resize(800, 720)
+    runtime.window.resize(1100, 760)
     runtime.window.show()
     return int(qt_application.exec())
 

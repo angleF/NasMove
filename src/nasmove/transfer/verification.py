@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path
@@ -79,6 +80,7 @@ class IntegrityVerifier:
         session: SessionInfo | None = None,
         *,
         session_generation: int | None = None,
+        progress: Callable[[TransferItemRecord, int], None] | None = None,
     ) -> None:
         if session is not None and session_generation is not None:
             raise ValueError("provide either session or session_generation")
@@ -90,6 +92,7 @@ class IntegrityVerifier:
         self._local = local_gateway
         self._smb = smb_gateway
         self._session = session
+        self._progress = progress
 
     def verify_full(self, item: TransferItemRecord) -> VerificationResult:
         expected = item.source_fingerprint
@@ -108,7 +111,10 @@ class IntegrityVerifier:
             else:
                 with self._smb.open_read(item.temp_path) as remote:
                     remote.seek(0)
-                    remote_result = sha256_stream(remote)
+                    callback = self._progress
+                    remote_result = sha256_stream(remote, progress=(
+                        None if callback is None else lambda offset: callback(item, offset)
+                    ))
                 after_remote_stat = self._smb.stat(item.temp_path)
 
         after = self._local.fingerprint(item.source_path)

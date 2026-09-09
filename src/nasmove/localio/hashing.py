@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import BinaryIO
 
@@ -27,7 +28,7 @@ def _read_bytes(stream: BinaryIO, size: int) -> bytes:
     return chunk
 
 
-def sha256_stream(stream: BinaryIO, block_size: int = _DEFAULT_BLOCK_SIZE) -> HashResult:
+def sha256_stream(stream: BinaryIO, block_size: int = _DEFAULT_BLOCK_SIZE, *, progress: Callable[[int], None] | None = None) -> HashResult:
     if type(block_size) is not int or block_size <= 0:
         raise ValueError("block_size must be a positive integer")
     digest = hashlib.sha256()
@@ -38,6 +39,8 @@ def sha256_stream(stream: BinaryIO, block_size: int = _DEFAULT_BLOCK_SIZE) -> Ha
             break
         digest.update(chunk)
         byte_count += len(chunk)
+        if progress is not None:
+            progress(byte_count)
     return HashResult(hexdigest=digest.hexdigest(), byte_count=byte_count)
 
 

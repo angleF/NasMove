@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
@@ -118,6 +118,7 @@ class CheckpointWriter:
         smb_gateway: SmbGateway,
         cancellation_token: CancellationToken | None = None,
         token: CancellationToken | None = None,
+        progress: Callable[[TransferItemRecord, int], None] | None = None,
     ) -> None:
         if cancellation_token is not None and token is not None:
             raise ValueError("provide only one cancellation token")
@@ -125,6 +126,7 @@ class CheckpointWriter:
         self._local = local_gateway
         self._smb = smb_gateway
         self._token = cancellation_token if cancellation_token is not None else token
+        self._progress = progress
 
     def copy(
         self,
@@ -136,6 +138,8 @@ class CheckpointWriter:
         self._validate_request(item, start_offset, session)
         last_persisted = start_offset
         offset = start_offset
+        if self._progress is not None:
+            self._progress(item, start_offset)
         active_token = token if token is not None else self._token
         if _cancel_requested(active_token):
             return CopyResult(CopyOutcome.CANCELLED, start_offset, last_persisted)
@@ -310,6 +314,8 @@ class CheckpointWriter:
                     session_generation=session.session_generation,
                 )
             )
+        if self._progress is not None:
+            self._progress(item, offset)
         return True
 
     def _assert_generation(self, session: SessionInfo) -> None:
