@@ -2,6 +2,7 @@
 
 from nasmove.ui.connection_page import ConnectionPage
 from nasmove.ui.main_window import MainWindow
+from nasmove.ui.navigation import AppDestination, AppNavigation
 from nasmove.ui.queue_execution_controller import QueueExecutionController
 from nasmove.ui.source_page import SourcePage
 from nasmove.ui.target_page import TargetPage
@@ -14,6 +15,8 @@ from nasmove.ui.theme import ThemeController, ThemeName, ThemePalette
 __all__ = [
     "ConnectionPage",
     "MainWindow",
+    "AppDestination",
+    "AppNavigation",
     "QueueExecutionController",
     "SourcePage",
     "TargetPage",
