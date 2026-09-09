@@ -144,6 +144,9 @@ class SetupWorkspace(QWidget):
         self.editor_stack.setCurrentWidget(self.connection_page)
         self.edit_connection_requested.emit()
 
+    def show_connection_editor(self) -> None:
+        self._show_connection()
+
     def _show_sources(self) -> None:
         self.editor_stack.setCurrentWidget(self.source_page)
         self.edit_sources_requested.emit()

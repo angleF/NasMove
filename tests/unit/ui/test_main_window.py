@@ -1,31 +1,43 @@
 from dataclasses import replace
 
+from PySide6.QtCore import QSettings
+
 from nasmove.core.states import TaskState
 from nasmove.ui.main_window import MainWindow
+from nasmove.ui.navigation import AppDestination
+from nasmove.ui.theme import ThemeController, ThemeName
 from tests.fixtures.builders import build_task_record
 
 
-def test_main_window_navigation_reaches_each_transfer_step(qtbot) -> None:
-    window = MainWindow()
+def test_main_window_routes_sidebar_destinations_without_losing_setup_editors(qtbot, tmp_path) -> None:
+    settings = QSettings(str(tmp_path / "appearance.ini"), QSettings.Format.IniFormat)
+    window = MainWindow(theme_controller=ThemeController(settings))
     qtbot.addWidget(window)
 
-    assert window.pages.currentWidget() is window.task_page
+    assert window.content_stack.currentWidget() is window.setup_workspace
     window.new_task_button.click()
+    assert window.content_stack.currentWidget() is window.setup_workspace
 
-    assert "1  连接 NAS" in window.step_label.text()
-    assert window.page_title_label.text() == "连接 NAS"
+    window.navigation.buttons[AppDestination.CONNECTIONS].click()
+    assert window.content_stack.currentWidget() is window.setup_workspace
+    assert window.setup_workspace.editor_stack.currentWidget() is window.connection_page
 
-    assert window.pages.currentWidget() is window.connection_page
-    window.next_button.click()
-    assert window.pages.currentWidget() is window.source_page
-    assert window.page_title_label.text() == "选择本地文件"
-    window.next_button.click()
-    assert window.pages.currentWidget() is window.target_page
-    window.workbench_button.click()
-    assert window.pages.currentWidget() is window.task_page
-    assert window.next_button.isEnabled() is False
+    window.navigation.buttons[AppDestination.QUEUE].click()
+    assert window.content_stack.currentWidget() is window.task_page
 
-    assert window.back_button.isHidden()
+    window.show_destination(AppDestination.WORKBENCH)
+    assert window.content_stack.currentWidget() is window.setup_workspace
+
+
+def test_main_window_applies_selected_theme(qtbot, tmp_path) -> None:
+    settings = QSettings(str(tmp_path / "appearance.ini"), QSettings.Format.IniFormat)
+    controller = ThemeController(settings)
+    window = MainWindow(theme_controller=controller)
+    qtbot.addWidget(window)
+
+    controller.select(ThemeName.WARM_STUDIO)
+
+    assert "#B76035" in window.styleSheet()
 
 
 def test_main_window_wires_task_page_to_commands(qtbot) -> None:

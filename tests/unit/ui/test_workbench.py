@@ -24,11 +24,9 @@ def test_real_repository_can_be_used_by_planning_and_queue_threads(tmp_path):
 def test_home_is_empty_workbench_with_new_task_action(qtbot):
     window = MainWindow()
     qtbot.addWidget(window)
-    assert window.pages.currentWidget() is window.task_page
-    assert window.task_page.status_label.text() == "尚未创建任务"
-    assert window.back_button.isHidden()
+    assert window.content_stack.currentWidget() is window.setup_workspace
     window.new_task_button.click()
-    assert window.pages.currentWidget() is window.connection_page
+    assert window.content_stack.currentWidget() is window.setup_workspace
 
 
 def test_background_event_does_not_overwrite_selected_task(qtbot):
