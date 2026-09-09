@@ -20,6 +20,7 @@ class TaskController(QObject):
     _execution_error_received = Signal(object)
     event_applied = Signal()
     resume_execution = Signal()
+    workspace_state_changed = Signal(object)
 
     def __init__(
         self,
@@ -139,6 +140,7 @@ class TaskController(QObject):
         self._update_row(task_id, getattr(event, "state", None))
         if self._visible(task_id):
             self._page.apply_event(event)
+            self.workspace_state_changed.emit(getattr(event, "state", None))
             item_id = getattr(event, "item_id", None)
             getter = getattr(self._repository, "get_item", None)
             if item_id is not None and callable(getter):

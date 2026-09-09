@@ -63,6 +63,19 @@ def test_worker_thread_events_are_applied_on_qt_thread(qtbot) -> None:
     assert applied_threads == [ui_thread]
 
 
+def test_visible_task_event_publishes_workspace_state(qtbot) -> None:
+    page = TaskPage()
+    controller = TaskController(page)
+    qtbot.addWidget(page)
+    task = build_task_record()
+    controller.load_queue((task,))
+
+    with qtbot.waitSignal(controller.workspace_state_changed) as signal:
+        controller.publish(TransferEvent(task.id, TaskState.WAITING_FOR_NETWORK))
+
+    assert signal.args == [TaskState.WAITING_FOR_NETWORK]
+
+
 def test_queue_reorder_is_persisted_as_complete_permutation(qtbot) -> None:
     from dataclasses import replace
     page = TaskPage()

@@ -8,6 +8,7 @@ from PySide6.QtCore import Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QFileDialog,
+    QFrame,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -50,6 +51,18 @@ class TaskPage(QWidget):
         self.safety_label = QLabel("创建任务后，这里会显示文件处理结果。")
         self.safety_label.setWordWrap(True)
         self.activity_label = QLabel()
+        self.phase_label = QLabel("等待任务开始")
+        self.phase_label.setWordWrap(True)
+        self.phase_label.setObjectName("taskPhase")
+        self.recovery_card = QFrame()
+        self.recovery_card.setObjectName("recoveryCard")
+        recovery_layout = QVBoxLayout(self.recovery_card)
+        recovery_title = QLabel("正在保护迁移进度")
+        recovery_title.setObjectName("recoveryTitle")
+        self.recovery_label = QLabel()
+        self.recovery_label.setWordWrap(True)
+        recovery_layout.addWidget(recovery_title)
+        recovery_layout.addWidget(self.recovery_label)
         self._last_update = monotonic()
         self._state: object = None
         self._action = "copy"
@@ -116,6 +129,7 @@ class TaskPage(QWidget):
         detail.addWidget(self.status_label)
         detail.addWidget(self.result_summary)
         detail.addWidget(self.activity_label)
+        detail.addWidget(self.phase_label)
         self.progress_panel = QWidget()
         progress_layout = QVBoxLayout(self.progress_panel)
         progress_layout.setContentsMargins(0, 0, 0, 0)
@@ -134,6 +148,7 @@ class TaskPage(QWidget):
         progress_layout.addLayout(metrics)
         detail.addWidget(self.progress_panel)
         detail.addWidget(self.safety_label)
+        detail.addWidget(self.recovery_card)
         actions = QHBoxLayout()
         for button in (self.pause_button, self.resume_button, self.cancel_button, self.connection_button):
             actions.addWidget(button)
@@ -161,6 +176,7 @@ class TaskPage(QWidget):
         self.export_button.hide()
         self.files_button.hide()
         self.target_button.hide()
+        self.recovery_card.hide()
 
     def show_task(self, task: object) -> None:
         self._action = str(getattr(getattr(task, "action", "copy"), "value", "copy"))
@@ -288,8 +304,7 @@ class TaskPage(QWidget):
         state = getattr(event, "state", None)
         self._last_update = monotonic()
         self.progress_panel.show()
-        self.status_label.setText(self._state_text(state))
-        self._update_actions(state)
+        self.set_workspace_state(state)
         if getattr(state, "value", state) in {"queued", "running", "verifying", "committing", "deleting_source"}:
             self.result_summary.clear()
             self._retry_deadline = None
@@ -309,6 +324,10 @@ class TaskPage(QWidget):
             self._retry_deadline = monotonic() + delay
             self._retry_attempt = attempt
             self.result_summary.setText(f"连接中断，正在自动重连。第 {attempt} 次重试，约 {delay:.0f} 秒后再次尝试。")
+            self.recovery_label.setText(
+                "检查点已保存，远端半成品尚未提交，完整校验通过前不会删除源文件。"
+                f"正在等待第 {attempt} 次重新连接，约 {delay:.0f} 秒后重试。"
+            )
 
     def apply_snapshot(self, snapshot: ProgressSnapshot, *, state: str | TaskState | None = None) -> None:
         total = max(1, snapshot.total_bytes)
@@ -324,8 +343,7 @@ class TaskPage(QWidget):
                 state = TaskState.VERIFYING
             elif snapshot.copied_bytes > 0:
                 state = TaskState.RUNNING
-        self.status_label.setText(self._state_text(state))
-        self._update_actions(state)
+        self.set_workspace_state(state)
 
     @staticmethod
     def _state_text(state: object) -> str:
@@ -337,8 +355,7 @@ class TaskPage(QWidget):
         self.details_button.setChecked(False)
         self.details_button.hide()
         state = getattr(result, "state", None)
-        self.status_label.setText(self._state_text(state))
-        self._update_actions(state)
+        self.set_workspace_state(state)
         self.update_selected_state(state)
         warnings = tuple(getattr(result, "warnings", ()))
         value = str(getattr(state, "value", state))
@@ -387,6 +404,30 @@ class TaskPage(QWidget):
         } else "#175cd3"
         self.status_label.setStyleSheet(f"font-size: 26px; font-weight: 700; color: {color}; padding: 12px 0;")
         self._update_activity()
+
+    def set_workspace_state(self, state: TaskState | str | None) -> None:
+        value = str(getattr(state, "value", state))
+        self.status_label.setText(self._state_text(state))
+        self._update_actions(state)
+        is_recovering = value == TaskState.WAITING_FOR_NETWORK.value
+        self.recovery_card.setVisible(is_recovering)
+        if value == TaskState.VERIFYING.value:
+            self.phase_label.setText("复制完成　›　完整回读校验中　›　原子提交　›　源文件处理")
+        elif value == TaskState.COMMITTING.value:
+            self.phase_label.setText("复制完成　›　完整回读校验完成　›　正在原子提交　›　源文件处理")
+        elif value == TaskState.DELETING_SOURCE.value:
+            self.phase_label.setText("复制完成　›　完整回读校验完成　›　原子提交完成　›　正在处理源文件")
+        elif is_recovering:
+            self.phase_label.setText("传输已停止　›　等待重新连接　›　断点核验")
+            self.recovery_label.setText(
+                "检查点已保存，远端半成品尚未提交，完整校验通过前不会删除源文件。"
+            )
+        elif value == TaskState.RUNNING.value:
+            self.phase_label.setText("正在复制　›　完整回读校验　›　原子提交　›　源文件处理")
+        elif value == TaskState.COMPLETED.value:
+            self.phase_label.setText("复制、完整回读校验和原子提交均已完成")
+        else:
+            self.phase_label.setText("等待任务开始")
 
     def _show_reason(self, code: str) -> None:
         code = safe_code(code)

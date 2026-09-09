@@ -147,6 +147,29 @@ def test_reconnected_task_clears_old_network_warning(qtbot):
     assert page.result_summary.text() == ""
 
 
+def test_verifying_state_keeps_copy_and_full_readback_as_distinct_phases(qtbot):
+    page = TaskPage()
+    qtbot.addWidget(page)
+
+    page.set_workspace_state(TaskState.VERIFYING)
+
+    assert "复制完成" in page.phase_label.text()
+    assert "完整回读校验中" in page.phase_label.text()
+    assert page.recovery_card.isHidden()
+
+
+def test_recovery_state_explains_checkpoint_and_source_safety(qtbot):
+    page = TaskPage()
+    qtbot.addWidget(page)
+
+    page.set_workspace_state(TaskState.WAITING_FOR_NETWORK)
+
+    assert page.recovery_card.isHidden() is False
+    assert "检查点" in page.recovery_label.text()
+    assert "不会删除源文件" in page.recovery_label.text()
+    assert page.pause_button.isEnabled() is True
+
+
 def test_start_request_during_worker_exit_runs_new_pending_work(qtbot):
     from nasmove.ui.queue_execution_controller import QueueExecutionController
     class Queue:
