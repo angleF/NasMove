@@ -9,6 +9,7 @@ from nasmove.ui.task_commands import TaskCommandService
 from nasmove.ui.task_controller import TaskController
 from nasmove.ui.task_creation_controller import TaskCreationController
 from nasmove.ui.task_page import TaskPage
+from nasmove.ui.theme import ThemeController, ThemeName, ThemePalette
 
 __all__ = [
     "ConnectionPage",
@@ -20,4 +21,7 @@ __all__ = [
     "TaskController",
     "TaskCreationController",
     "TaskPage",
+    "ThemeController",
+    "ThemeName",
+    "ThemePalette",
 ]
