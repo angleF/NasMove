@@ -11,8 +11,8 @@ from smbprotocol.exceptions import (
 )
 from smbprotocol.header import NtStatus
 
-from nasmove.core.errors import TransferErrorCategory
-from nasmove.smb.error_mapping import map_smb_error
+from nasmove.core.errors import SourceFileMissingError, TransferErrorCategory
+from nasmove.smb.error_mapping import map_smb_error, redacted_error_code
 from tests.fixtures.fake_smb import FakeNtStatusError
 
 
@@ -103,3 +103,21 @@ def test_temporary_dns_failure_is_retryable() -> None:
 
     assert failure.category is TransferErrorCategory.DNS
     assert failure.retryable is True
+
+
+def test_local_missing_source_has_its_own_code_distinct_from_remote_path() -> None:
+    assert redacted_error_code(SourceFileMissingError(errno.ENOENT, "source file is missing")) == (
+        "source_not_found"
+    )
+    # A remote-object miss keeps its own meaning, whether it arrives as a plain
+    # FileNotFoundError or as an NTSTATUS.
+    assert redacted_error_code(FileNotFoundError(errno.ENOENT, "remote path")) == "path_not_found"
+    assert redacted_error_code(FakeNtStatusError("STATUS_OBJECT_NAME_NOT_FOUND")) == "path_not_found"
+
+
+def test_local_missing_source_maps_to_a_non_retryable_not_found_failure() -> None:
+    failure = map_smb_error(SourceFileMissingError(errno.ENOENT, "source file is missing"))
+
+    assert failure.category is TransferErrorCategory.NOT_FOUND
+    assert failure.code == "source_not_found"
+    assert failure.retryable is False

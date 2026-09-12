@@ -4,28 +4,38 @@ import os
 import socket
 import stat
 from collections.abc import Callable
+from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
+from threading import RLock
 from typing import Any, cast
 
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from nasmove.app import ApplicationService
-from nasmove.core.ports import SessionInfo
+from nasmove.core.model import TaskRecord, TransferItemId, TransferItemRecord
 from nasmove.localio.files import PosixLocalFileGateway
 from nasmove.persistence.sqlite_repository import SqliteTaskRepository
 from nasmove.planning.task_planner import TaskPlanner
-from nasmove.security.keychain_store import MacOSKeychainCredentialStore
+from nasmove.security.sqlite_store import SqliteCredentialStore
 from nasmove.smb.error_mapping import redacted_error_code
 from nasmove.smb.smbprotocol_gateway import SmbProtocolGateway
 from nasmove.transfer.checkpoint_writer import CheckpointWriter
 from nasmove.transfer.commit import TargetCommitter
 from nasmove.transfer.deletion import SourceDeletionService
+from nasmove.transfer.item_worker import (
+    Committer,
+    CopyWriter,
+    EventSink,
+    TransferItemWorker,
+)
 from nasmove.transfer.progress import ProgressTracker
 from nasmove.transfer.recovery import RecoveryCoordinator
 from nasmove.transfer.retrying_runner import RetryingTaskRunner
 from nasmove.transfer.transfer_engine import QueueCoordinator, TransferEngine
 from nasmove.transfer.verification import IntegrityVerifier
+from nasmove.ui.connection_profile_service import ConnectionProfileService
 from nasmove.ui.main_window import MainWindow
 from nasmove.ui.view_models import ConnectionStageResult, ConnectionTestReport
 
@@ -128,6 +138,102 @@ def _prepare_data_directory(root: Path) -> None:
         raise PermissionError("application data directory could not be made private")
 
 
+def build_engine(
+    task: TaskRecord,
+    password: str,
+    *,
+    repository: SqliteTaskRepository,
+    local: PosixLocalFileGateway,
+    events: object,
+    gateway_factory: Callable[[], SmbProtocolGateway] = SmbProtocolGateway,
+) -> TransferEngine:
+    """Build one engine whose item workers each own a fresh gateway and session.
+
+    The password is only held in memory and handed to the per-worker factory as
+    an argument; it is never captured by a closure, event or log record.  The
+    engine rebuilds this whole stack for every network retry.
+
+    Progress has exactly one source: the absolute-offset callbacks
+    (``copy_progress`` / ``verify_progress``) driven into ``ProgressTracker``.
+    The per-item workers are deliberately built without a ``progress_tracker``
+    so their incremental ``record_copy`` / ``record_verification`` hooks stay
+    inert; otherwise an absolute update followed by an increment would double
+    count the same bytes.
+    """
+    protocol_repository = cast(Any, repository)
+    progress = ProgressTracker(
+        task.total_bytes,
+        event_sink=lambda snapshot: getattr(
+            getattr(events, "target", None), "publish_progress", lambda _: None
+        )(snapshot),
+    )
+    progress_lock = RLock()
+    copied: dict[TransferItemId, int] = {}
+    verified: dict[TransferItemId, int] = {}
+    for item in repository.list_items(task.id):
+        if item.state.value in {
+            "committed",
+            "source_delete_authorized",
+            "done",
+            "source_retained",
+        }:
+            copied[item.id] = item.source_fingerprint.size
+            verified[item.id] = item.source_fingerprint.size
+
+    def copy_progress(item: TransferItemRecord, offset: int) -> None:
+        with progress_lock:
+            copied[item.id] = offset
+            copied_total = sum(copied.values())
+            verified_total = sum(verified.values())
+        progress.update(copied_bytes=copied_total, verified_bytes=verified_total)
+
+    def verify_progress(item: TransferItemRecord, offset: int) -> None:
+        with progress_lock:
+            verified[item.id] = offset
+            copied_total = sum(copied.values())
+            verified_total = sum(verified.values())
+        progress.update(copied_bytes=copied_total, verified_bytes=verified_total)
+
+    def build_item_worker(
+        worker_task: TaskRecord, worker_password: str
+    ) -> TransferItemWorker:
+        gateway = gateway_factory()
+        try:
+            session = gateway.connect(worker_task.connection, worker_password)
+            verifier = IntegrityVerifier(
+                protocol_repository, local, gateway, session, progress=verify_progress
+            )
+            return TransferItemWorker(
+                protocol_repository,
+                RecoveryCoordinator(protocol_repository, local, gateway, session),
+                cast(
+                    CopyWriter,
+                    CheckpointWriter(protocol_repository, local, gateway, progress=copy_progress),
+                ),
+                verifier,
+                cast(Committer, TargetCommitter(protocol_repository, gateway, session)),
+                SourceDeletionService(protocol_repository, local, gateway, verifier),
+                smb_gateway=gateway,
+                session=session,
+                event_sink=cast(EventSink, events),
+            )
+        except BaseException:
+            # The engine classifies the failure, but this factory still owns
+            # the resources it created on the worker thread.
+            with suppress(Exception):
+                gateway.disconnect()
+            with suppress(Exception):
+                repository.release_thread_connection()
+            raise
+
+    return TransferEngine(
+        repository,
+        item_worker_factory=build_item_worker,
+        password=password,
+        event_sink=cast(EventSink, events),
+    )
+
+
 def build_desktop_runtime(
     *,
     data_dir: Path | None = None,
@@ -137,58 +243,19 @@ def build_desktop_runtime(
     _prepare_data_directory(root)
     repository = SqliteTaskRepository(root / "nasmove.db")
     gateway = SmbProtocolGateway()
-    credentials = credential_store or MacOSKeychainCredentialStore()
+    credentials = credential_store or SqliteCredentialStore(repository)
+    profile_service = ConnectionProfileService(repository, cast(Any, credentials))
     local = PosixLocalFileGateway()
     events = _UiEventSink()
 
-    def build_engine(session: SessionInfo) -> TransferEngine:
-        protocol_repository = cast(Any, repository)
-        active = next(
-            (
-                task
-                for task in repository.list_incomplete_tasks()
-                if task.state.value in {"running", "waiting_for_network"}
-            ),
-            None,
-        )
-        progress = ProgressTracker(
-            0 if active is None else active.total_bytes,
-            event_sink=lambda snapshot: getattr(events.target, "publish_progress", lambda _: None)(
-                snapshot
-            ),
-        )
-        copied: dict[object, int] = {}
-        verified: dict[object, int] = {}
-        if active is not None:
-            for item in repository.list_items(active.id):
-                if item.state.value in {"committed", "source_delete_authorized", "done", "source_retained"}:
-                    copied[item.id] = item.source_fingerprint.size
-                    verified[item.id] = item.source_fingerprint.size
+    engine_factory = partial(
+        build_engine,
+        repository=repository,
+        local=local,
+        events=events,
+    )
 
-        def copy_progress(item: Any, offset: int) -> None:
-            copied[item.id] = offset
-            progress.update(copied_bytes=sum(copied.values()), verified_bytes=sum(verified.values()))
-
-        def verify_progress(item: Any, offset: int) -> None:
-            verified[item.id] = offset
-            progress.update(copied_bytes=sum(copied.values()), verified_bytes=sum(verified.values()))
-
-        verifier = IntegrityVerifier(protocol_repository, local, gateway, session, progress=verify_progress)
-        return TransferEngine(
-            repository,
-            recovery=RecoveryCoordinator(protocol_repository, local, gateway, session),
-            checkpoint_writer=CheckpointWriter(repository, local, gateway, progress=copy_progress),
-            verifier=verifier,
-            committer=TargetCommitter(protocol_repository, gateway, session),
-            deletion_service=SourceDeletionService(
-                protocol_repository, local, gateway, verifier
-            ),
-            smb_gateway=gateway,
-            session=session,
-            event_sink=events,
-        )
-
-    runner = RetryingTaskRunner(repository, gateway, credentials, build_engine, event_sink=events)
+    runner = RetryingTaskRunner(repository, credentials, engine_factory, event_sink=events)
     queue = QueueCoordinator(cast(TransferEngine, runner), repository)
     application = ApplicationService(
         repository=repository,
@@ -207,6 +274,7 @@ def build_desktop_runtime(
         task_planner=TaskPlanner(local, gateway, repository),
         application=application,
         queue_coordinator=queue,
+        profile_service=profile_service,
     )
     events.target = window.task_controller
     return DesktopRuntime(window, application, repository, gateway, queue)
@@ -222,7 +290,15 @@ def main() -> int:
     runtime.window.task_controller.load_queue(tuple(runtime.repository.list_tasks()))
     if runtime.window.queue_execution is not None:
         runtime.window.queue_execution.start()
-    qt_application.aboutToQuit.connect(runtime.application.request_shutdown)
+
+    def shutdown() -> None:
+        # Stop the queue at a safe boundary and wait for the active engine's
+        # item workers to release their SQLite thread connections and SMB
+        # sessions before the application closes the repository.
+        runtime.queue.shutdown()
+        runtime.application.request_shutdown()
+
+    qt_application.aboutToQuit.connect(shutdown)
     runtime.window.resize(1100, 760)
     runtime.window.show()
     return int(qt_application.exec())
@@ -232,6 +308,7 @@ __all__ = [
     "DesktopRuntime",
     "ProductionConnectionTester",
     "build_desktop_runtime",
+    "build_engine",
     "main",
 ]
 

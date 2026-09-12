@@ -4,7 +4,6 @@ Version: 0.1.0
 Requires-Python: <3.13,>=3.12
 Requires-Dist: PySide6<7,>=6.10
 Requires-Dist: smbprotocol<2,>=1.15
-Requires-Dist: keyring<27,>=25
 Provides-Extra: dev
 Requires-Dist: mypy<2,>=1.18; extra == "dev"
 Requires-Dist: pip-tools<8,>=7.5; extra == "dev"

@@ -41,7 +41,12 @@ ITEM_TRANSITIONS: Final[Mapping[ItemState, frozenset[ItemState]]] = MappingProxy
             {ItemState.TRANSFERRING, ItemState.VERIFYING, ItemState.SOURCE_CHANGED}
         ),
         ItemState.VERIFIED: frozenset(
-            {ItemState.COMMITTED, ItemState.INTERRUPTED, ItemState.SOURCE_CHANGED}
+            {
+                ItemState.COMMITTED,
+                ItemState.INTERRUPTED,
+                ItemState.SOURCE_CHANGED,
+                ItemState.SKIPPED,
+            }
         ),
         ItemState.COMMITTED: frozenset(
             {ItemState.SOURCE_DELETE_AUTHORIZED, ItemState.DONE, ItemState.SOURCE_RETAINED}

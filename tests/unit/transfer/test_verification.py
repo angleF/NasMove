@@ -1,7 +1,10 @@
 import hashlib
 from dataclasses import replace
 
+import pytest
+
 from nasmove.core.states import SourceKind
+from tests.fixtures.transfer import TransferToken
 
 
 def test_full_verification_hashes_source_and_remote_from_zero(verification_fixture) -> None:
@@ -11,6 +14,32 @@ def test_full_verification_hashes_source_and_remote_from_zero(verification_fixtu
     assert result.matches is True
     assert result.source_bytes == len(b"verified payload")
     assert result.remote_bytes == len(b"verified payload")
+    assert verification_fixture.remote.remote_read_started_at == 0
+
+
+def test_full_verification_stops_at_source_hash_block_boundary(verification_fixture) -> None:
+    token = TransferToken()
+    verification_fixture.local.cancel_token = token
+
+    with pytest.raises(InterruptedError, match="verification stopped"):
+        verification_fixture.verifier.verify_full(verification_fixture.item, token=token)
+
+    assert token.cancel_requested is True
+    assert verification_fixture.remote.remote_read_started_at is None
+
+
+def test_full_verification_stops_at_remote_hash_block_boundary(verification_fixture) -> None:
+    token = TransferToken()
+
+    def request_cancel(_item, _offset) -> None:
+        token.request_cancel()
+
+    verification_fixture.verifier._progress = request_cancel
+
+    with pytest.raises(InterruptedError, match="verification stopped"):
+        verification_fixture.verifier.verify_full(verification_fixture.item, token=token)
+
+    assert token.cancel_requested is True
     assert verification_fixture.remote.remote_read_started_at == 0
 
 

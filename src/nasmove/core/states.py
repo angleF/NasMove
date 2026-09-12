@@ -41,7 +41,12 @@ class TransferAction(StrEnum):
 
 
 class ConflictPolicy(StrEnum):
-    AUTO_RENAME = "auto_rename"
+    KEEP_BOTH = "keep_both"
+    OVERWRITE = "overwrite"
+    SKIP = "skip"
+    OVERWRITE_IF_NEWER = "overwrite_if_newer"
+    ASK = "ask"
+    AUTO_RENAME = "keep_both"
 
 
 class VerificationPolicy(StrEnum):

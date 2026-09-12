@@ -11,6 +11,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QListWidget,
     QPushButton,
+    QRadioButton,
     QVBoxLayout,
     QWidget,
 )
@@ -24,7 +25,9 @@ class SourcePage(QWidget):
         self.sources: list[Path] = []
         self.preserve_hierarchy_checkbox = QCheckBox("保留源目录层级")
         self.preserve_hierarchy_checkbox.setChecked(True)
-        self.move_checkbox = QCheckBox("移动（复制、校验后删除源）")
+        self.copy_radio = QRadioButton("复制到 NAS（保留本地文件）")
+        self.move_checkbox = QRadioButton("移动到 NAS（校验成功后移入废纸篓）")
+        self.copy_radio.setChecked(True)
         self.verify_checkbox = QCheckBox("完整校验")
         self.verify_checkbox.setChecked(True)
         self.verify_checkbox.setEnabled(True)
@@ -42,10 +45,13 @@ class SourcePage(QWidget):
         self.clear_button.clicked.connect(lambda: self.set_sources([]))
         self.move_checkbox.toggled.connect(self._move_toggled)
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("选择要迁移的本地文件或文件夹，也可以直接拖入下方列表。"))
-        layout.addWidget(self.preserve_hierarchy_checkbox)
-        layout.addWidget(self.move_checkbox)
-        layout.addWidget(self.verify_checkbox)
+        source_hint = QLabel("选择要迁移的本地文件或文件夹，也可以直接拖入下方列表。")
+        source_hint.setWordWrap(True)
+        layout.addWidget(source_hint)
+        self.add_files_button.setProperty("themeRole", "secondary")
+        self.add_directory_button.setProperty("themeRole", "secondary")
+        self.preserve_hierarchy_checkbox.hide()
+        self.verify_checkbox.hide()
         buttons = QHBoxLayout()
         for button in (
             self.add_files_button,
@@ -56,6 +62,9 @@ class SourcePage(QWidget):
             buttons.addWidget(button)
         layout.addLayout(buttons)
         layout.addWidget(self.list_widget)
+        layout.addWidget(QLabel("完成后如何处理本地文件？"))
+        layout.addWidget(self.copy_radio)
+        layout.addWidget(self.move_checkbox)
         self.setAcceptDrops(True)
 
     def _move_toggled(self, checked: bool) -> None:

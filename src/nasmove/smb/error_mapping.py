@@ -9,7 +9,7 @@ try:
 except ImportError:  # pragma: no cover - compatibility with older smbprotocol releases
     _smb_exceptions = None
 
-from nasmove.core.errors import TransferErrorCategory, TransferFailure
+from nasmove.core.errors import SourceFileMissingError, TransferErrorCategory, TransferFailure
 
 
 class TargetExistsError(FileExistsError):
@@ -68,6 +68,7 @@ _NETWORK_CODES = frozenset({"network_name_deleted", "timeout", "connection_reset
 _CODE_CATEGORIES = {
     "permission_denied": TransferErrorCategory.PERMISSION,
     "path_not_found": TransferErrorCategory.NOT_FOUND,
+    "source_not_found": TransferErrorCategory.NOT_FOUND,
     "target_exists": TransferErrorCategory.TARGET_EXISTS,
     "disk_full": TransferErrorCategory.DISK_FULL,
     "quota_exceeded": TransferErrorCategory.QUOTA,
@@ -149,6 +150,10 @@ def redacted_error_code(error: BaseException) -> str:
         return "unsupported_dialect"
     if isinstance(error, PermissionError):
         return "permission_denied"
+    # Checked before the generic FileNotFoundError branch: a vanished local
+    # source is a different, actionable condition from a missing remote path.
+    if isinstance(error, SourceFileMissingError):
+        return "source_not_found"
     if isinstance(error, FileNotFoundError):
         return "path_not_found"
     if isinstance(error, TimeoutError):

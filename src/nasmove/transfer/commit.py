@@ -6,9 +6,10 @@ from datetime import UTC, datetime
 from pathlib import PurePosixPath
 from typing import BinaryIO, Protocol
 
+from nasmove.core.errors import ConflictResolutionRequired
 from nasmove.core.model import RemotePath, TransferItemRecord
 from nasmove.core.ports import RemoteEntry, RemoteStat, SessionInfo
-from nasmove.core.states import ItemState, SourceKind
+from nasmove.core.states import ConflictPolicy, ItemState, SourceKind
 from nasmove.localio.hashing import sha256_stream
 from nasmove.planning.conflicts import allocate_name
 from nasmove.transfer.verification import VerificationResult
@@ -32,6 +33,10 @@ class SmbGateway(Protocol):
     def list_dir(self, path: RemotePath) -> list[RemoteEntry]: ...
 
     def rename_exclusive(self, source: RemotePath, target: RemotePath) -> None: ...
+
+    def replace_atomic(self, source: RemotePath, target: RemotePath) -> None: ...
+
+    def remove_file(self, path: RemotePath) -> None: ...
 
     def open_read(self, path: RemotePath) -> AbstractContextManager[BinaryIO]: ...
 
@@ -65,7 +70,13 @@ class TargetCommitter:
         self._smb = smb_gateway
         self._session = session
 
-    def commit(self, item: TransferItemRecord, verification: VerificationResult) -> CommitResult:
+    def commit(
+        self,
+        item: TransferItemRecord,
+        verification: VerificationResult,
+        *,
+        conflict_policy: ConflictPolicy = ConflictPolicy.KEEP_BOTH,
+    ) -> CommitResult:
         if verification.matches is not True or verification.source_unchanged is not True:
             raise ValueError("commit requires matching verification and unchanged source")
         if verification.session_generation != self._session.session_generation:
@@ -77,7 +88,22 @@ class TargetCommitter:
             raise ValueError("item state changed before commit")
 
         with self._lease():
-            candidate = self._choose_initial_path(current)
+            existing = self._smb.stat(current.final_path)
+            if existing is not None and conflict_policy is ConflictPolicy.ASK:
+                raise ConflictResolutionRequired(current.final_path)
+            if existing is not None and conflict_policy is ConflictPolicy.SKIP:
+                return self._skip_verified(current, existing)
+            if (
+                existing is not None
+                and conflict_policy is ConflictPolicy.OVERWRITE_IF_NEWER
+                and current.source_fingerprint.mtime_ns <= existing.modified_ns
+            ):
+                return self._skip_verified(current, existing)
+            overwrite = conflict_policy in {
+                ConflictPolicy.OVERWRITE,
+                ConflictPolicy.OVERWRITE_IF_NEWER,
+            }
+            candidate = current.final_path if overwrite else self._choose_initial_path(current)
             while True:
                 if candidate != current.final_path:
                     current = self._persist_path(current, candidate)
@@ -92,11 +118,30 @@ class TargetCommitter:
                     raise OSError("temporary file identity changed after verification")
                 try:
                     self._assert_generation()
-                    self._smb.rename_exclusive(current.temp_path, candidate)
+                    if overwrite and self._smb.stat(candidate) is not None:
+                        self._smb.replace_atomic(current.temp_path, candidate)
+                    else:
+                        self._smb.rename_exclusive(current.temp_path, candidate)
                     self._assert_generation()
                 except FileExistsError:
-                    candidate = self._next_name(candidate)
-                    continue
+                    racing_target = self._smb.stat(candidate)
+                    if conflict_policy is ConflictPolicy.ASK:
+                        raise ConflictResolutionRequired(candidate)
+                    if conflict_policy is ConflictPolicy.SKIP:
+                        return self._skip_verified(current, racing_target)
+                    if (
+                        conflict_policy is ConflictPolicy.OVERWRITE_IF_NEWER
+                        and racing_target is not None
+                        and current.source_fingerprint.mtime_ns
+                        <= racing_target.modified_ns
+                    ):
+                        return self._skip_verified(current, racing_target)
+                    if overwrite:
+                        self._smb.replace_atomic(current.temp_path, candidate)
+                        self._assert_generation()
+                    else:
+                        candidate = self._next_name(candidate)
+                        continue
 
                 final_stat = self._smb.stat(candidate)
                 if (
@@ -127,6 +172,24 @@ class TargetCommitter:
                     current.id, ItemState.VERIFIED, ItemState.COMMITTED
                 )
                 return CommitResult(candidate, final_size, final_stat.file_id)
+
+    def _skip_verified(
+        self,
+        item: TransferItemRecord,
+        existing: RemoteStat | None,
+    ) -> CommitResult:
+        self._smb.remove_file(item.temp_path)
+        self._repository.transition_item(
+            item.id,
+            ItemState.VERIFIED,
+            ItemState.SKIPPED,
+        )
+        return CommitResult(
+            item.final_path,
+            0 if existing is None else existing.size,
+            None if existing is None else existing.file_id,
+            committed=False,
+        )
 
     def _choose_initial_path(self, item: TransferItemRecord) -> RemotePath:
         if self._smb.stat(item.final_path) is None:

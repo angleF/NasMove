@@ -269,6 +269,16 @@ class SmbProtocolGateway:
                 raise TargetExistsError("exclusive SMB rename target already exists") from error
             raise RenameOutcomeUnknownError("exclusive SMB rename outcome is unknown") from error
 
+    def replace_atomic(self, source: RemotePath, target: RemotePath) -> None:
+        try:
+            smbclient.replace(
+                self._unc(source),
+                self._unc(target),
+                **self._session_kwargs(),
+            )
+        except Exception as error:
+            raise RenameOutcomeUnknownError("atomic SMB replace outcome is unknown") from error
+
     def remove_file(self, path: RemotePath) -> None:
         smbclient.remove(self._unc(path), **self._session_kwargs())
 

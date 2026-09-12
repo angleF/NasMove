@@ -31,9 +31,23 @@ def test_every_theme_keeps_explicit_failure_and_recovery_tokens(tmp_path) -> Non
         controller.select(theme)
 
         stylesheet = controller.stylesheet()
+        palette = controller.palette()
 
-        assert "#B42318" in stylesheet
-        assert "#B54708" in stylesheet
+        assert palette.status_danger in stylesheet
+        assert palette.recovery_text in stylesheet
+
+
+def test_theme_system_adapts_to_dark_mode(tmp_path, monkeypatch) -> None:
+    settings = QSettings(str(tmp_path / "appearance.ini"), QSettings.Format.IniFormat)
+    controller = ThemeController(settings)
+    assert controller.selected_theme() is ThemeName.SYSTEM
+
+    import nasmove.ui.theme as theme_mod
+
+    monkeypatch.setattr(theme_mod, "is_system_dark", lambda: True)
+
+    assert controller.palette() == theme_mod.MIDNIGHT_OPS
+    assert theme_mod.MIDNIGHT_OPS.primary in controller.stylesheet()
 
 
 def test_theme_styles_navigation_surfaces_and_form_controls(tmp_path) -> None:
@@ -44,4 +58,20 @@ def test_theme_styles_navigation_surfaces_and_form_controls(tmp_path) -> None:
     assert "#appNavigation" in stylesheet
     assert 'QPushButton[themeRole="selected"]' in stylesheet
     assert "QLineEdit, QSpinBox, QComboBox" in stylesheet
+    assert "QComboBox::down-arrow" in stylesheet
+    assert "QWidget#deviceSidebar QPushButton" in stylesheet
+    assert "QPushButton#queueTopButton" in stylesheet
+    assert "QGroupBox" in stylesheet
     assert "#recoveryCard" in stylesheet
+
+
+def test_theme_styles_file_browser_splitters_and_queue_as_workbench_surfaces(tmp_path) -> None:
+    settings = QSettings(str(tmp_path / "appearance.ini"), QSettings.Format.IniFormat)
+
+    stylesheet = ThemeController(settings).stylesheet()
+
+    assert "QTableView#fileTable" in stylesheet
+    assert "QHeaderView::section" in stylesheet
+    assert "QSplitter::handle" in stylesheet
+    assert "#queuePanel" in stylesheet
+    assert "#deviceSidebar" in stylesheet

@@ -11,14 +11,15 @@ import threading
 import time
 import tracemalloc
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
 
 from nasmove.core.errors import DomainValidationError
-from nasmove.core.model import ConnectionConfig, ConnectionProfileId, RemotePath
+from nasmove.core.model import ConnectionConfig, ConnectionProfileId, RemotePath, TaskRecord
 from nasmove.core.ports import SessionInfo
 from nasmove.core.retry import RetryPolicy
 from nasmove.core.states import (
@@ -35,6 +36,8 @@ from nasmove.smb.error_mapping import map_smb_error, redacted_error_code
 from nasmove.smb.smbprotocol_gateway import SmbProtocolGateway
 from nasmove.transfer.checkpoint_writer import CancellationToken, CheckpointWriter
 from nasmove.transfer.commit import TargetCommitter
+from nasmove.transfer.deletion import SourceDeletionService
+from nasmove.transfer.item_worker import TransferItemWorker
 from nasmove.transfer.recovery import RecoveryCoordinator
 from nasmove.transfer.retrying_runner import RetryingTaskRunner
 from nasmove.transfer.transfer_engine import TransferEngine
@@ -88,6 +91,16 @@ class DirectoryTreeResult:
     nested_file_verified: bool
     empty_directory_created: bool
     source_tree_retained: bool
+
+
+@dataclass(frozen=True, slots=True)
+class ConcurrentFilesResult:
+    completed_files: int
+    verified_files: int
+    distinct_worker_gateways: int
+    distinct_worker_sessions: int
+    peak_parallel_workers: int
+    source_files_retained: int
 
 
 class _FixedCredentialStore:
@@ -218,6 +231,28 @@ class _TargetRaceGateway:
         return getattr(self._gateway, name)
 
 
+def _ntlm_gateway() -> SmbProtocolGateway:
+    """Match the NTLM gateways these fault scenarios connect through the proxy."""
+    return SmbProtocolGateway(auth_protocol="ntlm")
+
+
+class _WorkerEventSink:
+    """Record item-worker events so the fixture mirrors production wiring.
+
+    ``desktop_app.build_engine`` hands every item worker the shared UI event
+    sink; the isolated NAS gate has no UI, but the workers must still be built
+    the same way, so their events are recorded here instead of dropped.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.events: list[object] = []
+
+    def publish(self, event: object) -> None:
+        with self._lock:
+            self.events.append(event)
+
+
 class SynologyFixture:
     """Production-component harness restricted to an isolated Synology share."""
 
@@ -234,6 +269,11 @@ class SynologyFixture:
         ]
         if not self.test_root.startswith("NasMoveTest/"):
             raise ValueError("NASMOVE_SYNOLOGY_TEST_ROOT must be under NasMoveTest/")
+        self._worker_records_lock = threading.Lock()
+        self._record_workers = False
+        self._worker_gateways: list[object] = []
+        self._worker_sessions: list[object] = []
+        self._worker_thread_ids: list[int] = []
 
     def transfer_with_disconnects(
         self,
@@ -365,9 +405,10 @@ class SynologyFixture:
                     injector.start()
                     runner = RetryingTaskRunner(
                         repository,
-                        gateway,
                         _FixedCredentialStore(self.password),
-                        lambda session: self._build_engine(repository, gateway, session),
+                        self._engine_factory(
+                            repository, gateway, gateway_factory=_ntlm_gateway
+                        ),
                         sleeper=lambda _delay: None,
                         jitter=lambda: 0.0,
                     )
@@ -424,9 +465,10 @@ class SynologyFixture:
                 gateway.reset_connection()
                 runner = RetryingTaskRunner(
                     repository,
-                    gateway,
                     _FixedCredentialStore(self.password),
-                    lambda session: self._build_engine(repository, wrapped, session),
+                    self._engine_factory(
+                        repository, wrapped, gateway_factory=lambda: wrapped
+                    ),
                     sleeper=lambda _delay: None,
                     jitter=lambda: 0.0,
                 )
@@ -503,7 +545,8 @@ class SynologyFixture:
                         except BaseException as error:  # noqa: BLE001
                             restart_errors.append(error)
 
-                    def engine_factory(session: SessionInfo) -> TransferEngine:
+                    def engine_factory(task: TaskRecord, password: str) -> TransferEngine:
+                        gateway.connect(task.connection, password)
                         current = repository.get_item(item.id)
                         remote = gateway.stat(current.temp_path)
                         if remote is not None:
@@ -511,13 +554,14 @@ class SynologyFixture:
                                 maximum_replay[0],
                                 max(0, remote.size - current.confirmed_offset),
                             )
-                        return self._build_engine(repository, gateway, session)
+                        return self._build_engine(
+                            repository, password, gateway_factory=_ntlm_gateway
+                        )
 
                     injector = threading.Thread(target=restart_nas, daemon=True)
                     injector.start()
                     runner = RetryingTaskRunner(
                         repository,
-                        gateway,
                         _FixedCredentialStore(self.password),
                         engine_factory,
                         retry_policy=RetryPolicy(
@@ -622,9 +666,8 @@ class SynologyFixture:
                 gateway.reset_connection()
                 runner = RetryingTaskRunner(
                     repository,
-                    gateway,
                     _FixedCredentialStore(self.password),
-                    lambda session: self._build_engine(repository, gateway, session),
+                    self._engine_factory(repository, gateway),
                     sleeper=lambda _delay: None,
                     jitter=lambda: 0.0,
                 )
@@ -677,7 +720,7 @@ class SynologyFixture:
             repository = SqliteTaskRepository(Path(temporary).resolve() / "state.sqlite3")
             config = self._direct_config("synology-directory-tree")
             try:
-                session = gateway.connect(config, self.password)
+                gateway.connect(config, self.password)
                 gateway.make_dir(target_root)
                 planned = TaskPlanner(PosixLocalFileGateway(), gateway, repository).plan(
                     PlanRequest(
@@ -693,7 +736,7 @@ class SynologyFixture:
                 repository.transition_task(
                     planned.task.id, TaskState.PREFLIGHT, TaskState.QUEUED
                 )
-                result = self._build_engine(repository, gateway, session).run_task(
+                result = self._build_engine(repository, self.password).run_task(
                     planned.task.id, CancellationToken()
                 )
                 if not result.success:
@@ -713,6 +756,117 @@ class SynologyFixture:
                     source_tree_retained=source_file.exists() and empty.is_dir(),
                 )
             finally:
+                gateway.disconnect()
+                repository.close()
+                with suppress(Exception):
+                    admin.child_command(child, 'rm -rf -- "$1"')
+
+    def transfer_concurrent_files(
+        self,
+        *,
+        file_count: int = 6,
+        max_parallel_items: int = 2,
+    ) -> ConcurrentFilesResult:
+        """Transfer several files through the production concurrent path.
+
+        The task snapshot fixes ``max_parallel_items`` at 2 (or more), so the
+        engine runs its per-item worker factory concurrently.  Every item must
+        land with a matching SHA-256 and must have been handled by its own
+        gateway, session and worker thread.
+        """
+        if max_parallel_items < 2 or file_count < max_parallel_items:
+            raise ValueError("concurrent scenario needs a concurrency above one and enough files")
+        child = f"concurrent-files-{uuid.uuid4().hex}"
+        target_root = RemotePath(f"{self.test_root}/{child}")
+        admin = _SynologyAdmin(self.share, self.test_root)
+        gateway = SmbProtocolGateway()
+        with tempfile.TemporaryDirectory(prefix="nasmove-concurrent-files-") as temporary:
+            local_root = Path(temporary).resolve() / "sources"
+            local_root.mkdir()
+            sources: list[Path] = []
+            for index in range(file_count):
+                source = local_root / f"file-{index:06d}.bin"
+                size = 4096 + (index * 7919) % (256 * 1024 + 1)
+                pattern = (index + 1).to_bytes(4, "little")
+                with source.open("wb") as stream:
+                    stream.write((pattern * ((size + 3) // 4))[:size])
+                sources.append(source)
+
+            repository = SqliteTaskRepository(Path(temporary).resolve() / "state.sqlite3")
+            config = replace(
+                self._direct_config("synology-concurrent-files"),
+                max_parallel_items=max_parallel_items,
+            )
+            self._reset_worker_records()
+            self._record_workers = True
+            try:
+                gateway.connect(config, self.password)
+                gateway.make_dir(target_root)
+                planned = TaskPlanner(PosixLocalFileGateway(), gateway, repository).plan(
+                    PlanRequest(
+                        name="Synology concurrent files",
+                        connection=config,
+                        sources=tuple(sources),
+                        target_root=target_root,
+                        action=TransferAction.COPY,
+                        conflict_policy=ConflictPolicy.AUTO_RENAME,
+                        verification_policy=VerificationPolicy.FULL,
+                    )
+                )
+                repository.transition_task(
+                    planned.task.id, TaskState.PREFLIGHT, TaskState.QUEUED
+                )
+                gateway.reset_connection()
+                runner = RetryingTaskRunner(
+                    repository,
+                    _FixedCredentialStore(self.password),
+                    self._engine_factory(repository, gateway),
+                    sleeper=lambda _delay: None,
+                    jitter=lambda: 0.0,
+                )
+                result = runner.run_task(planned.task.id, CancellationToken())
+                if not result.success:
+                    raise AssertionError(f"concurrent transfer failed: {result.state.value}")
+                items = repository.list_items(planned.task.id)
+                if len(items) != file_count:
+                    raise AssertionError("concurrent scenario planned the wrong item count")
+                verified = 0
+                for item in items:
+                    with item.source_path.open("rb") as local_stream:
+                        local_hash = sha256_stream(local_stream).hexdigest
+                    with gateway.open_read(item.final_path) as remote_stream:
+                        remote_hash = sha256_stream(remote_stream).hexdigest
+                    if local_hash != remote_hash:
+                        raise AssertionError(
+                            f"concurrent file {item.relative_path} failed SHA-256"
+                        )
+                    verified += 1
+                gateways, sessions, threads = self._worker_resource_evidence()
+                # The serial compatibility branch would record nothing here; the
+                # concurrent path must have assembled one gateway and session
+                # per file, on more than one pool thread.
+                if gateways != file_count:
+                    raise AssertionError(
+                        "concurrent workers did not each own a distinct gateway"
+                    )
+                if sessions != file_count:
+                    raise AssertionError(
+                        "concurrent workers did not each own a distinct session"
+                    )
+                if threads < 2:
+                    raise AssertionError(
+                        "concurrent scenario never ran two workers in parallel"
+                    )
+                return ConcurrentFilesResult(
+                    completed_files=result.completed_items,
+                    verified_files=verified,
+                    distinct_worker_gateways=gateways,
+                    distinct_worker_sessions=sessions,
+                    peak_parallel_workers=threads,
+                    source_files_retained=sum(source.exists() for source in sources),
+                )
+            finally:
+                self._record_workers = False
                 gateway.disconnect()
                 repository.close()
                 with suppress(Exception):
@@ -786,9 +940,8 @@ class SynologyFixture:
 
                 runner = RetryingTaskRunner(
                     repository,
-                    gateway,
                     _FixedCredentialStore(connection_password),
-                    lambda session: self._build_engine(repository, gateway, session),
+                    self._engine_factory(repository, gateway),
                     sleeper=lambda _delay: None,
                     jitter=lambda: 0.0,
                 )
@@ -921,7 +1074,8 @@ class SynologyFixture:
                     triggered += 1
                     previous_percentage = percentage
 
-            def engine_factory(session: SessionInfo) -> TransferEngine:
+            def engine_factory(task: TaskRecord, password: str) -> TransferEngine:
+                gateway.connect(task.connection, password)
                 current = repository.get_item(item.id)
                 remote = gateway.stat(current.temp_path)
                 if remote is not None:
@@ -929,13 +1083,14 @@ class SynologyFixture:
                         maximum_replay[0],
                         max(0, remote.size - current.confirmed_offset),
                     )
-                return self._build_engine(repository, gateway, session)
+                return self._build_engine(
+                    repository, password, gateway_factory=_ntlm_gateway
+                )
 
             injector = threading.Thread(target=inject_disconnects, daemon=True)
             injector.start()
             runner = RetryingTaskRunner(
                 repository,
-                gateway,
                 _FixedCredentialStore(self.password),
                 engine_factory,
                 sleeper=lambda _delay: None,
@@ -970,22 +1125,102 @@ class SynologyFixture:
             gateway.disconnect()
             repository.close()
 
-    @staticmethod
-    def _build_engine(
+    def _engine_factory(
+        self,
         repository: SqliteTaskRepository,
         gateway: SmbProtocolGateway,
-        session: SessionInfo,
+        *,
+        gateway_factory: Callable[[], object] = SmbProtocolGateway,
+    ) -> Callable[[TaskRecord, str], TransferEngine]:
+        """Build an engine factory that connects its own session per attempt.
+
+        The outer ``gateway`` is reconnected once per attempt because callers
+        use it to measure replay and to read results after the run; the engine
+        itself hands every item worker its own gateway and session.
+        """
+
+        def factory(task: TaskRecord, password: str) -> TransferEngine:
+            gateway.connect(task.connection, password)
+            return self._build_engine(
+                repository, password, gateway_factory=gateway_factory
+            )
+
+        return factory
+
+    def _build_engine(
+        self,
+        repository: SqliteTaskRepository,
+        password: str,
+        *,
+        gateway_factory: Callable[[], object] = SmbProtocolGateway,
     ) -> TransferEngine:
+        """Build the production-equivalent concurrent engine for one attempt.
+
+        Mirrors ``nasmove.ui.desktop_app.build_engine``: the engine is created
+        with a per-item worker factory, so every item worker owns a freshly
+        connected gateway, its own session and its own SQLite thread
+        connection.  This is the concurrent path the application ships, so the
+        isolated NAS gate exercises production behaviour rather than the serial
+        compatibility branch.
+        """
         local = PosixLocalFileGateway()
+        events = _WorkerEventSink()
+
+        def build_item_worker(
+            worker_task: TaskRecord, worker_password: str
+        ) -> TransferItemWorker:
+            gateway = gateway_factory()
+            try:
+                session = gateway.connect(worker_task.connection, worker_password)
+                verifier = IntegrityVerifier(repository, local, gateway, session)
+                worker = TransferItemWorker(
+                    repository,
+                    RecoveryCoordinator(repository, local, gateway, session),
+                    CheckpointWriter(repository, local, gateway),
+                    verifier,
+                    TargetCommitter(repository, gateway, session),
+                    SourceDeletionService(repository, local, gateway, verifier),
+                    smb_gateway=gateway,
+                    session=session,
+                    event_sink=events,
+                )
+            except BaseException:
+                # The engine classifies the failure, but this factory still owns
+                # the resources it created on the worker thread.
+                with suppress(Exception):
+                    gateway.disconnect()
+                with suppress(Exception):
+                    repository.release_thread_connection()
+                raise
+            self._record_worker_resources(gateway, session)
+            return worker
+
         return TransferEngine(
             repository,
-            recovery=RecoveryCoordinator(repository, local, gateway, session),
-            checkpoint_writer=CheckpointWriter(repository, local, gateway),
-            verifier=IntegrityVerifier(repository, local, gateway, session),
-            committer=TargetCommitter(repository, gateway, session),
-            smb_gateway=gateway,
-            session=session,
+            item_worker_factory=build_item_worker,
+            password=password,
         )
+
+    def _reset_worker_records(self) -> None:
+        with self._worker_records_lock:
+            self._worker_gateways.clear()
+            self._worker_sessions.clear()
+            self._worker_thread_ids.clear()
+
+    def _record_worker_resources(self, gateway: object, session: SessionInfo) -> None:
+        if not self._record_workers:
+            return
+        with self._worker_records_lock:
+            self._worker_gateways.append(gateway)
+            self._worker_sessions.append(session)
+            self._worker_thread_ids.append(threading.get_ident())
+
+    def _worker_resource_evidence(self) -> tuple[int, int, int]:
+        with self._worker_records_lock:
+            gateways = len({id(entry) for entry in self._worker_gateways})
+            sessions = len({id(entry) for entry in self._worker_sessions})
+            threads = len(set(self._worker_thread_ids))
+        return gateways, sessions, threads
 
     @staticmethod
     def _cleanup_remote(

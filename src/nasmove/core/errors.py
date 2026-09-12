@@ -1,5 +1,11 @@
+from __future__ import annotations
+
 from dataclasses import dataclass
 from enum import StrEnum
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from nasmove.core.model import RemotePath
 
 
 class TransferErrorCategory(StrEnum):
@@ -51,9 +57,31 @@ class ConcurrentStateChange(DomainValidationError):
     """Raised when a compare-and-swap update observes a stale state."""
 
 
+class ConnectionProfileInUse(RuntimeError):
+    """Raised when an incomplete task still needs a connection profile."""
+
+
+class PreflightCancelled(RuntimeError):
+    """Raised when a cooperative preflight cancellation is observed."""
+
+
+class ConflictResolutionRequired(DomainValidationError):
+    """Raised when an ask-policy conflict needs an explicit user decision."""
+
+    def __init__(self, remote_path: RemotePath) -> None:
+        self.remote_path = remote_path
+        super().__init__(f"conflict resolution is required for {remote_path.value}")
+
+
 class UnsafeSourceDeletion(DomainValidationError):
     """Raised when evidence is insufficient to delete a source item."""
 
 
-class UnsafeCredentialBackend(DomainValidationError):
-    """Raised when credentials cannot be stored in the macOS Keychain backend."""
+class SourceFileMissingError(FileNotFoundError):
+    """Raised when a local source path no longer exists by the time it is read.
+
+    A distinct type from a remote ``path_not_found`` so the UI can tell the user
+    the source was already consumed instead of blaming the NAS directory.  It
+    stays a ``FileNotFoundError`` so every fail-closed "source is gone" path
+    keeps its current meaning.
+    """

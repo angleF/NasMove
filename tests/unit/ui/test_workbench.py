@@ -24,9 +24,9 @@ def test_real_repository_can_be_used_by_planning_and_queue_threads(tmp_path):
 def test_home_is_empty_workbench_with_new_task_action(qtbot):
     window = MainWindow()
     qtbot.addWidget(window)
-    assert window.content_stack.currentWidget() is window.setup_workspace
+    assert window.content_stack.currentWidget() is window.transfer_workspace
     window.new_task_button.click()
-    assert window.content_stack.currentWidget() is window.setup_workspace
+    assert window.content_stack.currentWidget() is window.transfer_workspace
 
 
 def test_background_event_does_not_overwrite_selected_task(qtbot):
@@ -164,7 +164,7 @@ def test_recovery_state_explains_checkpoint_and_source_safety(qtbot):
 
     assert page.recovery_card.isHidden() is False
     assert "检查点" in page.recovery_label.text()
-    assert "不会删除源文件" in page.recovery_label.text()
+    assert "不会处理源文件" in page.recovery_label.text()
     assert page.pause_button.isEnabled() is True
 
 

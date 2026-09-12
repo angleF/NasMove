@@ -93,6 +93,16 @@ class TargetPage(QWidget):
             raise InvalidRemotePath("请先选择 NAS 目标目录")
         return self._selected_path
 
+    def clear_selection(self) -> None:
+        self._selected_path = None
+        self._current_path = None
+        self.entries_list.clear()
+        self.selected_path_label.setText("尚未选择")
+        self.location_label.setText("共享目录根目录")
+        self.add_to_queue_button.setEnabled(False)
+        self._update_navigation_state()
+        self.target_changed.emit(None)
+
     def set_selected_path(self, value: str | RemotePath) -> None:
         path = value if isinstance(value, RemotePath) else normalize_remote_path(value)
         self._current_path = path

@@ -10,9 +10,9 @@ from pathlib import Path
 
 import pytest
 
-from nasmove.core.errors import ConcurrentStateChange, InvalidTransition
+from nasmove.core.errors import ConcurrentStateChange, ConnectionProfileInUse, InvalidTransition
 from nasmove.core.model import Checkpoint, ConnectionProfileId, RemotePath, TaskId, TransferItemId
-from nasmove.core.states import ItemState, TaskState, TransferAction
+from nasmove.core.states import ConflictPolicy, ItemState, TaskState, TransferAction
 from nasmove.persistence.sqlite_repository import SqliteTaskRepository
 from tests.fixtures.builders import build_task_record, build_transfer_item_record
 
@@ -85,6 +85,23 @@ def test_task_and_item_round_trip_preserves_all_fields(tmp_path) -> None:
     repository.close()
 
 
+@pytest.mark.parametrize("policy", list(ConflictPolicy))
+def test_task_round_trip_preserves_conflict_strategy(
+    tmp_path, policy: ConflictPolicy
+) -> None:
+    repository = SqliteTaskRepository(tmp_path / f"{policy.value}.db")
+    task = replace(
+        build_task_record(),
+        id=TaskId(f"task-{policy.value}"),
+        conflict_policy=policy,
+    )
+
+    repository.create_task(task, [])
+
+    assert repository.get_task(task.id).conflict_policy is policy
+    repository.close()
+
+
 def test_last_successful_connection_round_trips_without_a_task(tmp_path) -> None:
     repository = SqliteTaskRepository(tmp_path / "profiles.db")
     config = replace(
@@ -99,6 +116,78 @@ def test_last_successful_connection_round_trips_without_a_task(tmp_path) -> None
     repository.save_successful_connection(config)
 
     assert repository.last_successful_connection() == config
+    repository.close()
+
+
+def test_task_uses_parallel_item_snapshot_after_profile_update(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "parallel-item-snapshot.db")
+    profile = replace(build_task_record().connection, max_parallel_items=4)
+    task = build_task_record(connection=profile)
+    repository.create_task(task, [build_transfer_item_record()])
+    repository.save_successful_connection(replace(profile, max_parallel_items=1))
+
+    assert repository.get_connection_profile(profile.profile_id).max_parallel_items == 1
+    assert repository.get_task(task.id).connection.max_parallel_items == 4
+    repository.close()
+
+
+def test_connection_profiles_list_get_archive_and_reactivate(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "profile-lifecycle.db")
+    original = replace(
+        build_task_record().connection,
+        profile_id=ConnectionProfileId("home-nas"),
+        display_name="家庭 NAS",
+        host="nas.home",
+    )
+    other = replace(
+        original,
+        profile_id=ConnectionProfileId("office-nas"),
+        display_name="办公 NAS",
+        host="nas.office",
+    )
+    repository.save_successful_connection(original)
+    repository.save_successful_connection(other)
+
+    assert repository.get_connection_profile(original.profile_id) == original
+    assert repository.list_connection_profiles() == (other, original)
+
+    repository.archive_connection_profile(original.profile_id)
+
+    assert repository.list_connection_profiles() == (other,)
+    with pytest.raises(KeyError):
+        repository.get_connection_profile(original.profile_id)
+
+    reactivated = replace(original, display_name="家庭存储")
+    repository.save_successful_connection(reactivated)
+    assert repository.get_connection_profile(original.profile_id) == reactivated
+    assert repository.list_connection_profiles() == (reactivated, other)
+    repository.close()
+
+
+def test_connection_profile_archive_is_blocked_by_incomplete_task(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "active-profile.db")
+    task = build_task_record()
+    repository.create_task(task, [build_transfer_item_record()])
+
+    with pytest.raises(ConnectionProfileInUse):
+        repository.archive_connection_profile(task.connection.profile_id)
+
+    assert repository.get_connection_profile(task.connection.profile_id) == task.connection
+    repository.close()
+
+
+def test_connection_profile_archive_preserves_terminal_task_history(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "terminal-profile.db")
+    task = build_task_record()
+    repository.create_task(task, [build_transfer_item_record()])
+    repository.transition_task(task.id, TaskState.DRAFT, TaskState.CANCELED)
+
+    repository.archive_connection_profile(task.connection.profile_id)
+
+    assert repository.get_task(task.id).connection == task.connection
+    assert repository.get_item(build_transfer_item_record().id).task_id == task.id
+    with pytest.raises(KeyError):
+        repository.get_connection_profile(task.connection.profile_id)
     repository.close()
 
 
@@ -583,7 +672,7 @@ def test_empty_existing_database_is_initialized(tmp_path) -> None:
     repository = SqliteTaskRepository(path)
     repository.close()
     raw = sqlite3.connect(path)
-    assert raw.execute("SELECT value FROM schema_meta WHERE key = 'version'").fetchone()[0] == "3"
+    assert raw.execute("SELECT value FROM schema_meta WHERE key = 'version'").fetchone()[0] == "7"
     assert len(raw.execute("SELECT value FROM schema_meta WHERE key = 'schema_hash'").fetchone()[0]) == 64
     raw.close()
 
@@ -787,3 +876,53 @@ def test_new_database_paths_have_no_acl_and_private_modes(tmp_path) -> None:
             env={"LC_ALL": "C"},
             check=False,
         )
+
+
+def test_deletion_outcome_is_persisted_and_readable(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "nasmove.db")
+    task = build_task_record()
+    item = _item("item-deletion", task.id)
+    repository.create_task(task, [item])
+
+    repository.record_deletion_outcome(
+        task.id,
+        item.id,
+        "source_retained_move_failed",
+        "moving source to Trash failed: trash denied",
+    )
+
+    assert repository.last_deletion_outcome(item.id) == (
+        "source_retained_move_failed",
+        "moving source to Trash failed: trash denied",
+    )
+    repository.close()
+
+
+def test_last_deletion_outcome_is_scoped_to_the_item(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "nasmove.db")
+    task = build_task_record()
+    first = _item("item-first", task.id)
+    second = _item("item-second", task.id)
+    repository.create_task(task, [first, second])
+
+    repository.record_deletion_outcome(task.id, first.id, "source_deleted", "done")
+    repository.record_deletion_outcome(task.id, second.id, "source_missing_after_move", "absent")
+
+    assert repository.last_deletion_outcome(first.id) == ("source_deleted", "done")
+    assert repository.last_deletion_outcome(second.id) == ("source_missing_after_move", "absent")
+    repository.close()
+
+
+def test_last_deletion_outcome_for_task_is_the_newest_across_items(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "nasmove.db")
+    task = build_task_record()
+    first = _item("item-first", task.id)
+    second = _item("item-second", task.id)
+    repository.create_task(task, [first, second])
+
+    repository.record_deletion_outcome(task.id, first.id, "source_deleted", "done")
+    repository.record_deletion_outcome(task.id, second.id, "deletion_refused", "refused")
+
+    assert repository.last_deletion_outcome_for_task(task.id) == ("deletion_refused", "refused")
+    assert repository.last_deletion_outcome_for_task(TaskId("task-absent")) is None
+    repository.close()

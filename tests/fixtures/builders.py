@@ -37,13 +37,14 @@ def result_with_source_retained(name: str) -> TaskResult:
     return TaskResult(True, TaskState.COMPLETED_WITH_WARNINGS, warnings=("源文件仍保留",))
 
 
-def build_connection_config() -> ConnectionConfig:
+def build_connection_config(*, max_parallel_items: int = 2) -> ConnectionConfig:
     return ConnectionConfig(
         profile_id=ConnectionProfileId("connection-profile-1"),
         display_name="Primary NAS",
         host="nas.example.test",
         share="data",
         username="operator",
+        max_parallel_items=max_parallel_items,
     )
 
 
@@ -51,13 +52,13 @@ def build_source_fingerprint() -> SourceFingerprint:
     return SourceFingerprint(device=1, inode=2, kind=SourceKind.FILE, size=1024, mtime_ns=1)
 
 
-def build_task_record() -> TaskRecord:
+def build_task_record(*, connection: ConnectionConfig | None = None) -> TaskRecord:
     now = datetime.now(UTC)
     return TaskRecord(
         id=TaskId("task-1"),
         name="Copy data",
         action=TransferAction.COPY,
-        connection=build_connection_config(),
+        connection=connection or build_connection_config(),
         target_root=RemotePath("target"),
         conflict_policy=ConflictPolicy.AUTO_RENAME,
         verification_policy=VerificationPolicy.FULL,

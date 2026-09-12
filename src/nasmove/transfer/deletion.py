@@ -23,6 +23,17 @@ from nasmove.localio.hashing import sha256_stream
 
 _EMPTY_HASH = hashlib.sha256().hexdigest()
 
+# Human-readable diagnosis for the durable deletion outcome record. The code is
+# stored in ``events.error_code`` and the text in ``events.summary``.
+_REASON_SUMMARY = {
+    "source_deleted": "source moved to system Trash",
+    "source_already_done": "source deletion was already recorded",
+    "source_already_absent": "source was already absent; committed target verified",
+    "source_missing_after_move": "source was absent after a reported Trash failure; committed target verified",
+    "source_retained_move_failed": "moving source to Trash failed",
+    "source_retained_still_exists": "source still exists after the Trash operation",
+}
+
 
 class TaskRepository(Protocol):
     def get_task(self, task_id: object) -> TaskRecord: ...
@@ -39,11 +50,7 @@ class LocalFileGateway(Protocol):
 
     def open_read(self, path: Path) -> AbstractContextManager[BinaryIO]: ...
 
-    def remove_file(
-        self, path: Path, expected_fingerprint: SourceFingerprint | None = None
-    ) -> None: ...
-
-    def remove_empty_dir(
+    def move_to_trash(
         self, path: Path, expected_fingerprint: SourceFingerprint | None = None
     ) -> None: ...
 
@@ -72,6 +79,7 @@ class DeletionResult:
     already_absent: bool = False
     directories_removed: tuple[Path, ...] = ()
     warnings: tuple[str, ...] = ()
+    reason: str = ""
 
     @property
     def item_state(self) -> ItemState:
@@ -83,7 +91,7 @@ class DeletionResult:
 
 
 class SourceDeletionService:
-    """Delete local sources only after re-checking the committed target."""
+    """Move local sources to Trash only after re-checking the committed target."""
 
     _DELETABLE_STATES = frozenset(
         {ItemState.COMMITTED, ItemState.SOURCE_DELETE_AUTHORIZED, ItemState.SOURCE_RETAINED}
@@ -106,9 +114,24 @@ class SourceDeletionService:
     def delete_verified_source(
         self, item_id: TransferItemId, session: SessionInfo
     ) -> DeletionResult:
+        try:
+            result = self._delete_verified_source(item_id, session)
+        except UnsafeSourceDeletion as error:
+            # A refused deletion would otherwise leave the item retained with no
+            # recorded reason at all; record why, then re-raise unchanged.
+            self._record_refusal(item_id, error)
+            raise
+        self._record_outcome(result)
+        return result
+
+    def _delete_verified_source(
+        self, item_id: TransferItemId, session: SessionInfo
+    ) -> DeletionResult:
         item = self._repository.get_item(item_id)
         if item.state is ItemState.DONE:
-            return DeletionResult(item.id, ItemState.DONE, True, already_absent=True)
+            return DeletionResult(
+                item.id, ItemState.DONE, True, already_absent=True, reason="source_already_done"
+            )
         if item.state not in self._DELETABLE_STATES:
             raise UnsafeSourceDeletion("only committed items may delete a source")
         try:
@@ -122,20 +145,7 @@ class SourceDeletionService:
         source_fingerprint = self._read_source_fingerprint(item)
         target_stat, target_hash = self._read_verified_target(item, session)
         if source_fingerprint is None:
-            if item.full_hash_verified is not True or item.sha256 is None:
-                raise UnsafeSourceDeletion("full verification is required before recovery")
-            if target_hash != item.sha256:
-                raise UnsafeSourceDeletion("missing source has a mismatching committed target")
-            current = self._repository.get_item(item.id)
-            if current != item:
-                raise UnsafeSourceDeletion("task item changed while recovery was being checked")
-            if current.state is ItemState.SOURCE_RETAINED:
-                self._repository.transition_item(
-                    current.id, ItemState.SOURCE_RETAINED, ItemState.SOURCE_DELETE_AUTHORIZED
-                )
-                current = self._repository.get_item(item.id)
-            self._repository.transition_item(current.id, current.state, ItemState.DONE)
-            return DeletionResult(item.id, ItemState.DONE, True, already_absent=True)
+            return self._recover_missing_source(item, target_hash, "source_already_absent")
 
         if source_fingerprint != item.source_fingerprint:
             raise UnsafeSourceDeletion("source changed before deletion")
@@ -181,19 +191,37 @@ class SourceDeletionService:
         try:
             self._remove_source(current)
         except FileNotFoundError:
+            # The Trash entry may already exist even though the call reported a
+            # miss; only retain the source when it is genuinely still present.
             if self._source_exists(current.source_path):
                 self._retain_source(current)
-                return DeletionResult(current.id, ItemState.SOURCE_RETAINED, False)
+                return DeletionResult(
+                    current.id,
+                    ItemState.SOURCE_RETAINED,
+                    False,
+                    reason="source_retained_move_failed",
+                )
+            return self._recover_missing_source(
+                current, target_hash, "source_missing_after_move", clean_directories=True
+            )
         except RuntimeError:
             self._retain_source(current)
             raise
         except Exception as error:  # noqa: BLE001 - deletion failure is a durable result
+            if not self._source_exists(current.source_path):
+                # Qt can report a failed Trash move after the file has already
+                # left its original path; the durable state must not claim the
+                # source is still retained.  Reuses the reviewed recovery gate.
+                return self._recover_missing_source(
+                    current, target_hash, "source_missing_after_move", clean_directories=True
+                )
             self._retain_source(current)
             return DeletionResult(
                 current.id,
                 ItemState.SOURCE_RETAINED,
                 False,
-                warnings=(f"source deletion failed: {error}",),
+                warnings=(f"moving source to Trash failed: {error}",),
+                reason="source_retained_move_failed",
             )
 
         if self._source_exists(current.source_path):
@@ -202,7 +230,8 @@ class SourceDeletionService:
                 current.id,
                 ItemState.SOURCE_RETAINED,
                 False,
-                warnings=("source still exists after deletion",),
+                warnings=("source still exists after Trash operation",),
+                reason="source_retained_still_exists",
             )
 
         self._repository.transition_item(current.id, ItemState.SOURCE_DELETE_AUTHORIZED, ItemState.DONE)
@@ -213,7 +242,91 @@ class SourceDeletionService:
             True,
             directories_removed=removed_dirs,
             warnings=warnings,
+            reason="source_deleted",
         )
+
+    def _recover_missing_source(
+        self,
+        item: TransferItemRecord,
+        target_hash: str | None,
+        reason: str,
+        *,
+        clean_directories: bool = False,
+    ) -> DeletionResult:
+        """Reuse the reviewed "source is already gone" safety path.
+
+        Every gate here is the one the top-of-method missing-source path has
+        always applied: full hash verification, a non-null stored digest, and a
+        committed target whose digest matches it.  Nothing is weakened.
+
+        ``clean_directories`` restores the baseline behaviour of the
+        post-failure branches, which fell through to the planned-directory
+        cleanup; the entry-time path returned before it and keeps that.
+        """
+        if item.full_hash_verified is not True or item.sha256 is None:
+            raise UnsafeSourceDeletion("full verification is required before recovery")
+        if target_hash != item.sha256:
+            raise UnsafeSourceDeletion("missing source has a mismatching committed target")
+        current = self._repository.get_item(item.id)
+        if current != item:
+            raise UnsafeSourceDeletion("task item changed while recovery was being checked")
+        if current.state is ItemState.SOURCE_RETAINED:
+            self._repository.transition_item(
+                current.id, ItemState.SOURCE_RETAINED, ItemState.SOURCE_DELETE_AUTHORIZED
+            )
+            current = self._repository.get_item(item.id)
+        self._repository.transition_item(current.id, current.state, ItemState.DONE)
+        directories_removed: tuple[Path, ...] = ()
+        warnings: tuple[str, ...] = ()
+        if clean_directories:
+            directories_removed, warnings = self._clean_planned_directories()
+        return DeletionResult(
+            item.id,
+            ItemState.DONE,
+            True,
+            already_absent=True,
+            directories_removed=directories_removed,
+            warnings=warnings,
+            reason=reason,
+        )
+
+    def _record_outcome(self, result: DeletionResult) -> None:
+        """Persist the outcome so a later "why is it retained?" is answerable.
+
+        Diagnostics can never change the deletion outcome: any recorder failure
+        is swallowed and the already-decided result is returned unchanged.
+        """
+        recorder = getattr(self._repository, "record_deletion_outcome", None)
+        if not callable(recorder) or not result.reason:
+            return
+        summary = _REASON_SUMMARY.get(result.reason, result.reason)
+        if result.warnings:
+            summary = f"{summary}: {result.warnings[0]}"
+        try:
+            item = self._repository.get_item(result.item_id)
+            recorder(item.task_id, result.item_id, result.reason, summary)
+        except Exception:  # noqa: BLE001 - the deletion result is already durable
+            return
+
+    def _record_refusal(self, item_id: TransferItemId, error: BaseException) -> None:
+        """Persist why a deletion was refused, then let the refusal propagate.
+
+        Without this the item is left retained with no recorded reason, which is
+        the exact combination the deletion-outcome record exists to prevent.
+        """
+        recorder = getattr(self._repository, "record_deletion_outcome", None)
+        if not callable(recorder):
+            return
+        try:
+            item = self._repository.get_item(item_id)
+            recorder(
+                item.task_id,
+                item_id,
+                "deletion_refused",
+                f"source deletion was refused: {error}",
+            )
+        except Exception:  # noqa: BLE001 - the refusal itself is the durable outcome
+            return
 
     def _read_source_fingerprint(self, item: TransferItemRecord) -> SourceFingerprint | None:
         try:
@@ -318,10 +431,7 @@ class SourceDeletionService:
         return replace(updated, revision=item.revision + 1)
 
     def _remove_source(self, item: TransferItemRecord) -> None:
-        if item.source_fingerprint.kind is SourceKind.EMPTY_DIRECTORY:
-            self._local.remove_empty_dir(item.source_path, item.source_fingerprint)
-        else:
-            self._local.remove_file(item.source_path, item.source_fingerprint)
+        self._local.move_to_trash(item.source_path, item.source_fingerprint)
 
     def _source_exists(self, path: Path) -> bool:
         try:
@@ -347,7 +457,7 @@ class SourceDeletionService:
                 warnings.append(f"source directory retained because it is not empty: {directory}")
                 continue
             try:
-                self._local.remove_empty_dir(directory)
+                self._local.move_to_trash(directory)
             except FileNotFoundError:
                 continue
             except OSError as error:

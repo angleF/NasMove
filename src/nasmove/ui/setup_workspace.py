@@ -1,15 +1,12 @@
 from __future__ import annotations
 
-from collections.abc import Callable
-
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QFrame,
-    QGridLayout,
     QHBoxLayout,
     QLabel,
     QPushButton,
-    QStackedWidget,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -37,16 +34,19 @@ class SetupWorkspace(QWidget):
         self.source_page = source_page
         self.target_page = target_page
         self._connection_verified = False
+        self._creating = False
 
         self.connection_summary = QLabel()
         self.source_summary = QLabel()
         self.target_summary = QLabel()
+        self.target_summary.setWordWrap(True)
         self.safety_label = QLabel()
         self.safety_label.setWordWrap(True)
         self.create_button = QPushButton("加入队列")
         self.create_button.setProperty("themeRole", "primary")
         self.create_button.setEnabled(False)
-        self.editor_stack = QStackedWidget()
+        self.readiness_label = QLabel()
+        self.readiness_label.setWordWrap(True)
 
         self._build_ui()
         self._connect_signals()
@@ -56,7 +56,12 @@ class SetupWorkspace(QWidget):
         self._connection_verified = verified
         self.refresh_summary()
 
+    @property
+    def connection_verified(self) -> bool:
+        return self._connection_verified
+
     def refresh_summary(self) -> None:
+        self.reconnect_button.setVisible(not self._connection_verified)
         self.connection_summary.setText(
             "已验证，可安全浏览 NAS 目录" if self._connection_verified else "尚未测试连接"
         )
@@ -68,38 +73,68 @@ class SetupWorkspace(QWidget):
         self.target_summary.setText("尚未选择 NAS 目标目录" if target is None else target)
         self.safety_label.setText(self._safety_text())
         self.create_button.setEnabled(
-            self._connection_verified and source_count > 0 and target is not None
+            not self._creating and self._connection_verified and source_count > 0 and target is not None
+        )
+        self.create_button.setText(
+            "正在创建任务…" if self._creating else
+            "开始移动" if self.source_page.move_checkbox.isChecked() else "开始复制"
+        )
+        missing = []
+        if not self._connection_verified:
+            missing.append("连接 NAS")
+        if not source_count:
+            missing.append("添加文件或文件夹")
+        if target is None:
+            missing.append("选择目标文件夹")
+        self.readiness_label.setText(
+            "请先" + "、".join(missing) if missing else "准备就绪，开始后将自动加入队列处理。"
         )
 
+    def set_creating(self, creating: bool) -> None:
+        self._creating = creating
+        self.source_page.setEnabled(not creating)
+        self.target_page.setEnabled(not creating)
+        self.choose_target_button.setEnabled(not creating)
+        self.refresh_summary()
+
     def _build_ui(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 8, 12, 8)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        content = QWidget()
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(14)
+        scroll.setWidget(content)
+        root.addWidget(scroll, 1)
 
         eyebrow = QLabel("可靠迁移工作区")
         eyebrow.setProperty("themeRole", "muted")
-        title = QLabel("准备一次安全迁移")
+        title = QLabel("将文件复制或移动到 NAS")
         title.setObjectName("workspaceTitle")
-        description = QLabel("完成连接、来源与目标后，即可加入串行任务队列。")
+        description = QLabel("添加本地文件 → 选择目标文件夹 → 开始复制或移动")
+        description.setWordWrap(True)
         description.setProperty("themeRole", "muted")
-        layout.addWidget(eyebrow)
         layout.addWidget(title)
         layout.addWidget(description)
-
-        cards = QGridLayout()
-        cards.setHorizontalSpacing(12)
-        cards.addWidget(
-            self._card("01　连接", self.connection_summary, self._show_connection), 0, 0
-        )
-        cards.addWidget(self._card("02　来源", self.source_summary, self._show_sources), 0, 1)
-        cards.addWidget(self._card("03　目标", self.target_summary, self._show_target), 0, 2)
-        layout.addLayout(cards)
+        self.reconnect_button = QPushButton("连接 NAS／更换账号")
+        self.reconnect_button.clicked.connect(self.edit_connection_requested.emit)
+        layout.addWidget(self.reconnect_button)
 
         self.target_page.add_to_queue_button.hide()
-        self.editor_stack.addWidget(self.connection_page)
-        self.editor_stack.addWidget(self.source_page)
-        self.editor_stack.addWidget(self.target_page)
-        layout.addWidget(self.editor_stack, 1)
+        self.source_page.setMinimumHeight(250)
+        self.source_page.setMaximumHeight(320)
+        self.source_page.list_widget.setMinimumHeight(90)
+        layout.addWidget(self.source_page, 1)
+        target_actions = QHBoxLayout()
+        target_actions.addWidget(QLabel("目标文件夹"))
+        target_actions.addWidget(self.target_summary, 1)
+        self.choose_target_button = QPushButton("选择 NAS 文件夹…")
+        self.choose_target_button.setProperty("themeRole", "secondary")
+        self.choose_target_button.clicked.connect(self._show_target)
+        target_actions.addWidget(self.choose_target_button)
+        layout.addLayout(target_actions)
 
         safety_card = QFrame()
         safety_card.setProperty("themeRole", "surface")
@@ -111,23 +146,10 @@ class SetupWorkspace(QWidget):
         layout.addWidget(safety_card)
 
         actions = QHBoxLayout()
+        actions.addWidget(self.readiness_label, 1)
         actions.addStretch()
         actions.addWidget(self.create_button)
-        layout.addLayout(actions)
-
-    def _card(self, title: str, summary: QLabel, callback: Callable[[], None]) -> QFrame:
-        card = QFrame()
-        card.setProperty("themeRole", "surface")
-        layout = QVBoxLayout(card)
-        button = QPushButton(title)
-        button.setObjectName("setupCard-" + title[:2])
-        button.setAccessibleName(title)
-        button.clicked.connect(callback)
-        summary.setWordWrap(True)
-        summary.setProperty("themeRole", "muted")
-        layout.addWidget(button)
-        layout.addWidget(summary)
-        return card
+        root.addLayout(actions)
 
     def _connect_signals(self) -> None:
         self.connection_page.report_ready.connect(self._connection_reported)
@@ -141,18 +163,15 @@ class SetupWorkspace(QWidget):
         self.set_connection_verified(bool(getattr(report, "success", False)))
 
     def _show_connection(self) -> None:
-        self.editor_stack.setCurrentWidget(self.connection_page)
         self.edit_connection_requested.emit()
 
     def show_connection_editor(self) -> None:
         self._show_connection()
 
     def _show_sources(self) -> None:
-        self.editor_stack.setCurrentWidget(self.source_page)
         self.edit_sources_requested.emit()
 
     def _show_target(self) -> None:
-        self.editor_stack.setCurrentWidget(self.target_page)
         self.edit_target_requested.emit()
 
     def _request_creation(self) -> None:
@@ -167,8 +186,8 @@ class SetupWorkspace(QWidget):
 
     def _safety_text(self) -> str:
         if self.source_page.move_checkbox.isChecked():
-            return "安全移动：复制 → 完整回读校验 → 原子提交 → 删除源文件"
-        return "复制：复制 → 完整回读校验 → 原子提交；不会删除源文件"
+            return "安全移动：复制 → 完整回读校验 → 原子提交 → 移入废纸篓"
+        return "复制：复制 → 完整回读校验 → 原子提交；不会处理源文件"
 
 
 __all__ = ["SetupWorkspace"]

@@ -94,17 +94,29 @@ class IntegrityVerifier:
         self._session = session
         self._progress = progress
 
-    def verify_full(self, item: TransferItemRecord) -> VerificationResult:
+    def verify_full(
+        self,
+        item: TransferItemRecord,
+        token: object | None = None,
+    ) -> VerificationResult:
+        self._raise_if_stopped(token)
         expected = item.source_fingerprint
         if expected.kind is SourceKind.EMPTY_DIRECTORY:
-            return self._verify_empty_directory(item)
+            return self._verify_empty_directory(item, token)
         before = self._local.fingerprint(item.source_path)
+        self._raise_if_stopped(token)
         with self._local.open_read(item.source_path) as source:
             source.seek(0)
-            source_result = sha256_stream(source)
+            source_result = sha256_stream(
+                source,
+                progress=lambda _offset: self._raise_if_stopped(token),
+            )
+        self._raise_if_stopped(token)
 
         with self._lease():
+            self._raise_if_stopped(token)
             remote_stat = self._smb.stat(item.temp_path)
+            self._raise_if_stopped(token)
             if remote_stat is None or remote_stat.is_directory:
                 remote_result = HashResult(_EMPTY_HASH, 0)
                 after_remote_stat = remote_stat
@@ -112,11 +124,17 @@ class IntegrityVerifier:
                 with self._smb.open_read(item.temp_path) as remote:
                     remote.seek(0)
                     callback = self._progress
-                    remote_result = sha256_stream(remote, progress=(
-                        None if callback is None else lambda offset: callback(item, offset)
-                    ))
+                    def report_progress(offset: int) -> None:
+                        self._raise_if_stopped(token)
+                        if callback is not None:
+                            callback(item, offset)
+                        self._raise_if_stopped(token)
+
+                    remote_result = sha256_stream(remote, progress=report_progress)
+                self._raise_if_stopped(token)
                 after_remote_stat = self._smb.stat(item.temp_path)
 
+        self._raise_if_stopped(token)
         after = self._local.fingerprint(item.source_path)
         source_unchanged = before == expected and after == expected
         remote_exists = after_remote_stat is not None and not after_remote_stat.is_directory
@@ -158,22 +176,32 @@ class IntegrityVerifier:
             ),
         )
 
-    def _verify_empty_directory(self, item: TransferItemRecord) -> VerificationResult:
+    def _verify_empty_directory(
+        self,
+        item: TransferItemRecord,
+        token: object | None,
+    ) -> VerificationResult:
         expected = item.source_fingerprint
+        self._raise_if_stopped(token)
         before = self._local.fingerprint(item.source_path)
         with self._lease():
+            self._raise_if_stopped(token)
             remote_before = self._smb.stat(item.temp_path)
+            self._raise_if_stopped(token)
             entries_before = (
                 self._smb.list_dir(item.temp_path)
                 if remote_before is not None and remote_before.is_directory
                 else [RemoteEntry("invalid", False, 0)]
             )
+            self._raise_if_stopped(token)
             remote_after = self._smb.stat(item.temp_path)
+            self._raise_if_stopped(token)
             entries_after = (
                 self._smb.list_dir(item.temp_path)
                 if remote_after is not None and remote_after.is_directory
                 else [RemoteEntry("invalid", False, 0)]
             )
+        self._raise_if_stopped(token)
         after = self._local.fingerprint(item.source_path)
         stable_remote_identity = (
             remote_before is not None
@@ -205,6 +233,17 @@ class IntegrityVerifier:
                 else None
             ),
         )
+
+    @staticmethod
+    def _raise_if_stopped(token: object | None) -> None:
+        if token is None:
+            return
+        for name in ("cancel_requested", "pause_requested"):
+            value = getattr(token, name, False)
+            if callable(value):
+                value = value()
+            if type(value) is bool and value:
+                raise InterruptedError("verification stopped")
 
     def _lease(self) -> AbstractContextManager[None]:
         generation = self._session.session_generation

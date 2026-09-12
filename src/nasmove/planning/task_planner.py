@@ -5,14 +5,19 @@ import sqlite3
 import stat
 import tempfile
 import uuid
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from errno import ELOOP, ENOENT, ENOTDIR
 from pathlib import Path, PurePosixPath
+from threading import Event
 from typing import Protocol
 
-from nasmove.core.errors import DomainValidationError
+from nasmove.core.errors import (
+    ConflictResolutionRequired,
+    DomainValidationError,
+    PreflightCancelled,
+)
 from nasmove.core.model import (
     ConnectionConfig,
     RemotePath,
@@ -113,10 +118,59 @@ class PlannedTask:
     safety_margin: int
     required_space: int
     free_space: int
+    conflict_count: int = 0
 
     @property
     def task_record(self) -> TaskRecord:
         return self.task
+
+
+@dataclass(frozen=True, slots=True)
+class PreflightProgress:
+    item_count: int
+    total_files: int
+    total_bytes: int
+    current_path: Path
+
+
+class PreflightCancellation:
+    def __init__(self) -> None:
+        self._event = Event()
+
+    def cancel(self) -> None:
+        self._event.set()
+
+    @property
+    def cancelled(self) -> bool:
+        return self._event.is_set()
+
+
+class PreflightSession:
+    def __init__(
+        self,
+        *,
+        request: PlanRequest,
+        summary: PlannedTask,
+        spool_directory: tempfile.TemporaryDirectory[str],
+        spool_path: Path,
+        owner_token: object,
+    ) -> None:
+        self.request = request
+        self.summary = summary
+        self.spool_path = spool_path
+        self._spool_directory = spool_directory
+        self._owner_token = owner_token
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        return self._closed
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._spool_directory.cleanup()
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,53 +195,131 @@ class TaskPlanner:
         self._local = local_gateway
         self._smb = smb_gateway
         self._repository = repository
+        self._owner_token = object()
 
     def plan(self, request: PlanRequest) -> PlannedTask:
+        session = self.preflight(request)
+        if self._repository is None:
+            summary = session.summary
+            session.close()
+            return summary
+        return self.confirm_preflight(session)
+
+    def preflight(
+        self,
+        request: PlanRequest,
+        *,
+        cancellation: PreflightCancellation | None = None,
+        on_progress: Callable[[PreflightProgress], None] | None = None,
+    ) -> PreflightSession:
+        cancellation = cancellation or PreflightCancellation()
+        self._raise_if_cancelled(cancellation)
         sources = self._validate_sources(request.sources)
         task_id = request.task_id or TaskId(str(uuid.uuid4()))
-        with tempfile.TemporaryDirectory(prefix="nasmove-plan-") as spool_dir:
-            database = sqlite3.connect(Path(spool_dir) / "items.sqlite3")
-            try:
-                self._create_spool(database)
-                total_bytes, total_files, item_count = self._scan_to_spool(database, sources)
-                safety_margin = max(self.SAFETY_MINIMUM, (total_bytes * 5 + 99) // 100)
-                required_space = total_bytes + safety_margin
-                free_space = self._smb.free_space(request.target_root)
-                if free_space < required_space:
-                    raise DomainValidationError("insufficient NAS free space for planned transfer")
-                now = datetime.now(UTC)
-                task = TaskRecord(
-                    id=task_id,
-                    name=request.name,
-                    action=request.action,
-                    connection=request.connection,
-                    target_root=request.target_root,
-                    conflict_policy=request.conflict_policy,
-                    verification_policy=request.verification_policy,
-                    state=TaskState.PREFLIGHT,
-                    queue_position=request.queue_position,
-                    recovery_generation=1,
-                    total_files=total_files,
-                    total_bytes=total_bytes,
-                    copied_bytes=0,
-                    verified_bytes=0,
-                    revision=0,
-                    created_at=now,
-                    updated_at=now,
+        spool_directory = tempfile.TemporaryDirectory(prefix="nasmove-preflight-")
+        spool_path = Path(spool_directory.name) / "items.sqlite3"
+        database = sqlite3.connect(spool_path)
+        completed = False
+        try:
+            self._create_spool(database)
+            _scanned_bytes, _scanned_files, item_count = self._scan_to_spool(
+                database,
+                sources,
+                cancellation=cancellation,
+                on_progress=on_progress,
+            )
+            conflict_count = self._plan_spooled_items(
+                database, request, task_id, cancellation
+            )
+            total_bytes, total_files = self._planned_totals(database)
+            safety_margin = max(self.SAFETY_MINIMUM, (total_bytes * 5 + 99) // 100)
+            required_space = total_bytes + safety_margin
+            self._raise_if_cancelled(cancellation)
+            free_space = self._smb.free_space(request.target_root)
+            self._raise_if_cancelled(cancellation)
+            if free_space < required_space:
+                raise DomainValidationError("insufficient NAS free space for planned transfer")
+            now = datetime.now(UTC)
+            task = TaskRecord(
+                id=task_id,
+                name=request.name,
+                action=request.action,
+                connection=request.connection,
+                target_root=request.target_root,
+                conflict_policy=request.conflict_policy,
+                verification_policy=request.verification_policy,
+                state=TaskState.PREFLIGHT,
+                queue_position=request.queue_position,
+                recovery_generation=1,
+                total_files=total_files,
+                total_bytes=total_bytes,
+                copied_bytes=0,
+                verified_bytes=0,
+                revision=0,
+                created_at=now,
+                updated_at=now,
+            )
+            summary = PlannedTask(
+                task,
+                item_count,
+                total_bytes,
+                safety_margin,
+                required_space,
+                free_space,
+                conflict_count,
+            )
+            completed = True
+            return PreflightSession(
+                request=request,
+                summary=summary,
+                spool_directory=spool_directory,
+                spool_path=spool_path,
+                owner_token=self._owner_token,
+            )
+        finally:
+            database.close()
+            if not completed:
+                spool_directory.cleanup()
+
+    def confirm_preflight(self, session: PreflightSession) -> PlannedTask:
+        self._validate_session(session)
+        if self._repository is None:
+            session.close()
+            raise DomainValidationError("task repository is required to confirm preflight")
+        database = sqlite3.connect(session.spool_path)
+        try:
+            items = _TrackedItems(
+                self._iter_spooled_items(database, session.summary.task.id)
+            )
+            self._repository.create_task(session.summary.task, items)
+            if not items.exhausted:
+                raise DomainValidationError(
+                    "task repository did not consume all planned items"
                 )
-                if self._repository is not None:
-                    index = _DiskConflictIndex(database, self._smb)
-                    items = _TrackedItems(self._iter_spooled_items(database, request, task_id, index))
-                    self._repository.create_task(task, items)
-                    if not items.exhausted:
-                        raise DomainValidationError("task repository did not consume all planned items")
-                return PlannedTask(task, item_count, total_bytes, safety_margin, required_space, free_space)
-            finally:
-                database.close()
+            return session.summary
+        finally:
+            database.close()
+            session.close()
+
+    def cancel_preflight(self, session: PreflightSession) -> None:
+        if session._owner_token is not self._owner_token:
+            raise DomainValidationError("preflight session belongs to another planner")
+        session.close()
+
+    def _validate_session(self, session: PreflightSession) -> None:
+        if session._owner_token is not self._owner_token:
+            raise DomainValidationError("preflight session belongs to another planner")
+        if session.closed:
+            raise PreflightCancelled("preflight session is no longer available")
+
+    @staticmethod
+    def _raise_if_cancelled(cancellation: PreflightCancellation) -> None:
+        if cancellation.cancelled:
+            raise PreflightCancelled("preflight was cancelled")
 
     @staticmethod
     def _create_spool(database: sqlite3.Connection) -> None:
-        database.execute(
+        database.executescript(
             """CREATE TABLE items (
                 sequence INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_key TEXT NOT NULL,
@@ -199,16 +331,39 @@ class TaskPlanner:
                 size INTEGER NOT NULL,
                 mtime_ns INTEGER NOT NULL,
                 state TEXT NOT NULL
-            )"""
+            );
+            CREATE TABLE planned_items (
+                sequence INTEGER PRIMARY KEY,
+                item_id TEXT NOT NULL,
+                source_path TEXT NOT NULL,
+                relative_path TEXT NOT NULL,
+                final_path TEXT NOT NULL,
+                temp_path TEXT NOT NULL,
+                device INTEGER NOT NULL,
+                inode INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                size INTEGER NOT NULL,
+                mtime_ns INTEGER NOT NULL,
+                state TEXT NOT NULL
+            );"""
         )
         database.commit()
 
-    def _scan_to_spool(self, database: sqlite3.Connection, sources: Sequence[Path]) -> tuple[int, int, int]:
+    def _scan_to_spool(
+        self,
+        database: sqlite3.Connection,
+        sources: Sequence[Path],
+        *,
+        cancellation: PreflightCancellation,
+        on_progress: Callable[[PreflightProgress], None] | None,
+    ) -> tuple[int, int, int]:
         total_bytes = 0
         total_files = 0
         item_count = 0
         for source in sources:
+            self._raise_if_cancelled(cancellation)
             for discovered in self._scan(source):
+                self._raise_if_cancelled(cancellation)
                 database.execute(
                     "INSERT INTO items(source_key, source_path, relative_path, device, inode, kind, size, mtime_ns, state) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -228,35 +383,114 @@ class TaskPlanner:
                 if discovered.state is ItemState.PLANNED and discovered.fingerprint.kind is SourceKind.FILE:
                     total_bytes += discovered.fingerprint.size
                     total_files += 1
+                if on_progress is not None:
+                    on_progress(
+                        PreflightProgress(
+                            item_count=item_count,
+                            total_files=total_files,
+                            total_bytes=total_bytes,
+                            current_path=discovered.path,
+                        )
+                    )
+                self._raise_if_cancelled(cancellation)
         database.commit()
         return total_bytes, total_files, item_count
 
-    def _iter_spooled_items(
+    def _plan_spooled_items(
         self,
         database: sqlite3.Connection,
         request: PlanRequest,
         task_id: TaskId,
-        index: _DiskConflictIndex,
-    ) -> Iterator[TransferItemRecord]:
+        cancellation: PreflightCancellation,
+    ) -> int:
+        conflict_index = _DiskConflictIndex(database, self._smb)
+        conflict_count = 0
+        for sequence, discovered in self._iter_spooled_discoveries(database):
+            self._raise_if_cancelled(cancellation)
+            item, item_conflict_count = self._make_item(
+                request, discovered, conflict_index, task_id
+            )
+            conflict_count += item_conflict_count
+            database.execute(
+                "INSERT INTO planned_items(sequence, item_id, source_path, relative_path, final_path, "
+                "temp_path, device, inode, kind, size, mtime_ns, state) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    sequence,
+                    str(item.id),
+                    str(item.source_path),
+                    item.relative_path.as_posix(),
+                    item.final_path.value,
+                    item.temp_path.value,
+                    item.source_fingerprint.device,
+                    item.source_fingerprint.inode,
+                    item.source_fingerprint.kind.value,
+                    item.source_fingerprint.size,
+                    item.source_fingerprint.mtime_ns,
+                    item.state.value,
+                ),
+            )
+        database.commit()
+        return conflict_count
+
+    @staticmethod
+    def _planned_totals(database: sqlite3.Connection) -> tuple[int, int]:
+        row = database.execute(
+            "SELECT COALESCE(SUM(size), 0), COUNT(*) FROM planned_items "
+            "WHERE state = ? AND kind = ?",
+            (ItemState.PLANNED.value, SourceKind.FILE.value),
+        ).fetchone()
+        return int(row[0]), int(row[1])
+
+    @staticmethod
+    def _iter_spooled_discoveries(
+        database: sqlite3.Connection,
+    ) -> Iterator[tuple[int, _Discovered]]:
         rows = database.execute(
-            "SELECT source_key, source_path, relative_path, device, inode, kind, size, mtime_ns, state "
-            "FROM items ORDER BY source_key, relative_path, sequence"
+            "SELECT sequence, source_key, source_path, relative_path, device, inode, kind, size, "
+            "mtime_ns, state FROM items ORDER BY source_key, relative_path, sequence"
         )
         for row in rows:
-            discovered = _Discovered(
-                source_key=row[0],
-                path=Path(row[1]),
-                relative_path=PurePosixPath(row[2]),
+            yield row[0], _Discovered(
+                source_key=row[1],
+                path=Path(row[2]),
+                relative_path=PurePosixPath(row[3]),
                 fingerprint=SourceFingerprint(
-                    device=row[3],
-                    inode=row[4],
-                    kind=SourceKind(row[5]),
-                    size=row[6],
-                    mtime_ns=row[7],
+                    device=row[4],
+                    inode=row[5],
+                    kind=SourceKind(row[6]),
+                    size=row[7],
+                    mtime_ns=row[8],
                 ),
-                state=ItemState(row[8]),
+                state=ItemState(row[9]),
             )
-            yield self._make_item(request, discovered, index, task_id)
+
+    def _iter_spooled_items(
+        self,
+        database: sqlite3.Connection,
+        task_id: TaskId,
+    ) -> Iterator[TransferItemRecord]:
+        rows = database.execute(
+            "SELECT item_id, source_path, relative_path, final_path, temp_path, device, inode, kind, "
+            "size, mtime_ns, state FROM planned_items ORDER BY sequence"
+        )
+        for row in rows:
+            yield TransferItemRecord(
+                id=TransferItemId(row[0]),
+                task_id=task_id,
+                source_path=Path(row[1]),
+                relative_path=PurePosixPath(row[2]),
+                final_path=RemotePath(row[3]),
+                temp_path=RemotePath(row[4]),
+                source_fingerprint=SourceFingerprint(
+                    device=row[5],
+                    inode=row[6],
+                    kind=SourceKind(row[7]),
+                    size=row[8],
+                    mtime_ns=row[9],
+                ),
+                state=ItemState(row[10]),
+            )
 
     @staticmethod
     def _validate_sources(sources: Sequence[Path]) -> tuple[Path, ...]:
@@ -429,9 +663,11 @@ class TaskPlanner:
         discovered: _Discovered,
         conflict_index: _DiskConflictIndex,
         task_id: TaskId,
-    ) -> TransferItemRecord:
+    ) -> tuple[TransferItemRecord, int]:
         relative_parts = tuple(discovered.relative_path.parts)
         target_parts: list[str] = []
+        conflict_count = 0
+        item_state = discovered.state
         for component_index, source_name in enumerate(relative_parts):
             source_prefix = relative_parts[: component_index + 1]
             parent = request.target_root.value
@@ -441,10 +677,35 @@ class TaskPlanner:
             mapped_name = conflict_index.mapping(discovered.source_key, prefix)
             if mapped_name is None:
                 conflict_index.ensure_parent(parent)
+
                 def is_occupied(key: str, target_parent: str = parent) -> bool:
                     return conflict_index.occupied(target_parent, key)
 
-                mapped_name = allocate_name_with_index(source_name, is_occupied)
+                collision = is_occupied(conflict_key(source_name))
+                is_leaf = component_index == len(relative_parts) - 1
+                if not collision:
+                    mapped_name = source_name
+                elif request.conflict_policy is ConflictPolicy.KEEP_BOTH:
+                    mapped_name = allocate_name_with_index(source_name, is_occupied)
+                elif not is_leaf:
+                    mapped_name = source_name
+                elif request.conflict_policy is ConflictPolicy.ASK:
+                    raise ConflictResolutionRequired(
+                        RemotePath(f"{parent}/{source_name}")
+                    )
+                else:
+                    mapped_name = source_name
+                    if request.conflict_policy is ConflictPolicy.SKIP:
+                        item_state = ItemState.SKIPPED
+                    elif request.conflict_policy is ConflictPolicy.OVERWRITE_IF_NEWER:
+                        remote = self._smb.stat(RemotePath(f"{parent}/{source_name}"))
+                        if (
+                            remote is not None
+                            and discovered.fingerprint.mtime_ns <= remote.modified_ns
+                        ):
+                            item_state = ItemState.SKIPPED
+                if collision:
+                    conflict_count += 1
                 conflict_index.reserve(parent, mapped_name)
                 conflict_index.save_mapping(discovered.source_key, prefix, mapped_name)
             target_parts.append(mapped_name)
@@ -454,15 +715,18 @@ class TaskPlanner:
         temp_path = normalize_remote_path(
             f"{request.target_root.value}/{('/'.join(target_parts[:-1] + [f'.nasmove-{item_id}.part']))}"
         )
-        return TransferItemRecord(
-            id=item_id,
-            task_id=task_id,
-            source_path=discovered.path,
-            relative_path=discovered.relative_path,
-            final_path=final_path,
-            temp_path=temp_path,
-            source_fingerprint=discovered.fingerprint,
-            state=discovered.state,
+        return (
+            TransferItemRecord(
+                id=item_id,
+                task_id=task_id,
+                source_path=discovered.path,
+                relative_path=discovered.relative_path,
+                final_path=final_path,
+                temp_path=temp_path,
+                source_fingerprint=discovered.fingerprint,
+                state=item_state,
+            ),
+            conflict_count,
         )
 
     @staticmethod

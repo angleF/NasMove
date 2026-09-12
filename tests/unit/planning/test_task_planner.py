@@ -8,11 +8,20 @@ from pathlib import Path
 import pytest
 
 import nasmove.planning.task_planner as planner_module
-from nasmove.core.errors import DomainValidationError
+from nasmove.core.errors import (
+    ConflictResolutionRequired,
+    DomainValidationError,
+    PreflightCancelled,
+)
 from nasmove.core.model import ConnectionConfig, ConnectionProfileId, RemotePath
-from nasmove.core.ports import RemoteEntry
-from nasmove.core.states import ItemState, SourceKind
-from nasmove.planning.task_planner import PlannedTask, PlanRequest, TaskPlanner
+from nasmove.core.ports import RemoteEntry, RemoteStat
+from nasmove.core.states import ConflictPolicy, ItemState, SourceKind
+from nasmove.planning.task_planner import (
+    PlannedTask,
+    PlanRequest,
+    PreflightCancellation,
+    TaskPlanner,
+)
 
 
 class LocalGateway:
@@ -193,6 +202,199 @@ def test_space_check_precedes_persistence(tmp_path: Path) -> None:
 
     assert repository.calls == []
     assert repository.persisted == ()
+
+
+def test_preflight_does_not_persist_until_explicit_confirmation(tmp_path: Path) -> None:
+    source = tmp_path / "file.bin"
+    source.write_bytes(b"payload")
+    repository = AtomicRepository()
+    planner = TaskPlanner(LocalGateway(), SmbGateway(), repository)
+
+    session = planner.preflight(
+        PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+    )
+
+    assert repository.calls == []
+    assert session.summary.item_count == 1
+    assert session.spool_path.exists()
+
+    planned = planner.confirm_preflight(session)
+
+    assert repository.calls == ["create_task"]
+    assert planned.item_count == 1
+    assert session.closed is True
+    assert not session.spool_path.exists()
+
+
+def test_canceling_preflight_discards_spool_without_creating_task(tmp_path: Path) -> None:
+    source = tmp_path / "file.bin"
+    source.write_bytes(b"payload")
+    repository = AtomicRepository()
+    planner = TaskPlanner(LocalGateway(), SmbGateway(), repository)
+    session = planner.preflight(
+        PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+    )
+
+    planner.cancel_preflight(session)
+
+    assert session.closed is True
+    assert not session.spool_path.exists()
+    assert repository.calls == []
+    with pytest.raises(PreflightCancelled):
+        planner.confirm_preflight(session)
+
+
+def test_preflight_cancellation_is_observed_during_source_scan(tmp_path: Path) -> None:
+    source = tmp_path / "bulk"
+    source.mkdir()
+    for index in range(10):
+        (source / f"{index}.txt").write_text("payload")
+    repository = AtomicRepository()
+    planner = TaskPlanner(LocalGateway(), SmbGateway(), repository)
+    cancellation = PreflightCancellation()
+    progress = []
+
+    def cancel_after_first_item(snapshot) -> None:
+        progress.append(snapshot)
+        cancellation.cancel()
+
+    with pytest.raises(PreflightCancelled):
+        planner.preflight(
+            PlanRequest("copy", config(), (source,), RemotePath("incoming")),
+            cancellation=cancellation,
+            on_progress=cancel_after_first_item,
+        )
+
+    assert len(progress) == 1
+    assert progress[0].item_count == 1
+    assert repository.calls == []
+
+
+def test_preflight_resolves_conflicts_before_confirmation(tmp_path: Path) -> None:
+    source = tmp_path / "same.txt"
+    source.write_text("payload")
+
+    class ConflictGateway(SmbGateway):
+        def list_dir(self, path: RemotePath) -> list[RemoteEntry]:
+            self.list_calls.append(path.value)
+            return [RemoteEntry("same.txt", False, 7)] if path.value == "incoming" else []
+
+    gateway = ConflictGateway()
+    repository = AtomicRepository()
+    planner = TaskPlanner(LocalGateway(), gateway, repository)
+
+    session = planner.preflight(
+        PlanRequest("copy", config(), (source,), RemotePath("incoming"))
+    )
+    calls_after_preflight = tuple(gateway.list_calls)
+
+    assert session.summary.conflict_count == 1
+    planner.confirm_preflight(session)
+    assert tuple(gateway.list_calls) == calls_after_preflight
+    assert repository.persisted[0].final_path.value == "incoming/same (1).txt"
+
+
+@pytest.mark.parametrize(
+    ("policy", "expected_path", "expected_state"),
+    (
+        (ConflictPolicy.KEEP_BOTH, "incoming/same (1).txt", ItemState.PLANNED),
+        (ConflictPolicy.OVERWRITE, "incoming/same.txt", ItemState.PLANNED),
+        (ConflictPolicy.SKIP, "incoming/same.txt", ItemState.SKIPPED),
+    ),
+)
+def test_preflight_applies_deterministic_conflict_policy(
+    tmp_path: Path,
+    policy: ConflictPolicy,
+    expected_path: str,
+    expected_state: ItemState,
+) -> None:
+    source = tmp_path / "same.txt"
+    source.write_text("payload")
+
+    class ConflictGateway(SmbGateway):
+        def list_dir(self, path: RemotePath) -> list[RemoteEntry]:
+            self.list_calls.append(path.value)
+            return [RemoteEntry("same.txt", False, 7)]
+
+    repository = AtomicRepository()
+    planner = TaskPlanner(LocalGateway(), ConflictGateway(), repository)
+
+    planned = planner.plan(
+        PlanRequest(
+            "copy",
+            config(),
+            (source,),
+            RemotePath("incoming"),
+            conflict_policy=policy,
+        )
+    )
+
+    assert planned.conflict_count == 1
+    assert repository.persisted[0].final_path.value == expected_path
+    assert repository.persisted[0].state is expected_state
+    expected_files = 0 if expected_state is ItemState.SKIPPED else 1
+    assert planned.task.total_files == expected_files
+    assert planned.task.total_bytes == (0 if expected_files == 0 else len("payload"))
+
+
+@pytest.mark.parametrize(
+    ("remote_age_delta", "expected_state"),
+    ((-1, ItemState.PLANNED), (1, ItemState.SKIPPED)),
+)
+def test_overwrite_if_newer_compares_source_and_remote_mtime(
+    tmp_path: Path, remote_age_delta: int, expected_state: ItemState
+) -> None:
+    source = tmp_path / "same.txt"
+    source.write_text("payload")
+
+    class ConflictGateway(SmbGateway):
+        def list_dir(self, path: RemotePath) -> list[RemoteEntry]:
+            self.list_calls.append(path.value)
+            return [RemoteEntry("same.txt", False, 7)]
+
+        def stat(self, path: RemotePath) -> RemoteStat:
+            assert path.value == "incoming/same.txt"
+            return RemoteStat(
+                size=7,
+                is_directory=False,
+                modified_ns=source.stat().st_mtime_ns + remote_age_delta,
+                file_id="remote",
+            )
+
+    repository = AtomicRepository()
+    TaskPlanner(LocalGateway(), ConflictGateway(), repository).plan(
+        PlanRequest(
+            "copy",
+            config(),
+            (source,),
+            RemotePath("incoming"),
+            conflict_policy=ConflictPolicy.OVERWRITE_IF_NEWER,
+        )
+    )
+
+    assert repository.persisted[0].state is expected_state
+
+
+def test_ask_policy_requires_an_explicit_conflict_decision(tmp_path: Path) -> None:
+    source = tmp_path / "same.txt"
+    source.write_text("payload")
+
+    class ConflictGateway(SmbGateway):
+        def list_dir(self, path: RemotePath) -> list[RemoteEntry]:
+            return [RemoteEntry("same.txt", False, 7)]
+
+    with pytest.raises(ConflictResolutionRequired) as raised:
+        TaskPlanner(LocalGateway(), ConflictGateway()).preflight(
+            PlanRequest(
+                "copy",
+                config(),
+                (source,),
+                RemotePath("incoming"),
+                conflict_policy=ConflictPolicy.ASK,
+            )
+        )
+
+    assert raised.value.remote_path == RemotePath("incoming/same.txt")
 
 
 def test_successful_space_check_precedes_persistence(tmp_path: Path) -> None:

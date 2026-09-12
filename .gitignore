@@ -1,9 +1,50 @@
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
+*$py.class
 
+# Distribution / packaging
 build/
 dist/
+*.egg-info/
+*.egg
+.eggs/
+
+# Packaging crash reports
 nuitka-crash-report.xml
 
+# Databases & local runtime locks
+*.db
+*.sqlite
+*.sqlite3
+*.lock
+app.lock
+
+# macOS system files
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Environments & Tools
+.venv/
+env/
+venv/
+.env
+
+# Testing & Coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# IDE & Code Assistance
+.idea/
+.vscode/
+.claude/
 .codegraph/
 graphify-out/
+.superpowers/
+
+# Temporary scratchpad
+scratch/

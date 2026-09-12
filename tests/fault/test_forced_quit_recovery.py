@@ -231,6 +231,12 @@ class ExitLocal:
             os._exit(23)
     def remove_empty_dir(self, path, expected_fingerprint=None):
         return self.base.remove_empty_dir(path, expected_fingerprint)
+    def move_to_trash(self, path, expected_fingerprint=None):
+        # The crash-window test isolates state recovery; use the existing
+        # unlink primitive so it does not leave test artifacts in the user's Trash.
+        self.base.remove_file(path, expected_fingerprint)
+        if window == "delete":
+            os._exit(23)
 
 repository = SqliteTaskRepository(db)
 task_id = TaskId("production-crash")

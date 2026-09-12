@@ -73,6 +73,7 @@ class ConnectionConfig:
     domain: str | None = None
     require_encryption: bool = True
     minimum_dialect: str = "3.0"
+    max_parallel_items: int = 2
 
     def __post_init__(self) -> None:
         for field_name, value in (
@@ -85,6 +86,10 @@ class ConnectionConfig:
                 raise DomainValidationError(f"{field_name} must not be empty")
         if not 1 <= self.port <= 65535:
             raise DomainValidationError("port must be between 1 and 65535")
+        if type(self.max_parallel_items) is not int or not 1 <= self.max_parallel_items <= 4:
+            raise DomainValidationError(
+                "max_parallel_items must be an integer between 1 and 4"
+            )
 
 
 @dataclass(frozen=True, slots=True)

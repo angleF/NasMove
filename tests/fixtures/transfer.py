@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
@@ -10,6 +11,7 @@ from typing import BinaryIO
 
 import pytest
 
+from nasmove.core.errors import SourceFileMissingError
 from nasmove.core.model import (
     Checkpoint,
     RemotePath,
@@ -28,8 +30,15 @@ class TransferLocal:
         self.content = content
         self.trace = trace
         self.remove_calls: list[Path] = []
+        self.trash_calls: list[Path] = []
         self.fingerprint_calls = 0
         self.remove_error: BaseException | None = None
+        # Models the real Qt failure where the source was already moved to the
+        # system Trash but the call still reported failure.
+        self.remove_error_still_moves_source = False
+        # The real gateway raises a typed SourceFileMissingError for a vanished
+        # source; opt in so the mapping chain is exercised end to end.
+        self.missing_source_error: FileNotFoundError | None = None
         self.source_exists = True
         self.cancel_token: TransferToken | None = None
         self.cancel_on_eof = False
@@ -39,17 +48,24 @@ class TransferLocal:
     def open_read(self, path: Path) -> Iterator[BinaryIO]:
         del path
         if not self.source_exists:
-            raise FileNotFoundError("source is absent")
+            raise self._absent_source_error()
         yield _TracingLocalStream(self.content, self.trace, self.cancel_token, self.cancel_on_eof)
 
     def fingerprint(self, path: Path) -> SourceFingerprint:
         del path
         self.fingerprint_calls += 1
         if not self.source_exists:
-            raise FileNotFoundError("source is absent")
+            raise self._absent_source_error()
         if self.fingerprint_override is not None:
             return self.fingerprint_override
         return SourceFingerprint(1, 2, SourceKind.FILE, len(self.content), 1)
+
+    def _absent_source_error(self) -> FileNotFoundError:
+        # Mirror PosixLocalFileGateway, which raises a typed error for a vanished
+        # source, so the mapping chain runs exactly as it does in production.
+        return self.missing_source_error or SourceFileMissingError(
+            errno.ENOENT, "source file is missing"
+        )
 
     def remove_file(
         self, path: Path, expected_fingerprint: SourceFingerprint | None = None
@@ -69,6 +85,22 @@ class TransferLocal:
         self, path: Path, expected_fingerprint: SourceFingerprint | None = None
     ) -> None:
         self.remove_file(path, expected_fingerprint)
+
+    def move_to_trash(
+        self, path: Path, expected_fingerprint: SourceFingerprint | None = None
+    ) -> None:
+        del expected_fingerprint
+        self.trash_calls.append(path)
+        if self.remove_error is not None:
+            error = self.remove_error
+            if isinstance(error, RuntimeError) and str(error) == "injected crash":
+                self.remove_error = None
+            if self.remove_error_still_moves_source:
+                self.source_exists = False
+            raise error
+        if not self.source_exists:
+            raise FileNotFoundError("source is absent")
+        self.source_exists = False
 
     def list_dir(self, path: Path) -> list[Path]:
         del path
@@ -137,6 +169,11 @@ class TransferRemote:
         self.replacement_content = b"corrupted payload"
         self.crash_before_rename = False
         self.crash_after_rename = False
+        self.modified_ns = 0
+        self.disconnect_calls = 0
+
+    def disconnect(self) -> None:
+        self.disconnect_calls += 1
 
     @contextmanager
     def create_exclusive(self, path: RemotePath) -> Iterator[BinaryIO]:
@@ -184,7 +221,12 @@ class TransferRemote:
         if path.value not in self.file_ids:
             self.file_ids[path.value] = f"file-{self.next_file_id}"
             self.next_file_id += 1
-        result = RemoteStat(len(value), False, 0, self.file_ids[path.value])
+        result = RemoteStat(
+            len(value),
+            False,
+            self.modified_ns,
+            self.file_ids[path.value],
+        )
         if self.switch_generation_after_stat:
             self.active_generation += 1
             self.switch_generation_after_stat = False
@@ -240,6 +282,21 @@ class TransferRemote:
             self.next_file_id += 1
         if self.crash_after_rename:
             raise RuntimeError("injected crash after rename")
+
+    def replace_atomic(self, source: RemotePath, target: RemotePath) -> None:
+        self.trace.append(f"remote.replace@{target.value}")
+        if source.value not in self.files:
+            raise FileNotFoundError(source.value)
+        self.files[target.value] = self.files.pop(source.value)
+        source_file_id = self.file_ids.pop(source.value, None)
+        if source_file_id is not None:
+            self.file_ids[target.value] = source_file_id
+
+    def remove_file(self, path: RemotePath) -> None:
+        if path.value not in self.files:
+            raise FileNotFoundError(path.value)
+        self.files.pop(path.value)
+        self.file_ids.pop(path.value, None)
 
     def list_dir(self, path: RemotePath) -> list[object]:
         prefix = path.value + "/"
@@ -335,6 +392,10 @@ class TransferRepository:
         self.items: dict[TransferItemId, TransferItemRecord] = {}
         self.tasks: dict[TaskId, TaskRecord] = {}
         self.fail_done_transition_once = False
+        self.release_calls = 0
+
+    def release_thread_connection(self) -> None:
+        self.release_calls += 1
 
     def list_items(self, task_id: TaskId) -> list[TransferItemRecord]:
         return [item for item in self.items.values() if item.task_id == task_id]
@@ -775,7 +836,7 @@ class EngineCommitter:
         self.trace = trace
         self.repository = repository
 
-    def commit(self, item, verification):
+    def commit(self, item, verification, **_kwargs):
         from nasmove.transfer.commit import CommitResult
 
         del verification
@@ -853,6 +914,63 @@ def engine_fixture() -> EngineFixture:
         event_sink=Sink(),
     )
     return EngineFixture(engine, repository, task, item, token, trace, events, verifier)
+
+
+@dataclass
+class ItemWorkerFixture:
+    worker: object
+    repository: TransferRepository
+    remote: TransferRemote
+    local: TransferLocal
+    task: TaskRecord
+    item: TransferItemRecord
+    events: list[object]
+
+
+@pytest.fixture
+def item_worker_fixture() -> ItemWorkerFixture:
+    from nasmove.transfer.checkpoint_writer import CheckpointWriter
+    from nasmove.transfer.commit import TargetCommitter
+    from nasmove.transfer.deletion import SourceDeletionService
+    from nasmove.transfer.item_worker import TransferItemWorker
+    from nasmove.transfer.recovery import RecoveryCoordinator
+    from nasmove.transfer.verification import IntegrityVerifier
+    from tests.fixtures.builders import build_task_record
+
+    trace: list[str] = []
+    events: list[object] = []
+    local = TransferLocal(b"payload", trace)
+    remote = TransferRemote(trace)
+    repository = TransferRepository(trace)
+    item = replace(
+        FakeDependencies(local, remote, repository, trace, TransferToken()).item(),
+        state=ItemState.PLANNED,
+    )
+    task = replace(
+        build_task_record(), action=TransferAction.MOVE, state=TaskState.RUNNING,
+        total_bytes=len(local.content),
+    )
+    repository.items[item.id] = item
+    repository.tasks[task.id] = task
+    session = SessionInfo("3.1.1", True, True, 1)
+    verifier = IntegrityVerifier(repository, local, remote, session)
+
+    class Sink:
+        def publish(self, event):
+            events.append(event)
+
+    worker = TransferItemWorker(
+        repository,
+        RecoveryCoordinator(repository, local, remote, session),
+        CheckpointWriter(repository, local, remote),
+        verifier,
+        TargetCommitter(repository, remote, session),
+        SourceDeletionService(repository, local, remote, verifier),
+        smb_gateway=remote,
+        session=session,
+        event_sink=Sink(),
+    )
+    return ItemWorkerFixture(worker, repository, remote, local, task, item, events)
 
 
 @dataclass

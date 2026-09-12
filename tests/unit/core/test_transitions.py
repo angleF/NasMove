@@ -47,7 +47,12 @@ ITEM_ALLOWED_TRANSITIONS: dict[ItemState, set[ItemState]] = {
         ItemState.VERIFYING,
         ItemState.SOURCE_CHANGED,
     },
-    ItemState.VERIFIED: {ItemState.COMMITTED, ItemState.INTERRUPTED, ItemState.SOURCE_CHANGED},
+    ItemState.VERIFIED: {
+        ItemState.COMMITTED,
+        ItemState.INTERRUPTED,
+        ItemState.SOURCE_CHANGED,
+        ItemState.SKIPPED,
+    },
     ItemState.COMMITTED: {
         ItemState.SOURCE_DELETE_AUTHORIZED,
         ItemState.DONE,

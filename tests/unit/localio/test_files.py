@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from nasmove.core.errors import SourceFileMissingError
 from nasmove.core.states import SourceKind
 from nasmove.localio.files import PosixLocalFileGateway
 
@@ -227,6 +228,65 @@ def test_remove_empty_dir_rejects_non_empty_directory(tmp_path: Path) -> None:
     assert directory.exists()
 
 
+def test_move_to_trash_uses_qt_trash_after_fingerprint_check(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "source.bin"
+    path.write_bytes(b"payload")
+    gateway = PosixLocalFileGateway()
+    expected = gateway.fingerprint(path)
+    calls: list[str] = []
+
+    def fake_move_to_trash(file_name: str) -> tuple[bool, str]:
+        calls.append(file_name)
+        path.unlink()
+        return True, "/Users/test/.Trash/source.bin"
+
+    monkeypatch.setattr("nasmove.localio.files._qt_move_to_trash", fake_move_to_trash)
+
+    gateway.move_to_trash(path, expected)
+
+    assert calls == [str(path)]
+    assert not path.exists()
+
+
+def test_move_to_trash_rejects_changed_source_before_qt_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "source.bin"
+    path.write_bytes(b"before")
+    gateway = PosixLocalFileGateway()
+    expected = gateway.fingerprint(path)
+    path.write_bytes(b"changed and larger")
+    calls: list[str] = []
+    monkeypatch.setattr(
+        "nasmove.localio.files._qt_move_to_trash",
+        lambda file_name: (calls.append(file_name) is None, "unused"),
+    )
+
+    with pytest.raises(OSError) as error:
+        gateway.move_to_trash(path, expected)
+
+    assert error.value.errno == errno.EAGAIN
+    assert calls == []
+    assert path.exists()
+
+
+def test_move_to_trash_failure_keeps_source(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "source.bin"
+    path.write_bytes(b"payload")
+    monkeypatch.setattr(
+        "nasmove.localio.files._qt_move_to_trash", lambda _file_name: (False, "")
+    )
+
+    with pytest.raises(OSError, match="system trash rejected source"):
+        PosixLocalFileGateway().move_to_trash(path)
+
+    assert path.exists()
+
+
 def test_gateway_uses_no_follow_stat(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     path = tmp_path / "source.bin"
     path.write_bytes(b"payload")
@@ -246,3 +306,19 @@ def test_gateway_uses_no_follow_stat(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     PosixLocalFileGateway().fingerprint(path)
 
     assert calls == [False]
+
+
+def test_missing_source_raises_a_typed_actionable_error(tmp_path: Path) -> None:
+    gateway = PosixLocalFileGateway()
+    missing = tmp_path / "already-processed.bin"
+
+    with pytest.raises(SourceFileMissingError):
+        gateway.fingerprint(missing)
+    with pytest.raises(SourceFileMissingError):
+        gateway.open_read(missing)
+    with pytest.raises(SourceFileMissingError):
+        gateway.fingerprint(tmp_path / "gone-directory" / "file.bin")
+
+    # Kept a FileNotFoundError so deletion's "source is gone" recovery paths and
+    # every existing fail-closed OSError caller keep their meaning.
+    assert issubclass(SourceFileMissingError, FileNotFoundError)

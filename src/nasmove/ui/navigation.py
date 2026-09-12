@@ -17,7 +17,7 @@ class AppDestination(StrEnum):
 _DESTINATION_TEXT = {
     AppDestination.WORKBENCH: "迁移工作台",
     AppDestination.QUEUE: "任务队列",
-    AppDestination.CONNECTIONS: "连接配置",
+    AppDestination.CONNECTIONS: "账号与连接",
     AppDestination.HISTORY: "历史与报告",
     AppDestination.PREFERENCES: "偏好设置",
 }

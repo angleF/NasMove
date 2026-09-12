@@ -4,7 +4,7 @@ project_dir = @PROJECT_ROOT@
 input_file = @PROJECT_ROOT@/src/nasmove/ui/desktop_app.py
 exec_directory = @PROJECT_ROOT@/dist
 project_file =
-icon =
+icon = @PROJECT_ROOT@/deployment/nasmove.icns
 
 [python]
 python_path = @PYTHON@

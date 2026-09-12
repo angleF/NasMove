@@ -3,7 +3,8 @@ from dataclasses import replace
 
 import pytest
 
-from nasmove.core.states import SourceKind
+from nasmove.core.errors import ConflictResolutionRequired
+from nasmove.core.states import ConflictPolicy, SourceKind
 from nasmove.transfer.verification import VerificationResult
 
 
@@ -14,6 +15,69 @@ def test_commit_allocates_next_name_when_planned_name_was_taken(commit_fixture) 
     )
     assert str(result.final_path).endswith("movie (1).mov")
     assert commit_fixture.repository.get_item(commit_fixture.item.id).final_path == result.final_path
+
+
+def test_commit_atomically_replaces_existing_target_for_overwrite_policy(
+    commit_fixture,
+) -> None:
+    commit_fixture.occupy("movie.mov")
+
+    result = commit_fixture.committer.commit(
+        commit_fixture.item,
+        commit_fixture.valid_verification(),
+        conflict_policy=ConflictPolicy.OVERWRITE,
+    )
+
+    assert result.final_path == commit_fixture.item.final_path
+    assert bytes(commit_fixture.remote.files["target/movie.mov"]) == b"movie payload"
+    assert "remote.replace@target/movie.mov" in commit_fixture.remote.trace
+
+
+def test_commit_skip_policy_preserves_racing_target(commit_fixture) -> None:
+    commit_fixture.occupy("movie.mov")
+    commit_fixture.remote.files["target/movie.mov"] = bytearray(b"occupied")
+
+    result = commit_fixture.committer.commit(
+        commit_fixture.item,
+        commit_fixture.valid_verification(),
+        conflict_policy=ConflictPolicy.SKIP,
+    )
+
+    assert result.committed is False
+    assert commit_fixture.repository.get_item(commit_fixture.item.id).state.value == "skipped"
+    assert bytes(commit_fixture.remote.files["target/movie.mov"]) == b"occupied"
+
+
+@pytest.mark.parametrize(("delta", "committed"), ((-1, True), (1, False)))
+def test_commit_overwrite_if_newer_rechecks_racing_target_mtime(
+    commit_fixture, delta: int, committed: bool
+) -> None:
+    commit_fixture.occupy("movie.mov")
+    commit_fixture.remote.modified_ns = (
+        commit_fixture.item.source_fingerprint.mtime_ns + delta
+    )
+
+    result = commit_fixture.committer.commit(
+        commit_fixture.item,
+        commit_fixture.valid_verification(),
+        conflict_policy=ConflictPolicy.OVERWRITE_IF_NEWER,
+    )
+
+    assert result.committed is committed
+
+
+def test_commit_ask_policy_never_guesses_when_target_races(commit_fixture) -> None:
+    commit_fixture.occupy("movie.mov")
+
+    with pytest.raises(ConflictResolutionRequired):
+        commit_fixture.committer.commit(
+            commit_fixture.item,
+            commit_fixture.valid_verification(),
+            conflict_policy=ConflictPolicy.ASK,
+        )
+
+    assert commit_fixture.repository.get_item(commit_fixture.item.id).state.value == "verified"
+    assert commit_fixture.item.temp_path.value in commit_fixture.remote.files
 
 
 def test_commit_rejects_unverified_result(commit_fixture) -> None:

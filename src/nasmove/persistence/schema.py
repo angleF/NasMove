@@ -9,7 +9,8 @@ from typing import TypeVar
 from nasmove.core.states import ItemState, TaskState
 from nasmove.core.transitions import ITEM_TRANSITIONS, TASK_TRANSITIONS
 
-SCHEMA_VERSION = "3"
+SCHEMA_VERSION = "7"
+LEGACY_SCHEMA_VERSIONS = ("6", "5", "4", "3")
 SCHEMA_HASH_KEY = "schema_hash"
 CORE_TABLES = frozenset(
     {
@@ -139,6 +140,33 @@ CREATE TABLE IF NOT EXISTS events (
 );
 """
 
+PROFILE_ARCHIVE_SQL = """
+ALTER TABLE connection_profiles
+ADD COLUMN is_archived INTEGER NOT NULL DEFAULT 0 CHECK (is_archived IN (0, 1));
+"""
+
+CONFLICT_STRATEGY_SQL = """
+ALTER TABLE tasks
+ADD COLUMN conflict_strategy TEXT NOT NULL DEFAULT 'keep_both'
+CHECK (conflict_strategy IN ('keep_both', 'overwrite', 'skip', 'overwrite_if_newer', 'ask'));
+"""
+
+PARALLEL_ITEMS_SQL = """
+ALTER TABLE connection_profiles ADD COLUMN max_parallel_items INTEGER NOT NULL DEFAULT 2
+CHECK (max_parallel_items BETWEEN 1 AND 4);
+ALTER TABLE tasks ADD COLUMN connection_max_parallel_items INTEGER NOT NULL DEFAULT 2
+CHECK (connection_max_parallel_items BETWEEN 1 AND 4);
+"""
+
+# The v7 addition. Kept out of SCHEMA_SQL so the frozen legacy fingerprints for
+# v3..v6 continue to describe exactly the schema text those databases carry.
+CREDENTIALS_SQL = """
+CREATE TABLE IF NOT EXISTS credentials (
+    profile_id TEXT PRIMARY KEY REFERENCES connection_profiles(profile_id),
+    password TEXT NOT NULL
+);
+"""
+
 
 def _transition_trigger[State: (TaskState, ItemState)](
     table: str, mapping: Mapping[State, frozenset[State]], trigger_name: str
@@ -170,6 +198,27 @@ def _trigger_sql() -> str:
     )
 
 
+def _legacy_trigger_sql() -> str:
+    legacy_item_transitions = dict(ITEM_TRANSITIONS)
+    verified_targets = set(ITEM_TRANSITIONS[ItemState.VERIFIED])
+    verified_targets.discard(ItemState.SKIPPED)
+    legacy_item_transitions[ItemState.VERIFIED] = frozenset(verified_targets)
+    return (
+        _transition_trigger("tasks", TASK_TRANSITIONS, "tasks_state_guard")
+        + _transition_trigger(
+            "transfer_items",
+            legacy_item_transitions,
+            "transfer_items_state_guard",
+        )
+        + "CREATE TRIGGER IF NOT EXISTS tasks_initial_state_guard BEFORE INSERT ON tasks "
+        + "WHEN NEW.state NOT IN ('draft', 'preflight', 'queued') "
+        + "BEGIN SELECT RAISE(ABORT, 'invalid initial task state'); END;"
+        + "CREATE TRIGGER IF NOT EXISTS transfer_items_initial_state_guard BEFORE INSERT ON transfer_items "
+        + "WHEN NEW.state NOT IN ('planned', 'skipped') "
+        + "BEGIN SELECT RAISE(ABORT, 'invalid initial item state'); END;"
+    )
+
+
 def schema_fingerprint(connection: sqlite3.Connection) -> str:
     """Return a stable digest of the user schema, excluding SQLite internals."""
     objects = sorted(
@@ -192,16 +241,50 @@ def expected_schema_fingerprint() -> str:
     """Build the canonical schema in memory and fingerprint its SQLite objects."""
     connection = sqlite3.connect(":memory:")
     try:
-        connection.executescript(SCHEMA_SQL + _trigger_sql())
+        connection.executescript(
+            SCHEMA_SQL
+            + _trigger_sql()
+            + PROFILE_ARCHIVE_SQL
+            + CONFLICT_STRATEGY_SQL
+            + PARALLEL_ITEMS_SQL
+            + CREDENTIALS_SQL
+        )
         return schema_fingerprint(connection)
     finally:
         connection.close()
 
 
-def has_current_schema(connection: sqlite3.Connection) -> bool:
-    """Check version, stored digest, required tables, and actual schema structure."""
+def _expected_legacy_schema_fingerprint(version: str) -> str:
+    connection = sqlite3.connect(":memory:")
     try:
-        version = connection.execute(
+        if version == "6":
+            connection.executescript(
+                SCHEMA_SQL
+                + _trigger_sql()
+                + PROFILE_ARCHIVE_SQL
+                + CONFLICT_STRATEGY_SQL
+                + PARALLEL_ITEMS_SQL
+            )
+        elif version == "5":
+            connection.executescript(
+                SCHEMA_SQL
+                + _trigger_sql()
+                + PROFILE_ARCHIVE_SQL
+                + CONFLICT_STRATEGY_SQL
+            )
+        else:
+            suffix = PROFILE_ARCHIVE_SQL if version == "4" else ""
+            connection.executescript(SCHEMA_SQL + _legacy_trigger_sql() + suffix)
+        return schema_fingerprint(connection)
+    finally:
+        connection.close()
+
+
+def _has_schema_identity(
+    connection: sqlite3.Connection, *, version: str, expected_hash: str
+) -> bool:
+    try:
+        stored_version = connection.execute(
             "SELECT value FROM schema_meta WHERE key = 'version'"
         ).fetchone()
         stored_hash = connection.execute(
@@ -209,7 +292,7 @@ def has_current_schema(connection: sqlite3.Connection) -> bool:
         ).fetchone()
     except sqlite3.DatabaseError:
         return False
-    if version is None or version[0] != SCHEMA_VERSION or stored_hash is None:
+    if stored_version is None or stored_version[0] != version or stored_hash is None:
         return False
     tables = {
         row[0]
@@ -220,19 +303,95 @@ def has_current_schema(connection: sqlite3.Connection) -> bool:
     if not CORE_TABLES <= tables:
         return False
     actual_hash = schema_fingerprint(connection)
-    return bool(actual_hash == stored_hash[0] == expected_schema_fingerprint())
+    return bool(actual_hash == stored_hash[0] == expected_hash)
+
+
+def has_current_schema(connection: sqlite3.Connection) -> bool:
+    """Check version, stored digest, required tables, and actual schema structure."""
+    return _has_schema_identity(
+        connection,
+        version=SCHEMA_VERSION,
+        expected_hash=expected_schema_fingerprint(),
+    )
+
+
+def _legacy_schema_version(connection: sqlite3.Connection) -> str | None:
+    for version in LEGACY_SCHEMA_VERSIONS:
+        if _has_schema_identity(
+            connection,
+            version=version,
+            expected_hash=_expected_legacy_schema_fingerprint(version),
+        ):
+            return version
+    return None
+
+
+def has_supported_schema(connection: sqlite3.Connection) -> bool:
+    """Accept current schema and the one exact legacy identity that can be migrated."""
+    return has_current_schema(connection) or _legacy_schema_version(connection) is not None
+
+
+def _write_schema_identity(connection: sqlite3.Connection, schema_hash: str) -> None:
+    connection.execute(
+        "INSERT INTO schema_meta(key, value) VALUES ('version', ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (SCHEMA_VERSION,),
+    )
+    connection.execute(
+        "INSERT INTO schema_meta(key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (SCHEMA_HASH_KEY, schema_hash),
+    )
+
+
+def _migrate_legacy_schema(connection: sqlite3.Connection, version: str) -> None:
+    expected_hash = expected_schema_fingerprint()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        if version == "3":
+            connection.execute(PROFILE_ARCHIVE_SQL)
+        if version in ("3", "4"):
+            connection.execute(CONFLICT_STRATEGY_SQL)
+            connection.execute("DROP TRIGGER transfer_items_state_guard")
+            connection.execute(
+                _transition_trigger(
+                    "transfer_items",
+                    ITEM_TRANSITIONS,
+                    "transfer_items_state_guard",
+                )
+            )
+        if version in ("3", "4", "5"):
+            for statement in PARALLEL_ITEMS_SQL.split(";"):
+                if statement.strip():
+                    connection.execute(statement)
+        for statement in CREDENTIALS_SQL.split(";"):
+            if statement.strip():
+                connection.execute(statement)
+        actual_hash = schema_fingerprint(connection)
+        if actual_hash != expected_hash:
+            raise RuntimeError("migrated database does not match the current schema")
+        _write_schema_identity(connection, actual_hash)
+        connection.commit()
+    except BaseException:
+        if connection.in_transaction:
+            connection.rollback()
+        raise
 
 
 def initialize_database(connection: sqlite3.Connection) -> None:
     """Configure SQLite durability and create the current schema."""
+    legacy_version: str | None = None
     user_objects = connection.execute(
         "SELECT name FROM sqlite_master WHERE name NOT LIKE 'sqlite_%'"
     ).fetchall()
     if not user_objects:
         is_new_database = True
+        is_legacy_database = False
     else:
         is_new_database = False
-        if not has_current_schema(connection):
+        legacy_version = _legacy_schema_version(connection)
+        is_legacy_database = legacy_version is not None
+        if not has_current_schema(connection) and not is_legacy_database:
             has_meta_table = connection.execute(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_meta'"
             ).fetchone()
@@ -252,6 +411,9 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
         ).fetchone() is not None:
             raise RuntimeError("database schema changed during initialization")
+    elif is_legacy_database:
+        if _legacy_schema_version(connection) != legacy_version:
+            raise RuntimeError("database schema changed during initialization")
     elif not has_current_schema(connection):
         raise RuntimeError("database schema changed during initialization")
 
@@ -259,26 +421,29 @@ def initialize_database(connection: sqlite3.Connection) -> None:
     connection.execute("PRAGMA synchronous = FULL")
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
+    if is_legacy_database:
+        assert legacy_version is not None
+        _migrate_legacy_schema(connection, legacy_version)
+        return
     if not is_new_database:
         connection.commit()
         return
 
     expected_hash = expected_schema_fingerprint()
     try:
-        connection.executescript("BEGIN IMMEDIATE;\n" + SCHEMA_SQL + _trigger_sql())
+        connection.executescript(
+            "BEGIN IMMEDIATE;\n"
+            + SCHEMA_SQL
+            + _trigger_sql()
+            + PROFILE_ARCHIVE_SQL
+            + CONFLICT_STRATEGY_SQL
+            + PARALLEL_ITEMS_SQL
+            + CREDENTIALS_SQL
+        )
         actual_hash = schema_fingerprint(connection)
         if actual_hash != expected_hash:
             raise RuntimeError("database schema does not match the current schema")
-        connection.execute(
-            "INSERT INTO schema_meta(key, value) VALUES ('version', ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (SCHEMA_VERSION,),
-        )
-        connection.execute(
-            "INSERT INTO schema_meta(key, value) VALUES (?, ?) "
-            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            (SCHEMA_HASH_KEY, actual_hash),
-        )
+        _write_schema_identity(connection, actual_hash)
         connection.commit()
     except BaseException:
         if connection.in_transaction:

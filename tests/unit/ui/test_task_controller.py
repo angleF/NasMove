@@ -1,13 +1,18 @@
 from __future__ import annotations
 
+import errno
+from dataclasses import replace
 from pathlib import Path
 from threading import Thread, get_ident
 
 from PySide6.QtCore import QCoreApplication, Qt
 
+from nasmove.core.errors import SourceFileMissingError
 from nasmove.core.model import TaskId
 from nasmove.core.states import TaskState
+from nasmove.transfer.checkpoint_writer import CancellationToken
 from nasmove.transfer.transfer_engine import TaskResult, TransferEvent
+from nasmove.ui.queue_panel import QueuePanel
 from nasmove.ui.task_controller import TaskController
 from nasmove.ui.task_page import TaskPage
 from tests.fixtures.builders import build_task_record, snapshot
@@ -40,6 +45,25 @@ def test_task_buttons_dispatch_commands_for_selected_task(qtbot) -> None:
     page.cancel_requested.emit()
 
     assert commands.calls == [("pause", task.id), ("resume", task.id), ("cancel", task.id)]
+
+
+def test_attached_queue_panel_routes_commands_and_receives_events(qtbot) -> None:
+    page = TaskPage()
+    panel = QueuePanel()
+    commands = Commands()
+    controller = TaskController(page, commands=commands)
+    qtbot.addWidget(page)
+    qtbot.addWidget(panel)
+    task = replace(build_task_record(), state=TaskState.RUNNING)
+
+    controller.attach_queue_panel(panel)
+    controller.load_queue((task,))
+    panel.select_task(task.id)
+    panel.pause_button.click()
+    controller.publish(TransferEvent(task.id, TaskState.WAITING_FOR_NETWORK))
+
+    qtbot.waitUntil(lambda: panel.state_text(task.id) == "等待网络")
+    assert commands.calls == [("pause", task.id)]
 
 
 def test_worker_thread_events_are_applied_on_qt_thread(qtbot) -> None:
@@ -77,7 +101,6 @@ def test_visible_task_event_publishes_workspace_state(qtbot) -> None:
 
 
 def test_queue_reorder_is_persisted_as_complete_permutation(qtbot) -> None:
-    from dataclasses import replace
     page = TaskPage()
 
     class Repository:
@@ -171,3 +194,143 @@ def test_exported_summary_omits_technical_error_details(qtbot, tmp_path: Path) -
     assert "结果：迁移失败" in content
     assert "secret" not in content
     assert "/private/share" not in content
+
+
+def test_missing_local_source_is_readable_and_stays_an_item_level_failure(qtbot) -> None:
+    page = TaskPage()
+    qtbot.addWidget(page)
+    recorded: list[tuple[object, str]] = []
+
+    class Repository:
+        def record_ui_error(self, task_id, code) -> None:
+            recorded.append((task_id, code))
+
+    controller = TaskController(page, repository=Repository())
+    task = replace(build_task_record(), state=TaskState.QUEUED)
+
+    controller.load_queue((task,))
+    page.queue_list.setCurrentRow(0)
+    controller.publish_result(
+        TaskResult(
+            False,
+            TaskState.FAILED,
+            error=SourceFileMissingError(errno.ENOENT, "source file is missing"),
+            task_id=task.id,
+        )
+    )
+
+    assert recorded == [(task.id, "source_not_found")]
+    assert "已被此前的任务处理" in page.result_summary.text()
+    assert page.status_label.text() != "执行已停止 · 需要处理"
+
+
+def test_reloaded_item_level_failure_keeps_its_readable_reason(qtbot) -> None:
+    page = TaskPage()
+    qtbot.addWidget(page)
+
+    class Repository:
+        def last_ui_error(self, task_id) -> str:
+            return "source_not_found"
+
+    controller = TaskController(page, repository=Repository())
+    task = replace(build_task_record(), state=TaskState.FAILED)
+
+    controller.load_queue((task,))
+    page.queue_list.setCurrentRow(0)
+
+    assert "已被此前的任务处理" in page.result_summary.text()
+    assert page.status_label.text() != "执行已停止 · 需要处理"
+
+
+def test_reloaded_execution_error_still_stops_the_task(qtbot) -> None:
+    page = TaskPage()
+    qtbot.addWidget(page)
+
+    class Repository:
+        def last_ui_error(self, task_id) -> str:
+            return "database_thread_error"
+
+    controller = TaskController(page, repository=Repository())
+    task = replace(build_task_record(), state=TaskState.RUNNING)
+
+    controller.load_queue((task,))
+    page.queue_list.setCurrentRow(0)
+
+    assert page.status_label.text() == "执行已停止 · 需要处理"
+
+
+def test_command_failure_on_a_paused_task_keeps_the_task_level_stop(qtbot) -> None:
+    # A resume/cancel command can fail while the row still holds its previous
+    # TaskState; re-selecting it must not downgrade the stop message, because
+    # that message carries the "some files may already have been transferred"
+    # safety prompt.
+    page = TaskPage()
+    qtbot.addWidget(page)
+
+    class FailingResume:
+        def resume(self, task_id: object) -> None:
+            raise OSError(errno.EIO, "resume rejected")
+
+    controller = TaskController(page, commands=FailingResume())
+    task = replace(build_task_record(), state=TaskState.PAUSED)
+
+    controller.load_queue((task,))
+    page.queue_list.setCurrentRow(0)
+    page.resume_requested.emit()
+    page.selection_changed.emit(task.id)
+
+    assert page.status_label.text() == "执行已停止 · 需要处理"
+    assert "任务已停止" in page.safety_label.text()
+
+
+def test_gateway_missing_source_is_persisted_as_source_not_found(qtbot, item_worker_fixture) -> None:
+    # End-to-end composition chain: the local gateway's typed missing-source
+    # error must survive the item worker and be persisted as ``source_not_found``
+    # rather than degenerating into the remote ``path_not_found``.
+    fixture = item_worker_fixture
+    fixture.local.source_exists = False
+
+    outcome = fixture.worker.run(fixture.item, fixture.task, CancellationToken())
+
+    assert isinstance(outcome.error, SourceFileMissingError)
+    recorded: list[tuple[object, str]] = []
+
+    class Repository:
+        def record_ui_error(self, task_id, code) -> None:
+            recorded.append((task_id, code))
+
+    page = TaskPage()
+    qtbot.addWidget(page)
+    controller = TaskController(page, repository=Repository())
+    controller.load_queue((fixture.task,))
+    controller.publish_result(
+        TaskResult(False, TaskState.FAILED, error=outcome.error, task_id=fixture.task.id)
+    )
+
+    assert recorded == [(fixture.task.id, "source_not_found")]
+
+
+def test_exported_summary_includes_the_deletion_outcome(qtbot, tmp_path: Path) -> None:
+    page = TaskPage()
+    qtbot.addWidget(page)
+
+    class Repository:
+        def last_deletion_outcome_for_task(self, task_id):
+            return (
+                "source_missing_after_move",
+                "source was absent: OSError(5, '/private/share/source.bin')",
+            )
+
+    controller = TaskController(page, repository=Repository())
+    task = replace(build_task_record(), state=TaskState.COMPLETED)
+
+    controller.load_queue((task,))
+    page.queue_list.setCurrentRow(0)
+    destination = tmp_path / "report.txt"
+    page.export_summary(destination)
+    content = destination.read_text(encoding="utf-8")
+
+    assert "源文件处理" in content
+    assert "source_missing_after_move" in content
+    assert "/private/share" not in content
+    assert "OSError" not in content

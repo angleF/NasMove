@@ -13,8 +13,15 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import BinaryIO
 
+from PySide6.QtCore import QFile
+
+from nasmove.core.errors import SourceFileMissingError
 from nasmove.core.model import SourceFingerprint
 from nasmove.core.states import SourceKind
+
+
+def _qt_move_to_trash(file_name: str) -> tuple[bool, str]:
+    return QFile.moveToTrash(file_name)
 
 
 def _unsafe_path(path: Path, message: str = "unsafe local path") -> OSError:
@@ -59,6 +66,15 @@ def _anchored_parent(path: Path) -> Iterator[tuple[int, str]]:
         yield parent_fd, components[-1]
     finally:
         os.close(parent_fd)
+
+
+@contextmanager
+def _as_missing_source_error(path: Path) -> Iterator[None]:
+    """Re-raise a vanished source path as a typed, actionable error."""
+    try:
+        yield
+    except FileNotFoundError as error:
+        raise SourceFileMissingError(errno.ENOENT, "source file is missing", path) from error
 
 
 def _same_entry(left: os.stat_result, right: os.stat_result) -> bool:
@@ -113,7 +129,7 @@ class PosixLocalFileGateway:
     """
 
     def fingerprint(self, path: Path) -> SourceFingerprint:
-        with _anchored_parent(path) as (parent_fd, name):
+        with _as_missing_source_error(path), _anchored_parent(path) as (parent_fd, name):
             info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
             if stat.S_ISLNK(info.st_mode):
                 raise _unsafe_path(path, "symbolic links are not supported")
@@ -134,7 +150,7 @@ class PosixLocalFileGateway:
                 os.close(directory_fd)
 
     def open_read(self, path: Path) -> BinaryIO:
-        with _anchored_parent(path) as (parent_fd, name):
+        with _as_missing_source_error(path), _anchored_parent(path) as (parent_fd, name):
             fd = os.open(name, _file_open_flags(), dir_fd=parent_fd)
             try:
                 info = os.fstat(fd)
@@ -209,3 +225,40 @@ class PosixLocalFileGateway:
             finally:
                 os.close(directory_fd)
             os.rmdir(name, dir_fd=parent_fd)
+
+    def move_to_trash(
+        self,
+        path: Path,
+        expected_fingerprint: SourceFingerprint | None = None,
+    ) -> None:
+        """Move an unchanged regular file or empty directory to the system Trash."""
+        with _anchored_parent(path) as (parent_fd, name), _locked_parent(parent_fd):
+            info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+            if stat.S_ISLNK(info.st_mode):
+                raise _unsafe_path(path, "symbolic links are not supported")
+            current = _fingerprint_for_entry(info)
+            if current is None:
+                raise OSError(errno.EINVAL, "source is not a regular file or directory", path)
+            if expected_fingerprint is not None and current != expected_fingerprint:
+                raise _changed(path)
+            expected = current if expected_fingerprint is None else expected_fingerprint
+
+            if current.kind is SourceKind.FILE:
+                entry_fd = os.open(name, _file_open_flags(), dir_fd=parent_fd)
+            else:
+                entry_fd = os.open(name, _directory_open_flags(), dir_fd=parent_fd)
+            try:
+                bound = os.fstat(entry_fd)
+                if _fingerprint_for_entry(bound) != expected:
+                    raise _changed(path)
+                if current.kind is SourceKind.EMPTY_DIRECTORY and os.listdir(entry_fd):
+                    raise OSError(errno.ENOTEMPTY, "directory is not empty", path)
+                latest = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+                if _fingerprint_for_entry(latest) != expected:
+                    raise _changed(path)
+            finally:
+                os.close(entry_fd)
+
+            moved, _trashed_path = _qt_move_to_trash(str(path))
+            if not moved:
+                raise OSError(errno.EIO, "system trash rejected source", path)

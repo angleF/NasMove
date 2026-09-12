@@ -30,7 +30,7 @@ def test_setup_workspace_describes_move_as_verify_commit_then_delete(qtbot) -> N
     workspace.source_page.move_checkbox.setChecked(True)
 
     assert "完整回读" in workspace.safety_label.text()
-    assert "删除源文件" in workspace.safety_label.text()
+    assert "移入废纸篓" in workspace.safety_label.text()
 
 
 def test_setup_workspace_routes_primary_action_through_existing_target_signal(qtbot) -> None:

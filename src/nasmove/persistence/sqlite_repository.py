@@ -14,7 +14,7 @@ from tempfile import TemporaryDirectory
 from threading import Lock, local
 from typing import Self, cast
 
-from nasmove.core.errors import ConcurrentStateChange
+from nasmove.core.errors import ConcurrentStateChange, ConnectionProfileInUse
 from nasmove.core.model import (
     Checkpoint,
     ConnectionConfig,
@@ -35,7 +35,7 @@ from nasmove.core.states import (
     VerificationPolicy,
 )
 from nasmove.core.transitions import assert_item_transition, assert_task_transition
-from nasmove.persistence.schema import has_current_schema, initialize_database
+from nasmove.persistence.schema import has_supported_schema, initialize_database
 
 _TERMINAL_TASK_STATES = (
     TaskState.COMPLETED,
@@ -234,7 +234,7 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
                     objects = connection.execute(
                         "SELECT 1 FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' LIMIT 1"
                     ).fetchone()
-                    return objects is None or has_current_schema(connection)
+                    return objects is None or has_supported_schema(connection)
                 finally:
                     connection.close()
         except (OSError, sqlite3.DatabaseError, RuntimeError, ValueError):
@@ -386,7 +386,7 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         try:
             self._insert_connection_profile(config)
             self._connection.execute(
-                "UPDATE connection_profiles SET last_test_ok = 1, last_test_at = ? "
+                "UPDATE connection_profiles SET last_test_ok = 1, last_test_at = ?, is_archived = 0 "
                 "WHERE profile_id = ?",
                 (_encode_datetime(datetime.now(UTC)), str(config.profile_id)),
             )
@@ -397,11 +397,100 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
 
     def last_successful_connection(self) -> ConnectionConfig | None:
         row = self._connection.execute(
-            "SELECT * FROM connection_profiles WHERE last_test_ok = 1 "
+            "SELECT * FROM connection_profiles WHERE last_test_ok = 1 AND is_archived = 0 "
             "ORDER BY last_test_at DESC, profile_id LIMIT 1"
         ).fetchone()
         if row is None:
             return None
+        return self._connection_profile_from_row(row)
+
+    def list_connection_profiles(self) -> tuple[ConnectionConfig, ...]:
+        rows = self._connection.execute(
+            "SELECT * FROM connection_profiles "
+            "WHERE last_test_ok = 1 AND is_archived = 0 "
+            "ORDER BY last_test_at DESC, display_name COLLATE NOCASE, profile_id"
+        ).fetchall()
+        return tuple(self._connection_profile_from_row(row) for row in rows)
+
+    def get_connection_profile(self, profile_id: ConnectionProfileId) -> ConnectionConfig:
+        row = self._connection.execute(
+            "SELECT * FROM connection_profiles WHERE profile_id = ? AND is_archived = 0",
+            (str(profile_id),),
+        ).fetchone()
+        if row is None:
+            raise KeyError(profile_id)
+        return self._connection_profile_from_row(row)
+
+    def archive_connection_profile(self, profile_id: ConnectionProfileId) -> None:
+        terminal_values = tuple(state.value for state in _TERMINAL_TASK_STATES)
+        placeholders = ", ".join("?" for _ in terminal_values)
+        self._begin()
+        try:
+            row = self._connection.execute(
+                "SELECT is_archived FROM connection_profiles WHERE profile_id = ?",
+                (str(profile_id),),
+            ).fetchone()
+            if row is None:
+                raise KeyError(profile_id)
+            if bool(row["is_archived"]):
+                self._commit()
+                return
+            in_use = self._connection.execute(
+                f"SELECT 1 FROM tasks WHERE profile_id = ? "
+                f"AND state NOT IN ({placeholders}) LIMIT 1",
+                (str(profile_id), *terminal_values),
+            ).fetchone()
+            if in_use is not None:
+                raise ConnectionProfileInUse(
+                    f"connection profile is required by an incomplete task: {profile_id}"
+                )
+            self._connection.execute(
+                "UPDATE connection_profiles SET is_archived = 1 WHERE profile_id = ?",
+                (str(profile_id),),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+
+    def get_credential_password(self, profile_id: ConnectionProfileId) -> str | None:
+        """Return the stored password, or None when the profile has no credential."""
+        row = self._connection.execute(
+            "SELECT password FROM credentials WHERE profile_id = ?",
+            (str(profile_id),),
+        ).fetchone()
+        return None if row is None else str(row[0])
+
+    def set_credential_password(
+        self, profile_id: ConnectionProfileId, password: str
+    ) -> None:
+        """Idempotently upsert the credential for a profile."""
+        self._begin()
+        try:
+            self._connection.execute(
+                "INSERT INTO credentials(profile_id, password) VALUES (?, ?) "
+                "ON CONFLICT(profile_id) DO UPDATE SET password = excluded.password",
+                (str(profile_id), password),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+
+    def delete_credential_password(self, profile_id: ConnectionProfileId) -> None:
+        self._begin()
+        try:
+            self._connection.execute(
+                "DELETE FROM credentials WHERE profile_id = ?",
+                (str(profile_id),),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+
+    @staticmethod
+    def _connection_profile_from_row(row: sqlite3.Row) -> ConnectionConfig:
         return ConnectionConfig(
             profile_id=ConnectionProfileId(row["profile_id"]),
             display_name=row["display_name"],
@@ -412,19 +501,21 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
             domain=row["domain"],
             require_encryption=bool(row["require_encryption"]),
             minimum_dialect=row["minimum_dialect"],
+            max_parallel_items=row["max_parallel_items"],
         )
 
     def _insert_connection_profile(self, config: ConnectionConfig) -> None:
         self._connection.execute(
             """INSERT INTO connection_profiles(
                 profile_id, display_name, host, port, share, username, domain,
-                require_encryption, minimum_dialect, keychain_account
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                require_encryption, minimum_dialect, max_parallel_items, keychain_account
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(profile_id) DO UPDATE SET
                 display_name = excluded.display_name, host = excluded.host,
                 port = excluded.port, share = excluded.share, username = excluded.username,
                 domain = excluded.domain, require_encryption = excluded.require_encryption,
-                minimum_dialect = excluded.minimum_dialect""",
+                minimum_dialect = excluded.minimum_dialect,
+                max_parallel_items = excluded.max_parallel_items, is_archived = 0""",
             (
                 str(config.profile_id),
                 config.display_name,
@@ -435,6 +526,7 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
                 config.domain,
                 _bool_value(config.require_encryption),
                 config.minimum_dialect,
+                config.max_parallel_items,
                 str(config.profile_id),
             ),
         )
@@ -445,10 +537,11 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
             """INSERT INTO tasks(
                 task_id, name, action, profile_id, connection_display_name, connection_host,
                 connection_port, connection_share, connection_username, connection_domain,
-                connection_require_encryption, connection_minimum_dialect, target_root,
-                conflict_policy, verification_policy, state, queue_position, recovery_generation,
+                connection_require_encryption, connection_minimum_dialect,
+                connection_max_parallel_items, target_root,
+                conflict_policy, conflict_strategy, verification_policy, state, queue_position, recovery_generation,
                 total_files, total_bytes, copied_bytes, verified_bytes, revision, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 str(task.id),
                 task.name,
@@ -462,7 +555,9 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
                 config.domain,
                 _bool_value(config.require_encryption),
                 config.minimum_dialect,
+                config.max_parallel_items,
                 task.target_root.value,
+                "auto_rename",
                 task.conflict_policy.value,
                 task.verification_policy.value,
                 task.state.value,
@@ -712,6 +807,54 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         ).fetchone()
         return None if row is None else str(row[0])
 
+    def record_deletion_outcome(
+        self, task_id: TaskId | None, item_id: TransferItemId, code: str, summary: str
+    ) -> None:
+        """Persist why a source deletion ended the way it did, for diagnosis.
+
+        Stored in the existing ``events`` table under its own ``event_type`` so
+        no schema change is required.
+        """
+        self._begin()
+        try:
+            self._connection.execute(
+                "INSERT INTO events(task_id,item_id,event_type,error_code,summary,occurred_at) "
+                "VALUES(?,?,?,?,?,?)",
+                (
+                    task_id,
+                    item_id,
+                    "deletion_outcome",
+                    code,
+                    summary,
+                    _encode_datetime(datetime.now(UTC)),
+                ),
+            )
+            self._commit()
+        except BaseException:
+            self._rollback()
+            raise
+
+    def last_deletion_outcome(self, item_id: TransferItemId) -> tuple[str, str | None] | None:
+        row = self._connection.execute(
+            "SELECT error_code, summary FROM events WHERE item_id IS ? AND event_type = ? "
+            "ORDER BY event_id DESC LIMIT 1", (item_id, "deletion_outcome"),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), None if row[1] is None else str(row[1])
+
+    def last_deletion_outcome_for_task(
+        self, task_id: TaskId | None
+    ) -> tuple[str, str | None] | None:
+        """Read the task's most recent deletion outcome, for the task summary."""
+        row = self._connection.execute(
+            "SELECT error_code, summary FROM events WHERE task_id IS ? AND event_type = ? "
+            "ORDER BY event_id DESC LIMIT 1", (task_id, "deletion_outcome"),
+        ).fetchone()
+        if row is None:
+            return None
+        return str(row[0]), None if row[1] is None else str(row[1])
+
     def mark_active_tasks_interrupted(self) -> int:
         self._begin()
         try:
@@ -782,6 +925,7 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
             domain=row["connection_domain"],
             require_encryption=bool(row["connection_require_encryption"]),
             minimum_dialect=row["connection_minimum_dialect"],
+            max_parallel_items=row["connection_max_parallel_items"],
         )
         return TaskRecord(
             id=TaskId(row["task_id"]),
@@ -789,7 +933,7 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
             action=TransferAction(row["action"]),
             connection=connection,
             target_root=RemotePath(row["target_root"]),
-            conflict_policy=ConflictPolicy(row["conflict_policy"]),
+            conflict_policy=ConflictPolicy(row["conflict_strategy"]),
             verification_policy=VerificationPolicy(row["verification_policy"]),
             state=TaskState(row["state"]),
             queue_position=row["queue_position"],

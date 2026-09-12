@@ -371,3 +371,46 @@ def test_rename_exclusive_marks_lost_response_as_unknown_outcome(
 
     with pytest.raises(RenameOutcomeUnknownError):
         gateway.rename_exclusive(RemotePath("a/source"), RemotePath("a/target"))
+
+
+def test_replace_atomic_calls_smb_replace_and_redacts_unc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.replace",
+        lambda source, target, **kwargs: calls.append((source, target)),
+    )
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "memory-only-secret")
+
+    gateway.replace_atomic(RemotePath("a/source"), RemotePath("a/target"))
+
+    assert calls == [
+        (
+            r"\\nas.example.test\test-share\a\source",
+            r"\\nas.example.test\test-share\a\target",
+        )
+    ]
+
+
+def test_replace_atomic_marks_lost_response_as_unknown_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.register_session",
+        lambda *args, **kwargs: _session(),
+    )
+    monkeypatch.setattr(
+        "nasmove.smb.smbprotocol_gateway.smbclient.replace",
+        lambda *args, **kwargs: (_ for _ in ()).throw(TimeoutError("lost")),
+    )
+    gateway = SmbProtocolGateway()
+    gateway.connect(_config(), "memory-only-secret")
+
+    with pytest.raises(RenameOutcomeUnknownError):
+        gateway.replace_atomic(RemotePath("a/source"), RemotePath("a/target"))

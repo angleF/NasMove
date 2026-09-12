@@ -4,6 +4,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from threading import RLock
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +64,7 @@ class ProgressTracker:
     ) -> None:
         if type(total_bytes) is not int or total_bytes < 0:
             raise ValueError("total_bytes must be a non-negative integer")
+        self._lock = RLock()
         self._source_bytes = total_bytes
         self._verification_enabled = verification_enabled if full_verification is None else full_verification
         self._clock = clock
@@ -73,50 +75,102 @@ class ProgressTracker:
         self._samples: deque[tuple[float, int]] = deque()
         self._last_event_at: float | None = None
         self._last_database_at: float | None = None
+        self._pending_notifications: deque[tuple[ProgressSnapshot, bool, bool]] = deque()
+        self._notifying = False
 
     @property
     def total_bytes(self) -> int:
-        return self._source_bytes * (2 if self._verification_enabled else 1)
+        with self._lock:
+            return self._source_bytes * (2 if self._verification_enabled else 1)
 
     def set_total(self, total_bytes: int, *, verification_enabled: bool | None = None) -> None:
         if type(total_bytes) is not int or total_bytes < 0:
             raise ValueError("total_bytes must be a non-negative integer")
-        self._source_bytes = total_bytes
-        if verification_enabled is not None:
-            self._verification_enabled = verification_enabled
+        with self._lock:
+            self._source_bytes = total_bytes
+            if verification_enabled is not None:
+                self._verification_enabled = verification_enabled
 
     def record_copy(self, byte_count: int) -> ProgressSnapshot:
-        self._add("copied", byte_count)
-        return self._record(byte_count)
+        with self._lock:
+            self._add("copied", byte_count)
+            snapshot = self._record(byte_count)
+        return self._notify(snapshot)
 
     def record_verification(self, byte_count: int) -> ProgressSnapshot:
-        self._add("verified", byte_count)
-        return self._record(byte_count)
+        with self._lock:
+            self._add("verified", byte_count)
+            snapshot = self._record(byte_count)
+        return self._notify(snapshot)
 
     def update(self, *, copied_bytes: int | None = None, verified_bytes: int | None = None) -> ProgressSnapshot:
-        before = self._copied + self._verified
-        if copied_bytes is not None:
-            self._set("copied", copied_bytes)
-        if verified_bytes is not None:
-            self._set("verified", verified_bytes)
-        return self._record(max(0, self._copied + self._verified - before))
+        with self._lock:
+            before = self._copied + self._verified
+            if copied_bytes is not None:
+                self._set("copied", copied_bytes)
+            if verified_bytes is not None:
+                self._set("verified", verified_bytes)
+            snapshot = self._record(max(0, self._copied + self._verified - before))
+        return self._notify(snapshot)
 
     def snapshot(self) -> ProgressSnapshot:
-        now = self._clock()
-        self._trim_samples(now)
-        return self._snapshot(now)
+        with self._lock:
+            now = self._clock()
+            self._trim_samples(now)
+            return self._snapshot(now)
 
     def _record(self, delta: int) -> ProgressSnapshot:
+        """Queue notifications in snapshot order while holding the state lock."""
         now = self._clock()
         self._samples.append((now, delta))
         self._trim_samples(now)
         snapshot = self._snapshot(now)
-        if self._last_event_at is None or now - self._last_event_at >= self.EVENT_INTERVAL_SECONDS:
+        event_due = self._last_event_at is None or now - self._last_event_at >= self.EVENT_INTERVAL_SECONDS
+        database_due = (
+            self._last_database_at is None
+            or now - self._last_database_at >= self.DATABASE_INTERVAL_SECONDS
+        )
+        if event_due:
             self._last_event_at = now
-            self._emit(self._event_sink, snapshot)
-        if self._last_database_at is None or now - self._last_database_at >= self.DATABASE_INTERVAL_SECONDS:
+        if database_due:
             self._last_database_at = now
-            self._emit(self._database_sink, snapshot)
+        if event_due or database_due:
+            self._pending_notifications.append((snapshot, event_due, database_due))
+        return snapshot
+
+    def _notify(self, snapshot: ProgressSnapshot) -> ProgressSnapshot:
+        """Deliver callbacks outside the state lock, then report all failures."""
+        with self._lock:
+            if self._notifying:
+                # Reentrant updates must not wait for the current callback.
+                return snapshot
+            self._notifying = True
+        failures: list[BaseException] = []
+        try:
+            while True:
+                with self._lock:
+                    if not self._pending_notifications:
+                        self._notifying = False
+                        break
+                    pending, event_due, database_due = self._pending_notifications.popleft()
+                for sink, due in (
+                    (self._event_sink, event_due), (self._database_sink, database_due)
+                ):
+                    if due:
+                        try:
+                            self._emit(sink, pending)
+                        except BaseException as error:  # noqa: BLE001 - all failures are re-raised
+                            # Finish this snapshot and drain reentrant updates
+                            # before propagating callback failures to the caller.
+                            failures.append(error)
+        except BaseException:
+            with self._lock:
+                self._notifying = False
+            raise
+        if len(failures) == 1:
+            raise failures[0]
+        if failures:
+            raise BaseExceptionGroup("progress notification callbacks failed", failures)
         return snapshot
 
     def _snapshot(self, now: float) -> ProgressSnapshot:

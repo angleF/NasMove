@@ -26,7 +26,14 @@ from nasmove.core.states import TaskState
 from nasmove.smb.error_mapping import redacted_error_code
 from nasmove.transfer.progress import ProgressSnapshot
 from nasmove.transfer.transfer_engine import TaskResult
-from nasmove.ui.task_presentation import ERROR_TEXT, STATE_TEXT, duration_text, safe_code, size_text
+from nasmove.ui.task_presentation import (
+    DELETION_OUTCOME_TEXT,
+    ERROR_TEXT,
+    STATE_TEXT,
+    duration_text,
+    safe_code,
+    size_text,
+)
 
 
 class TaskPage(QWidget):
@@ -37,6 +44,7 @@ class TaskPage(QWidget):
     selection_changed = Signal(object)
     connection_requested = Signal()
     files_requested = Signal()
+    workbench_requested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -68,8 +76,10 @@ class TaskPage(QWidget):
         self._action = "copy"
         self._total_files = 0
         self._error_code: str | None = None
+        self._deletion_outcome: str | None = None
         self._retry_deadline: float | None = None
         self._retry_attempt: int | None = None
+        self._smoothed_speed: float | None = None
         self.current_file_label = QLabel("当前文件：—")
         self.current_file_label.setWordWrap(True)
         self.speed_label = QLabel("速度：—")
@@ -94,6 +104,9 @@ class TaskPage(QWidget):
         self.resume_button = QPushButton("继续")
         self.cancel_button = QPushButton("取消")
         self.export_button = QPushButton("导出脱敏摘要")
+        self.back_button = QPushButton("‹ 返回迁移工作台")
+        self.back_button.setProperty("themeRole", "secondary")
+        self.back_button.clicked.connect(self.workbench_requested.emit)
         self.queue_list = QListWidget()
         self.queue_list.currentItemChanged.connect(
             lambda *_: self.selection_changed.emit(self.selected_task_id())
@@ -124,6 +137,7 @@ class TaskPage(QWidget):
         detail = QVBoxLayout(content)
         detail.setContentsMargins(24, 20, 24, 20)
         detail.setSpacing(14)
+        detail.addWidget(self.back_button, alignment=Qt.AlignmentFlag.AlignLeft)
         detail.addWidget(self.task_name_label)
         detail.addWidget(self.location_label)
         detail.addWidget(self.status_label)
@@ -196,11 +210,13 @@ class TaskPage(QWidget):
         )
         self.error_details.clear()
         self._error_code = None
+        self._deletion_outcome = None
         self.details_button.setChecked(False)
         self.details_button.hide()
         self.result_summary.clear()
-        self.safety_label.setText("文件处理结果将在完成后确认；复制与校验完成前不会删除源文件。")
+        self.safety_label.setText("文件处理结果将在完成后确认；复制与校验完成前不会处理源文件。")
         self.current_file_label.setText("当前文件：—")
+        self._smoothed_speed = None
         self.speed_label.setText("速度：—")
         self.eta_label.setText("剩余：正在估算")
         self.progress_panel.show()
@@ -232,17 +248,31 @@ class TaskPage(QWidget):
         if not QDesktopServices.openUrl(self._target_url):
             self.result_summary.setText("无法打开 Finder。请通过“查看文件结果”核对目标路径。")
 
+    def set_deletion_outcome(self, code: str | None) -> None:
+        """Remember the persisted source-deletion outcome for the summary export."""
+        self._deletion_outcome = code
+
     def export_summary(self, destination: Path) -> None:
         """Export user-facing state only; technical details may contain sensitive paths."""
         lines = (
             "NasMove 任务摘要",
             f"状态：{self.status_label.text()}",
             f"结果：{self.result_summary.text() or '尚无结果'}",
+            f"源文件处理：{self._deletion_outcome_text()}",
             f"复制进度：{self.copy_progress.value()}%",
             f"校验进度：{self.verify_progress.value()}%",
             f"错误代码：{self._error_code or '无'}",
         )
         destination.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+    def _deletion_outcome_text(self) -> str:
+        # Only allowlisted labels are exported: the stored summary may contain
+        # absolute paths, and this text leaves the machine.
+        code = self._deletion_outcome
+        if not code:
+            return "无记录"
+        label = DELETION_OUTCOME_TEXT.get(code)
+        return f"{code}（{label}）" if label else code
 
     def _choose_export_path(self) -> None:
         filename, _ = QFileDialog.getSaveFileName(
@@ -325,7 +355,7 @@ class TaskPage(QWidget):
             self._retry_attempt = attempt
             self.result_summary.setText(f"连接中断，正在自动重连。第 {attempt} 次重试，约 {delay:.0f} 秒后再次尝试。")
             self.recovery_label.setText(
-                "检查点已保存，远端半成品尚未提交，完整校验通过前不会删除源文件。"
+                "检查点已保存，远端半成品尚未提交，完整校验通过前不会处理源文件。"
                 f"正在等待第 {attempt} 次重新连接，约 {delay:.0f} 秒后重试。"
             )
 
@@ -336,7 +366,13 @@ class TaskPage(QWidget):
         self.verify_progress.setValue(min(100, int(snapshot.verified_bytes * 100 / max(1, total // 2))))
         self.copy_progress.setFormat(f"%p% · {size_text(snapshot.copied_bytes)} / {size_text(snapshot.total_bytes / 2)}")
         self.verify_progress.setFormat(f"%p% · {size_text(snapshot.verified_bytes)} / {size_text(snapshot.total_bytes / 2)}")
-        self.speed_label.setText(f"速度：{size_text(snapshot.speed_bytes_per_second)}/s")
+        current_speed = float(snapshot.speed_bytes_per_second)
+        if self._smoothed_speed is None or current_speed <= 0:
+            self._smoothed_speed = current_speed
+        else:
+            self._smoothed_speed = 0.2 * current_speed + 0.8 * self._smoothed_speed
+        display_speed = int(self._smoothed_speed)
+        self.speed_label.setText(f"速度：{size_text(display_speed)}/s")
         self.eta_label.setText(f"剩余：{duration_text(snapshot.eta_seconds)}")
         if state is None:
             if snapshot.verified_bytes > 0:
@@ -352,6 +388,7 @@ class TaskPage(QWidget):
     def show_result(self, result: TaskResult | Any) -> None:
         self.error_details.clear()
         self._error_code = None
+        self._deletion_outcome = None
         self.details_button.setChecked(False)
         self.details_button.hide()
         state = getattr(result, "state", None)
@@ -363,11 +400,11 @@ class TaskPage(QWidget):
             self._retry_deadline = None
         if value == "completed_with_warnings" or warnings:
             self.result_summary.setText("迁移完成，但源文件仍保留" if warnings else "迁移完成，但有警告")
-            self.safety_label.setText("部分文件需要处理，请核对文件结果；不要重复删除源文件。")
+            self.safety_label.setText("部分文件需要处理，请核对文件结果；不要手动重复处理源文件。")
         elif bool(getattr(result, "success", False)):
             self.result_summary.setText("迁移完成")
             self.safety_label.setText("目标文件已校验并提交。" + (
-                "移动流程已完成。" if self._action == "move" else "源文件保留在本机。"
+                "源文件已移入废纸篓。" if self._action == "move" else "源文件保留在本机。"
             ))
             for bar in (self.copy_progress, self.verify_progress):
                 bar.setValue(100)
@@ -383,6 +420,7 @@ class TaskPage(QWidget):
         if error is not None:
             self._show_reason(redacted_error_code(error))
         if value in {"failed", "completed", "completed_with_warnings", "canceled", "paused"}:
+            self._smoothed_speed = None
             self.speed_label.setText("速度：—")
             self.eta_label.setText("剩余：—")
 
@@ -399,10 +437,14 @@ class TaskPage(QWidget):
         for button in (self.pause_button, self.resume_button, self.cancel_button):
             button.setVisible(button.isEnabled())
         self.connection_button.setVisible(value in {"failed", "interrupted", "paused", "waiting_for_network"})
-        color = "#16835d" if value == "completed" else "#b54708" if value in {
-            "failed", "paused", "interrupted", "waiting_for_network", "completed_with_warnings"
-        } else "#175cd3"
-        self.status_label.setStyleSheet(f"font-size: 26px; font-weight: 700; color: {color}; padding: 12px 0;")
+        state_role = "recovered" if value == "completed" else "failure" if value in {
+            "failed"
+        } else "warning" if value in {
+            "paused", "interrupted", "waiting_for_network", "completed_with_warnings"
+        } else "running"
+        self.status_label.setProperty("taskState", state_role)
+        self.status_label.style().unpolish(self.status_label)
+        self.status_label.style().polish(self.status_label)
         self._update_activity()
 
     def set_workspace_state(self, state: TaskState | str | None) -> None:
@@ -412,18 +454,18 @@ class TaskPage(QWidget):
         is_recovering = value == TaskState.WAITING_FOR_NETWORK.value
         self.recovery_card.setVisible(is_recovering)
         if value == TaskState.VERIFYING.value:
-            self.phase_label.setText("复制完成　›　完整回读校验中　›　原子提交　›　源文件处理")
+            self.phase_label.setText("复制完成　›　完整回读校验中　›　原子提交　›　移入废纸篓")
         elif value == TaskState.COMMITTING.value:
-            self.phase_label.setText("复制完成　›　完整回读校验完成　›　正在原子提交　›　源文件处理")
+            self.phase_label.setText("复制完成　›　完整回读校验完成　›　正在原子提交　›　移入废纸篓")
         elif value == TaskState.DELETING_SOURCE.value:
-            self.phase_label.setText("复制完成　›　完整回读校验完成　›　原子提交完成　›　正在处理源文件")
+            self.phase_label.setText("复制完成　›　完整回读校验完成　›　原子提交完成　›　正在移入废纸篓")
         elif is_recovering:
             self.phase_label.setText("传输已停止　›　等待重新连接　›　断点核验")
             self.recovery_label.setText(
-                "检查点已保存，远端半成品尚未提交，完整校验通过前不会删除源文件。"
+                "检查点已保存，远端半成品尚未提交，完整校验通过前不会处理源文件。"
             )
         elif value == TaskState.RUNNING.value:
-            self.phase_label.setText("正在复制　›　完整回读校验　›　原子提交　›　源文件处理")
+            self.phase_label.setText("正在复制　›　完整回读校验　›　原子提交　›　移入废纸篓")
         elif value == TaskState.COMPLETED.value:
             self.phase_label.setText("复制、完整回读校验和原子提交均已完成")
         else:
