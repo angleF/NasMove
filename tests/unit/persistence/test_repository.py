@@ -13,6 +13,7 @@ import pytest
 from nasmove.core.errors import ConcurrentStateChange, ConnectionProfileInUse, InvalidTransition
 from nasmove.core.model import Checkpoint, ConnectionProfileId, RemotePath, TaskId, TransferItemId
 from nasmove.core.states import ConflictPolicy, ItemState, TaskState, TransferAction
+from nasmove.persistence.schema import SCHEMA_VERSION
 from nasmove.persistence.sqlite_repository import SqliteTaskRepository
 from tests.fixtures.builders import build_task_record, build_transfer_item_record
 
@@ -672,7 +673,7 @@ def test_empty_existing_database_is_initialized(tmp_path) -> None:
     repository = SqliteTaskRepository(path)
     repository.close()
     raw = sqlite3.connect(path)
-    assert raw.execute("SELECT value FROM schema_meta WHERE key = 'version'").fetchone()[0] == "7"
+    assert raw.execute("SELECT value FROM schema_meta WHERE key = 'version'").fetchone()[0] == SCHEMA_VERSION
     assert len(raw.execute("SELECT value FROM schema_meta WHERE key = 'schema_hash'").fetchone()[0]) == 64
     raw.close()
 
@@ -925,4 +926,59 @@ def test_last_deletion_outcome_for_task_is_the_newest_across_items(tmp_path) -> 
 
     assert repository.last_deletion_outcome_for_task(task.id) == ("deletion_refused", "refused")
     assert repository.last_deletion_outcome_for_task(TaskId("task-absent")) is None
+    repository.close()
+
+
+def test_task_summary_aggregates_transfer_items(tmp_path) -> None:
+    repository = SqliteTaskRepository(tmp_path / "nasmove.db")
+    task = build_task_record()
+    first = _item("item-1", task.id, size=100, state=ItemState.PLANNED)
+    second = _item("item-2", task.id, size=200, state=ItemState.PLANNED)
+    repository.create_task(task, [first, second])
+
+    repository.save_checkpoint(Checkpoint(first.id, 100, 100, 0, 100, "a" * 64, 1))
+    current_first = repository.get_item(first.id)
+    repository.update_item_metadata(
+        replace(current_first, sha256="a" * 64, full_hash_verified=True, verified_session_generation=1),
+        current_first.revision,
+    )
+    for expected, target in (
+        (ItemState.PLANNED, ItemState.TRANSFERRING),
+        (ItemState.TRANSFERRING, ItemState.TRANSFERRED),
+        (ItemState.TRANSFERRED, ItemState.VERIFYING),
+        (ItemState.VERIFYING, ItemState.VERIFIED),
+        (ItemState.VERIFIED, ItemState.COMMITTED),
+        (ItemState.COMMITTED, ItemState.DONE),
+    ):
+        repository.transition_item(first.id, expected, target)
+
+    repository.save_checkpoint(Checkpoint(second.id, 200, 200, 0, 200, "b" * 64, 1))
+    current_second = repository.get_item(second.id)
+    repository.update_item_metadata(
+        replace(current_second, sha256="b" * 64, full_hash_verified=True, verified_session_generation=1),
+        current_second.revision,
+    )
+    for expected, target in (
+        (ItemState.PLANNED, ItemState.TRANSFERRING),
+        (ItemState.TRANSFERRING, ItemState.TRANSFERRED),
+        (ItemState.TRANSFERRED, ItemState.VERIFYING),
+        (ItemState.VERIFYING, ItemState.VERIFIED),
+        (ItemState.VERIFIED, ItemState.COMMITTED),
+    ):
+        repository.transition_item(second.id, expected, target)
+
+    summary = repository.task_summary(task.id)
+    assert summary.total_items == 2
+    assert summary.total_bytes == 300
+    assert summary.confirmed_bytes == 300
+    assert summary.done_items == 1
+    assert summary.committed_items == 2
+    assert summary.verified_items == 2
+    assert summary.all_committed is True
+    assert "item-2.bin" in summary.uncompleted_names
+    assert "item-1.bin" not in summary.uncompleted_names
+
+    empty = repository.task_summary(TaskId("task-non-existent"))
+    assert empty.total_items == 0
+    assert empty.all_committed is False
     repository.close()

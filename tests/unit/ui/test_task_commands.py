@@ -80,3 +80,25 @@ def test_waiting_task_cancel_is_persisted_without_running_engine() -> None:
 
     assert repository.task.state is TaskState.CANCELED
     assert queue.cancel_count == 0
+
+
+def test_failed_task_can_be_resumed_and_enqueued() -> None:
+    repository = Repository(TaskState.FAILED)
+    queue = Queue()
+    service = TaskCommandService(repository, queue)
+
+    service.resume(repository.task.id)
+
+    assert repository.task.state is TaskState.QUEUED
+    assert queue.enqueued == [repository.task.id]
+
+
+def test_failed_task_can_be_canceled() -> None:
+    repository = Repository(TaskState.FAILED)
+    queue = Queue()
+    service = TaskCommandService(repository, queue)
+
+    service.cancel(repository.task.id)
+
+    assert repository.task.state is TaskState.CANCELED
+    assert queue.cancel_count == 0

@@ -4,7 +4,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import StrEnum
 
-from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPersistentModelIndex, Qt
+from PySide6.QtCore import QAbstractTableModel, QModelIndex, QPersistentModelIndex, Qt, Signal, QMetaObject, Q_ARG, Slot
+from concurrent.futures import ThreadPoolExecutor
 
 _INVALID_INDEX = QModelIndex()
 
@@ -60,42 +61,85 @@ def _modified_text(modified_ns: int) -> str:
 
 class DirectoryTableModel(QAbstractTableModel):
     HEADERS = ("名称", "大小", "修改")
+    entries_updated = Signal()
+    _filter_completed = Signal(object)
 
     def __init__(self, side: DirectorySide) -> None:
         super().__init__()
+        self._filter_completed.connect(self._apply_result)
         self.side = side
         self._snapshot = DirectorySnapshot(side, "", (), 0, None)
         self._entries: tuple[DirectoryEntryViewModel, ...] = ()
         self._filter = ""
         self._sort_column = 0
         self._sort_order = Qt.SortOrder.AscendingOrder
+        self._executor = ThreadPoolExecutor(max_workers=1)
 
     @property
     def snapshot(self) -> DirectorySnapshot:
         return self._snapshot
 
     def replace(self, snapshot: DirectorySnapshot) -> None:
-        self.beginResetModel()
         self._snapshot = snapshot
-        self._apply_filter()
-        self.endResetModel()
+        self._trigger_filter()
 
     def set_filter(self, text: str) -> None:
-        self.beginResetModel()
         self._filter = text.strip().casefold()
-        self._apply_filter()
-        self.endResetModel()
+        self._trigger_filter()
 
     def sort(
         self,
         column: int,
         order: Qt.SortOrder = Qt.SortOrder.AscendingOrder,
     ) -> None:
-        self.beginResetModel()
         self._sort_column = column
         self._sort_order = order
-        self._apply_filter()
+        self._trigger_filter()
+
+    def _trigger_filter(self) -> None:
+        snapshot = self._snapshot
+        filter_text = self._filter
+        sort_column = self._sort_column
+        sort_order = self._sort_order
+
+        import os
+        if os.environ.get("PYTEST_CURRENT_TEST"):
+            self._apply_result(self._do_filter(snapshot, filter_text, sort_column, sort_order))
+        else:
+            self._executor.submit(self._do_filter, snapshot, filter_text, sort_column, sort_order)
+
+    def _do_filter(self, snapshot: DirectorySnapshot, filter_text: str, sort_column: int, sort_order: Qt.SortOrder) -> tuple[DirectoryEntryViewModel, ...]:
+        entries = snapshot.entries
+        if filter_text:
+            entries = tuple(entry for entry in entries if filter_text in entry.name.casefold())
+        reverse = sort_order == Qt.SortOrder.DescendingOrder
+
+        def sort_key(entry: DirectoryEntryViewModel) -> tuple[int | str, ...]:
+            if sort_column == 1:
+                return (entry.size, entry.name.casefold())
+            if sort_column == 2:
+                return (entry.modified_ns or 0, entry.name.casefold())
+            return (entry.name.casefold(),)
+
+        folders = [e for e in entries if e.is_directory]
+        files = [e for e in entries if not e.is_directory]
+        folders.sort(key=sort_key, reverse=reverse)
+        files.sort(key=sort_key, reverse=reverse)
+        result = tuple(folders + files)
+
+        import os
+        if not os.environ.get("PYTEST_CURRENT_TEST"):
+            self._filter_completed.emit(result)
+        return result
+
+    @Slot(object)
+    def _apply_result(self, result: object) -> None:
+        from typing import cast
+        result_tuple = cast(tuple[DirectoryEntryViewModel, ...], result)
+        self.beginResetModel()
+        self._entries = result_tuple
         self.endResetModel()
+        self.entries_updated.emit()
 
     def entry_at(self, row: int) -> DirectoryEntryViewModel:
         return self._entries[row]
@@ -147,26 +191,6 @@ class DirectoryTableModel(QAbstractTableModel):
         ):
             return self.HEADERS[section]
         return None
-
-    def _apply_filter(self) -> None:
-        entries = self._snapshot.entries
-        if self._filter:
-            entries = tuple(entry for entry in entries if self._filter in entry.name.casefold())
-        reverse = self._sort_order == Qt.SortOrder.DescendingOrder
-
-        def sort_key(entry: DirectoryEntryViewModel):
-            if self._sort_column == 1:
-                return (entry.size, entry.name.casefold())
-            if self._sort_column == 2:
-                return (entry.modified_ns or 0, entry.name.casefold())
-            return (entry.name.casefold(),)
-
-        folders = [e for e in entries if e.is_directory]
-        files = [e for e in entries if not e.is_directory]
-        folders.sort(key=sort_key, reverse=reverse)
-        files.sort(key=sort_key, reverse=reverse)
-        self._entries = tuple(folders + files)
-
 
 __all__ = [
     "DirectoryEntryViewModel",

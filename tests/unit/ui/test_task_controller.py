@@ -8,7 +8,7 @@ from threading import Thread, get_ident
 from PySide6.QtCore import QCoreApplication, Qt
 
 from nasmove.core.errors import SourceFileMissingError
-from nasmove.core.model import TaskId
+from nasmove.core.model import TaskId, TaskSummary
 from nasmove.core.states import TaskState
 from nasmove.transfer.checkpoint_writer import CancellationToken
 from nasmove.transfer.transfer_engine import TaskResult, TransferEvent
@@ -334,3 +334,91 @@ def test_exported_summary_includes_the_deletion_outcome(qtbot, tmp_path: Path) -
     assert "source_missing_after_move" in content
     assert "/private/share" not in content
     assert "OSError" not in content
+
+
+def test_all_committed_failed_source_deletion_displays_reassuring_diagnostics(qtbot) -> None:
+    page = TaskPage()
+    qtbot.addWidget(page)
+
+    class Repository:
+        def task_summary(self, task_id):
+            return TaskSummary(
+                total_items=48,
+                total_bytes=71718730806,
+                confirmed_bytes=71718730806,
+                done_items=46,
+                committed_items=48,
+                verified_items=48,
+                uncompleted_names=("video1.mp4", "video2.mp4"),
+            )
+
+        def last_ui_error(self, task_id):
+            return "file_locked"
+
+    controller = TaskController(page, repository=Repository())
+    task = replace(build_task_record(), total_files=48, total_bytes=71718730806, state=TaskState.FAILED)
+
+    controller.load_queue((task,))
+    page.queue_list.setCurrentRow(0)
+
+    # 1. phase_label accurately reflects phase rather than saying "等待任务开始"
+    assert "源文件移入废纸篓受阻" in page.phase_label.text()
+    assert "等待任务开始" not in page.phase_label.text()
+
+    # 2. safety_label reassures user that target NAS files are 100% safe and verified
+    assert "目标端数据安全无损" in page.safety_label.text()
+    assert "所有文件已完整写入 NAS" in page.safety_label.text()
+
+    # 3. result_summary explains all files copied to NAS
+    assert "全部复制到 NAS" in page.result_summary.text()
+
+    # 4. error_details contains structured report
+    details = page.error_details.toPlainText()
+    assert "【数据安全状态】" in details
+    assert "全部 48 个文件" in details
+    assert "【受阻环节】" in details
+    assert "【原因与错误代码】" in details
+    assert "file_locked" in details
+    assert "【受影响的文件】" in details
+    assert "video1.mp4" in details
+    assert "video2.mp4" in details
+    assert "【处理建议】" in details
+
+    # 5. details button is automatically expanded
+    assert page.details_button.isChecked() is True
+    assert not page.error_details.isHidden()
+
+
+def test_partial_failure_displays_exact_item_counts_and_local_safety(qtbot) -> None:
+    page = TaskPage()
+    qtbot.addWidget(page)
+
+    class Repository:
+        def task_summary(self, task_id):
+            return TaskSummary(
+                total_items=10,
+                total_bytes=10000,
+                confirmed_bytes=7000,
+                done_items=7,
+                committed_items=7,
+                verified_items=7,
+                uncompleted_names=("file8.txt", "file9.txt", "file10.txt"),
+            )
+
+        def last_ui_error(self, task_id):
+            return "disk_full"
+
+    controller = TaskController(page, repository=Repository())
+    task = replace(build_task_record(), total_files=10, total_bytes=10000, state=TaskState.FAILED)
+
+    controller.load_queue((task,))
+    page.queue_list.setCurrentRow(0)
+
+    assert "存储空间不足" in page.result_summary.text()
+    assert "部分数据已就绪：7 个文件已安全写入 NAS" in page.safety_label.text()
+    assert "未完成文件源文件完好保留在本机" in page.safety_label.text()
+
+    details = page.error_details.toPlainText()
+    assert "已成功写入 7/10 个文件" in details
+    assert "disk_full" in details
+    assert "file8.txt" in details

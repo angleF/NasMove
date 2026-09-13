@@ -269,3 +269,18 @@ def advance_revision[T: (TaskRecord, TransferItemRecord)](record: T) -> T:
     if not isinstance(record, (TaskRecord, TransferItemRecord)):
         raise TypeError("record must be a TaskRecord or TransferItemRecord")
     return replace(record, revision=record.revision + 1)
+
+
+@dataclass(frozen=True, slots=True)
+class TaskSummary:
+    total_items: int = 0
+    total_bytes: int = 0
+    confirmed_bytes: int = 0
+    done_items: int = 0
+    committed_items: int = 0
+    verified_items: int = 0
+    uncompleted_names: tuple[str, ...] = ()
+
+    @property
+    def all_committed(self) -> bool:
+        return self.total_items > 0 and self.committed_items >= self.total_items

@@ -115,6 +115,7 @@ TASK_ALLOWED_TRANSITIONS: dict[TaskState, set[TaskState]] = {
         TaskState.INTERRUPTED,
         TaskState.FAILED,
     },
+    TaskState.FAILED: {TaskState.QUEUED, TaskState.CANCELED},
 }
 
 

@@ -140,6 +140,7 @@ def test_create_move_task_plans_persists_then_enqueues(qtbot, tmp_path: Path) ->
 
     qtbot.waitUntil(lambda: application.enqueued == [TaskId("planned-task")])
     request = planner.requests[0]
+    assert request.name == "source.bin"
     assert request.connection.display_name == "Home NAS"
     assert request.sources == (source,)
     assert request.target_root.value == "incoming"
@@ -149,6 +150,34 @@ def test_create_move_task_plans_persists_then_enqueues(qtbot, tmp_path: Path) ->
         (TaskId("planned-task"), TaskState.PREFLIGHT, TaskState.QUEUED)
     ]
     assert target.creation_status_label.text() == "任务已加入队列"
+    assert controller is not None
+
+
+def test_task_creation_derives_name_for_multiple_sources(qtbot, tmp_path: Path) -> None:
+    source1 = tmp_path / "photo1.jpg"
+    source2 = tmp_path / "photo2.jpg"
+    source1.touch()
+    source2.touch()
+    connection = ConnectionPage()
+    sources = SourcePage()
+    target = TargetPage()
+    for page in (connection, sources, target):
+        qtbot.addWidget(page)
+    sources.set_sources([source1, source2])
+    target.set_selected_path("photos")
+    planner = Planner()
+    application = Application()
+    controller = TaskCreationController(
+        connection,
+        sources,
+        target,
+        planner=planner,
+        repository=Repository(),
+        application=application,
+    )
+    target.add_to_queue_button.click()
+    qtbot.waitUntil(lambda: len(planner.requests) == 1)
+    assert planner.requests[0].name == "photo1.jpg 等 2 个项目"
     assert controller is not None
 
 

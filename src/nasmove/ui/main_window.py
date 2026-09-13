@@ -4,7 +4,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import cast
 
-from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtCore import QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import QCloseEvent, QResizeEvent, QShowEvent
 from PySide6.QtWidgets import (
     QComboBox,
@@ -26,7 +26,6 @@ from nasmove.ui.directory_browser_controller import DirectoryBrowserController
 from nasmove.ui.directory_models import DirectorySide
 from nasmove.ui.navigation import AppDestination, AppNavigation
 from nasmove.ui.queue_execution_controller import QueueExecutionController
-from nasmove.ui.setup_workspace import SetupWorkspace
 from nasmove.ui.source_page import SourcePage
 from nasmove.ui.target_page import TargetPage
 from nasmove.ui.task_commands import TaskCommandService
@@ -46,6 +45,8 @@ _DESTINATION_TITLES = {
 
 
 class MainWindow(QMainWindow):
+    _capacity_queried = Signal(object)
+
     def __init__(
         self,
         *,
@@ -78,11 +79,6 @@ class MainWindow(QMainWindow):
         self.source_page = SourcePage()
         self.target_page = TargetPage(gateway=gateway)
         self.task_page = TaskPage()
-        self.setup_workspace = SetupWorkspace(
-            self.connection_page,
-            self.source_page,
-            self.target_page,
-        )
         self.transfer_workspace = TransferWorkspace(self.source_page, self.target_page)
         self.directory_browser = DirectoryBrowserController(gateway=gateway)
         self._local_browser_started = False
@@ -142,12 +138,13 @@ class MainWindow(QMainWindow):
         self._apply_theme(self.theme_controller.selected_theme())
         self.show_destination(AppDestination.WORKBENCH)
         self.connection_page.test_button.setText("连接并进入文件迁移")
+        self._task_states: dict[str, str] = {}
         if self.connection_page.profile_id is not None:
             self.connection_status_label.setText("NAS：正在恢复连接…")
             QTimer.singleShot(0, self.connection_page.test_connection)
 
     def _choose_target(self) -> None:
-        if not self.setup_workspace.connection_verified:
+        if not self.transfer_workspace.connection_verified:
             self.show_destination(AppDestination.CONNECTIONS)
             return
         self.target_dialog.open()
@@ -191,7 +188,7 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.navigation.destination_requested.connect(self.show_destination)
         self.navigation.activity_requested.connect(lambda: self.show_destination(AppDestination.QUEUE))
-        self.new_task_button.clicked.connect(lambda: self.show_destination(AppDestination.WORKBENCH))
+        self.new_task_button.clicked.connect(lambda *_: self.show_destination(AppDestination.WORKBENCH))
         self.task_page.connection_requested.connect(
             lambda: self.show_destination(AppDestination.CONNECTIONS)
         )
@@ -200,10 +197,6 @@ class MainWindow(QMainWindow):
         )
         self.connection_page.report_ready.connect(self._connection_reported)
         self.connection_page.configuration_changed.connect(self._connection_changed)
-        self.setup_workspace.edit_connection_requested.connect(
-            lambda: self.show_destination(AppDestination.CONNECTIONS)
-        )
-        self.setup_workspace.edit_target_requested.connect(self._choose_target)
         self.transfer_workspace.edit_connection_requested.connect(
             lambda: self.show_destination(AppDestination.CONNECTIONS)
         )
@@ -224,11 +217,11 @@ class MainWindow(QMainWindow):
             lambda _task_id: self.show_destination(AppDestination.QUEUE)
         )
         if self.task_creation_controller is not None:
-            self.task_creation_controller.creating_changed.connect(self.setup_workspace.set_creating)
             self.task_creation_controller.creating_changed.connect(
                 self.transfer_workspace.set_creating
             )
         self.task_controller.workspace_state_changed.connect(self._show_task_workspace)
+        self.task_controller.task_state_updated.connect(self._on_task_state_updated)
         self.directory_browser.snapshot_ready.connect(
             self.transfer_workspace.apply_directory_snapshot
         )
@@ -248,6 +241,7 @@ class MainWindow(QMainWindow):
         self.transfer_workspace.remote_pane.new_folder_requested.connect(self._create_remote_folder)
         self.theme_selector.currentIndexChanged.connect(self._select_theme)
         self.theme_controller.theme_changed.connect(self._apply_theme)
+        self._capacity_queried.connect(self.transfer_workspace.device_sidebar.show_capacity)
 
     def show_destination(self, destination: AppDestination) -> None:
         if destination is AppDestination.CONNECTIONS:
@@ -298,11 +292,28 @@ class MainWindow(QMainWindow):
             self.target_page.start_browsing()
             if self.directory_browser.can_browse_remote:
                 self.directory_browser.browse_remote(None, str(config.profile_id))
+            self._trigger_capacity_query()
             if self.content_stack.currentWidget() is self.connection_page:
                 self.show_destination(AppDestination.WORKBENCH)
         else:
             self.connection_status_label.setText("NAS：连接测试失败")
             self.transfer_workspace.set_connection_verified(False)
+
+    def _trigger_capacity_query(self) -> None:
+        gateway = getattr(self, "_gateway", None)
+        query_fn = getattr(gateway, "free_space_share_root", None)
+        if not callable(query_fn):
+            return
+        
+        import threading
+        def worker() -> None:
+            try:
+                free_bytes = query_fn()
+                self._capacity_queried.emit(free_bytes)
+            except Exception:
+                self._capacity_queried.emit(None)
+                
+        threading.Thread(target=worker, daemon=True).start()
 
     def _connection_changed(self) -> None:
         self._invalidate_connection_context("NAS：账号已更改，请连接")
@@ -429,7 +440,6 @@ class MainWindow(QMainWindow):
             )
 
     def _invalidate_connection_context(self, message: str) -> None:
-        self.setup_workspace.set_connection_verified(False)
         self.transfer_workspace.set_connection_verified(False)
         self.directory_browser.invalidate(DirectorySide.REMOTE)
         reset = getattr(self._gateway, "reset_connection", None)
@@ -473,6 +483,7 @@ class MainWindow(QMainWindow):
         self.source_page.set_sources([])
         self.transfer_workspace.local_pane.table.clearSelection()
         self.task_controller.append_task(task)
+        self._task_states[str(getattr(task, "id", ""))] = str(getattr(getattr(task, "state", None), "value", ""))
         self._update_active_task_count()
         if self.queue_execution is not None:
             self.queue_execution.start()
@@ -539,7 +550,7 @@ class MainWindow(QMainWindow):
             try:
                 target.mkdir(parents=False, exist_ok=False)
                 self.directory_browser.browse_local(Path(location))
-            except Exception as exc:
+            except Exception as exc:  # noqa: BLE001 - user feedback for folder creation failures
                 self.connection_status_label.setText(f"新建本地文件夹失败：{exc}")
 
     def _create_remote_folder(self, name: str) -> None:
@@ -566,6 +577,10 @@ class MainWindow(QMainWindow):
         pane_name = "Mac" if side is DirectorySide.LOCAL else "NAS"
         self.connection_status_label.setText(f"{pane_name} 目录读取失败：{code}")
 
+    def _on_task_state_updated(self, task_id: object, state: object) -> None:
+        self._task_states[str(task_id)] = str(getattr(state, "value", state))
+        self._update_active_task_count()
+
     def _update_active_task_count(self) -> None:
         active_states = {
             "queued",
@@ -575,13 +590,17 @@ class MainWindow(QMainWindow):
             "deleting_source",
             "waiting_for_network",
         }
-        count = sum(
-            1
-            for row in range(self.task_page.queue_list.count())
-            if str(self.task_page.queue_list.item(row).data(Qt.ItemDataRole.UserRole + 1))
-            in active_states
-        )
+        # Populate from queue on first call if empty and there are tasks
+        if not self._task_states and hasattr(self, "task_controller") and self.task_controller._tasks:
+            for t in self.task_controller._tasks:
+                self._task_states[str(getattr(t, "id", ""))] = str(getattr(getattr(t, "state", None), "value", ""))
+        count = sum(1 for state in self._task_states.values() if state in active_states)
         self.navigation.set_active_task_count(count)
+
+    @property
+    def setup_workspace(self) -> TransferWorkspace:
+        """Compatibility alias for the active workbench workspace."""
+        return self.transfer_workspace
 
     @staticmethod
     def _message_page(title: str, message: str) -> QWidget:

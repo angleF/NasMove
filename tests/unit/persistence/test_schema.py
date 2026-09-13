@@ -14,7 +14,6 @@ from nasmove.persistence.schema import (
     SCHEMA_VERSION,
     _expected_legacy_schema_fingerprint,
     _legacy_trigger_sql,
-    _trigger_sql,
     initialize_database,
     schema_fingerprint,
 )
@@ -45,7 +44,7 @@ def test_schema_initializes_durable_pragmas_and_required_tables(tmp_path) -> Non
     } <= names
     assert connection.execute(
         "SELECT value FROM schema_meta WHERE key = 'version'"
-    ).fetchone()[0] == SCHEMA_VERSION == "7"
+    ).fetchone()[0] == SCHEMA_VERSION == "8"
     profile_columns = {
         row[1] for row in connection.execute("PRAGMA table_info(connection_profiles)")
     }
@@ -91,7 +90,7 @@ def test_schema_v3_is_migrated_without_losing_connection_profiles(tmp_path) -> N
 
     assert connection.execute(
         "SELECT value FROM schema_meta WHERE key = 'version'"
-    ).fetchone()[0] == "7"
+    ).fetchone()[0] == "8"
     assert connection.execute(
         "SELECT display_name, is_archived FROM connection_profiles WHERE profile_id = ?",
         ("home-nas",),
@@ -120,7 +119,7 @@ def test_schema_v4_is_migrated_with_keep_both_default(tmp_path) -> None:
 
     assert connection.execute(
         "SELECT value FROM schema_meta WHERE key = 'version'"
-    ).fetchone()[0] == "7"
+    ).fetchone()[0] == "8"
     column = next(
         row for row in connection.execute("PRAGMA table_info(tasks)")
         if row[1] == "conflict_strategy"
@@ -132,7 +131,7 @@ def test_schema_v4_is_migrated_with_keep_both_default(tmp_path) -> None:
 def create_exact_v5_database(path):
     connection = sqlite3.connect(path)
     connection.executescript(
-        SCHEMA_SQL + _trigger_sql() + PROFILE_ARCHIVE_SQL + CONFLICT_STRATEGY_SQL
+        SCHEMA_SQL + _legacy_trigger_sql("5") + PROFILE_ARCHIVE_SQL + CONFLICT_STRATEGY_SQL
     )
     connection.execute(
         "INSERT INTO connection_profiles(profile_id, display_name, host, port, share, "
@@ -165,7 +164,7 @@ def test_schema_v5_migrates_parallel_item_defaults(tmp_path) -> None:
     initialize_database(connection)
     assert connection.execute(
         "SELECT value FROM schema_meta WHERE key = 'version'"
-    ).fetchone()[0] == "7"
+    ).fetchone()[0] == "8"
     assert connection.execute(
         "SELECT max_parallel_items FROM connection_profiles"
     ).fetchone()[0] == 2
@@ -258,7 +257,7 @@ def test_schema_v3_migration_hard_exit_is_recoverable(
     reopened = sqlite3.connect(path)
     assert reopened.execute(
         "SELECT value FROM schema_meta WHERE key = 'version'"
-    ).fetchone()[0] == "7"
+    ).fetchone()[0] == "8"
     assert reopened.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     reopened.close()
 
@@ -279,7 +278,7 @@ def _assert_bootstrap_recovered(path) -> None:
     ).fetchone()[0]
     assert connection.execute(
         "SELECT value FROM schema_meta WHERE key = 'version'"
-    ).fetchone()[0] == "7"
+    ).fetchone()[0] == "8"
     assert stored_hash == schema_fingerprint(connection)
     assert connection.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     connection.close()
@@ -334,7 +333,7 @@ def create_exact_v6_database(path):
     connection = sqlite3.connect(path)
     connection.executescript(
         SCHEMA_SQL
-        + _trigger_sql()
+        + _legacy_trigger_sql("6")
         + PROFILE_ARCHIVE_SQL
         + CONFLICT_STRATEGY_SQL
         + PARALLEL_ITEMS_SQL
@@ -358,7 +357,7 @@ def test_expected_v6_fingerprint_is_frozen() -> None:
     assert _expected_legacy_schema_fingerprint("6") == V6_SCHEMA_FINGERPRINT
 
 
-def test_schema_v6_migrates_to_v7_and_preserves_profiles(tmp_path) -> None:
+def test_schema_v6_migrates_to_v8_and_preserves_profiles(tmp_path) -> None:
     connection = create_exact_v6_database(tmp_path / "schema-v6.db")
     assert schema_fingerprint(connection) == V6_SCHEMA_FINGERPRINT
 
@@ -366,7 +365,7 @@ def test_schema_v6_migrates_to_v7_and_preserves_profiles(tmp_path) -> None:
 
     assert connection.execute(
         "SELECT value FROM schema_meta WHERE key = 'version'"
-    ).fetchone()[0] == "7"
+    ).fetchone()[0] == "8"
     assert connection.execute(
         "SELECT display_name, is_archived, max_parallel_items FROM connection_profiles "
         "WHERE profile_id = ?",
@@ -426,4 +425,77 @@ def test_credentials_table_shape_and_foreign_key(tmp_path) -> None:
         )
     with pytest.raises(sqlite3.IntegrityError):
         connection.execute("INSERT INTO credentials(profile_id, password) VALUES ('p2', NULL)")
+    connection.close()
+
+
+V7_SCHEMA_FINGERPRINT = "b085a0e6d762ebafb4c29ee3c4978ef8013bd7c680b7ad8d6cdc013c53e3b086"
+
+
+def create_exact_v7_database(path):
+    from nasmove.persistence.schema import CREDENTIALS_SQL
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        SCHEMA_SQL
+        + _legacy_trigger_sql("7")
+        + PROFILE_ARCHIVE_SQL
+        + CONFLICT_STRATEGY_SQL
+        + PARALLEL_ITEMS_SQL
+        + CREDENTIALS_SQL
+    )
+    connection.execute(
+        "INSERT INTO connection_profiles(profile_id, display_name, host, port, share, "
+        "username, require_encryption, minimum_dialect, keychain_account) "
+        "VALUES ('v7-profile', 'V7 NAS', 'nas.v7', 445, 'share', 'user', 1, '3.0', 'v7-profile')"
+    )
+    connection.execute("INSERT INTO credentials(profile_id, password) VALUES ('v7-profile', 'secret')")
+    connection.execute(
+        "INSERT INTO tasks(task_id, name, action, profile_id, connection_display_name, "
+        "connection_host, connection_port, connection_share, connection_username, "
+        "connection_require_encryption, connection_minimum_dialect, target_root, "
+        "conflict_policy, conflict_strategy, verification_policy, state, queue_position, "
+        "recovery_generation, total_files, total_bytes, copied_bytes, verified_bytes, "
+        "revision, created_at, updated_at) VALUES ('v7-task', 'V7 task', 'copy', "
+        "'v7-profile', 'V7 NAS', 'nas.v7', 445, 'share', 'user', 1, '3.0', 'target', "
+        "'auto_rename', 'keep_both', 'full', 'queued', 0, 0, 0, 0, 0, 0, 0, "
+        "'2026-09-12T00:00:00+00:00', '2026-09-12T00:00:00+00:00')"
+    )
+    connection.execute("UPDATE tasks SET state = 'running' WHERE task_id = 'v7-task'")
+    connection.execute("UPDATE tasks SET state = 'failed' WHERE task_id = 'v7-task'")
+    connection.execute("INSERT INTO schema_meta VALUES ('version', '7')")
+    connection.execute(
+        "INSERT INTO schema_meta VALUES (?, ?)",
+        (SCHEMA_HASH_KEY, schema_fingerprint(connection)),
+    )
+    connection.commit()
+    return connection
+
+
+def test_expected_v7_fingerprint_is_frozen() -> None:
+    assert _expected_legacy_schema_fingerprint("7") == V7_SCHEMA_FINGERPRINT
+
+
+def test_schema_v7_migrates_to_v8_and_enables_failed_task_retry(tmp_path) -> None:
+    connection = create_exact_v7_database(tmp_path / "schema-v7.db")
+    assert schema_fingerprint(connection) == V7_SCHEMA_FINGERPRINT
+
+    # In v7, transitioning from failed to queued raises abort from tasks_state_guard
+    with pytest.raises(sqlite3.DatabaseError, match="invalid state transition"):
+        connection.execute("UPDATE tasks SET state = 'queued' WHERE task_id = 'v7-task'")
+    connection.rollback()
+
+    initialize_database(connection)
+
+    assert connection.execute(
+        "SELECT value FROM schema_meta WHERE key = 'version'"
+    ).fetchone()[0] == "8"
+    assert connection.execute(
+        "SELECT value FROM schema_meta WHERE key = ?", (SCHEMA_HASH_KEY,)
+    ).fetchone()[0] == schema_fingerprint(connection)
+
+    # In v8, transitioning from failed to queued succeeds
+    connection.execute("UPDATE tasks SET state = 'queued' WHERE task_id = 'v7-task'")
+    connection.commit()
+    assert connection.execute(
+        "SELECT state FROM tasks WHERE task_id = 'v7-task'"
+    ).fetchone()[0] == "queued"
     connection.close()

@@ -41,6 +41,11 @@ class TransferAction(StrEnum):
 
 
 class ConflictPolicy(StrEnum):
+    """File conflict resolution policies when target exists on remote.
+
+    AUTO_RENAME is a backward-compatible alias for KEEP_BOTH.
+    """
+
     KEEP_BOTH = "keep_both"
     OVERWRITE = "overwrite"
     SKIP = "skip"

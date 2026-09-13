@@ -35,7 +35,12 @@ NasMove 的核心工程理念是 **“中断是常态，数据完整性是底线
 - **原子重命名提交**：以临时文件名写入，校验通过后执行原子重命名生效，避免竞争或不完整文件被意外消费；
 - **平滑速度曲线**：采用指数移动平均（EMA $\alpha=0.2$）算法计算实时传输速度与估算剩余时间（ETA），消除剧烈抖动。
 
-### 3. 🎨 原生 macOS 视觉与无障碍体验 (Native macOS UX)
+### 3. 📋 全生命周期任务队列与归档管理 (Task & Queue Management)
+- **灵活队列调度**：支持任务暂停、继续、失败快速重试、取消与动态置顶，运行中独占保护与平滑状态流转；
+- **安全删除与存储归档**：支持对已完成、完成警告、已失败及已取消的终态任务进行一键彻底删除与归档，通过 SQLite 外键级联（`ON DELETE CASCADE`）完整清理任务项、检查点与尝试记录，释放持久化存储；
+- **自适应微型队列面板**：双栏工作台内嵌可折叠队列，针对窄边栏重构流式双行操作按钮，消除文字挤压变形；强制关闭列表冗余横向滚动条，搭配全新轻量滚动条 QSS 样式。
+
+### 4. 🎨 原生 macOS 视觉与无障碍体验 (Native macOS UX)
 - **专属 macOS 原生图标**：精心打造黑曜石极客版（Obsidian Neon）应用图标，符合 Apple Human Interface Guidelines 规范，具备标准 Squircle（超椭圆）曲率、多层柔和环境悬浮阴影与 10 档 Retina 高清分辨率；
 - **常驻导航侧边栏**：左侧主导航栏常驻可见，方便在「迁移工作台」、「任务队列」、「账号与连接」之间无缝切换；在任务详情页提供 `‹ 返回迁移工作台` 快捷链路；
 - **全场景自适应主题**：
@@ -120,3 +125,4 @@ bash scripts/build_macos_app.sh
 - [多配置与多工作线程并发架构](docs/superpowers/specs/2026-09-11-nas-profile-item-concurrency-design.md)
 - [Synology 测试验证矩阵](docs/verification/synology-test-matrix.md)
 - [发布检验清单](docs/verification/release-checklist.md)
+- [交互修复与任务生命周期改动记录 (2026-09-13)](docs/changelogs/2026-09-13-ui-interaction-and-task-management.md)

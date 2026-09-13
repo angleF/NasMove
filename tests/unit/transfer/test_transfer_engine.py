@@ -89,14 +89,9 @@ class _ParallelWorkerHarness:
                     ItemState.INTERRUPTED,
                     error=self.failure_error,
                 )
-            deadline = time.monotonic() + 2
-            while not token.cancel_requested:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("internal stop was not delivered")
-                time.sleep(0.001)
-            self.internal_cancel_seen.set()
-            token.request_cancel()
-            return ItemRunOutcome(item_id, ItemState.INTERRUPTED)
+            if not self.overlap_reached.wait(2):
+                raise TimeoutError("parallel peer did not start")
+            return ItemRunOutcome(item_id, ItemState.DONE)
         if self.behavior in {
             "retryable-first",
             "retryable-first-nonretryable-peer",
@@ -137,11 +132,8 @@ class _ParallelWorkerHarness:
                     ItemState.INTERRUPTED,
                     error=self.failure_error,
                 )
-            deadline = time.monotonic() + 2
-            while not token.cancel_requested:
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("internal stop was not delivered")
-                time.sleep(0.001)
+            if not self.overlap_reached.wait(2):
+                raise TimeoutError("parallel peer did not start")
             return ItemRunOutcome(
                 item_id,
                 ItemState.INTERRUPTED,
@@ -273,17 +265,8 @@ def test_parallel_limit_one_preserves_planned_item_order() -> None:
     assert harness.started == [TransferItemId(f"item-{index}") for index in range(1, 5)]
 
 
-@pytest.mark.parametrize(
-    ("behavior", "expected_state"),
-    [
-        ("fail-first", TaskState.FAILED),
-        ("retryable-first", TaskState.WAITING_FOR_NETWORK),
-    ],
-)
-def test_parallel_failure_stops_new_items_without_canceling_user_token(
-    behavior, expected_state
-) -> None:
-    harness = _ParallelWorkerHarness(2, behavior)
+def test_parallel_retryable_failure_stops_new_items_without_canceling_user_token() -> None:
+    harness = _ParallelWorkerHarness(2, "retryable-first")
     engine, repository, task, _ = _parallel_engine(
         max_parallel_items=2,
         item_count=4,
@@ -293,11 +276,38 @@ def test_parallel_failure_stops_new_items_without_canceling_user_token(
 
     result = engine.run_task(task.id, token)
 
-    assert result.state is expected_state
-    assert repository.get_task(task.id).state is expected_state
+    assert result.state is TaskState.WAITING_FOR_NETWORK
+    assert repository.get_task(task.id).state is TaskState.WAITING_FOR_NETWORK
     assert set(harness.started) == {TransferItemId("item-1"), TransferItemId("item-2")}
     assert set(harness.closed) == set(harness.started)
     assert harness.internal_cancel_seen.is_set()
+    assert token.cancel_requested is False
+    assert token.pause_requested is False
+
+
+def test_parallel_nonretryable_failure_continues_remaining_items() -> None:
+    harness = _ParallelWorkerHarness(2, "fail-first")
+    engine, repository, task, _ = _parallel_engine(
+        max_parallel_items=2,
+        item_count=4,
+        harness=harness,
+    )
+    token = CancellationToken()
+
+    result = engine.run_task(task.id, token)
+
+    assert result.state is TaskState.FAILED
+    assert repository.get_task(task.id).state is TaskState.FAILED
+    assert set(harness.started) == {
+        TransferItemId("item-1"),
+        TransferItemId("item-2"),
+        TransferItemId("item-3"),
+        TransferItemId("item-4"),
+    }
+    assert set(harness.closed) == set(harness.started)
+    assert result.completed_items == 3
+    assert result.failed_items == 1
+    assert result.error is harness.failure_error
     assert token.cancel_requested is False
     assert token.pause_requested is False
 
@@ -357,17 +367,10 @@ def test_late_user_cancel_does_not_replace_retryable_first_error() -> None:
     assert repository.get_task(task.id).state is TaskState.WAITING_FOR_NETWORK
 
 
-@pytest.mark.parametrize(
-    ("behavior", "expected_state", "error_attribute"),
-    [
-        ("retryable-first", TaskState.WAITING_FOR_NETWORK, "retryable_error"),
-        ("fail-first", TaskState.FAILED, "failure_error"),
-    ],
-)
-def test_completed_worker_error_is_frozen_before_scheduler_observes_late_cancel(
-    monkeypatch, behavior, expected_state, error_attribute
+def test_completed_retryable_error_is_frozen_before_scheduler_observes_late_cancel(
+    monkeypatch,
 ) -> None:
-    harness = _ParallelWorkerHarness(2, behavior)
+    harness = _ParallelWorkerHarness(2, "retryable-first")
     engine, repository, task, _ = _parallel_engine(
         max_parallel_items=2,
         item_count=4,
@@ -398,9 +401,47 @@ def test_completed_worker_error_is_frozen_before_scheduler_observes_late_cancel(
 
     assert not runner.is_alive()
     assert token.cancel_requested is True
-    assert results[0].state is expected_state
-    assert results[0].error is getattr(harness, error_attribute)
-    assert repository.get_task(task.id).state is expected_state
+    assert results[0].state is TaskState.WAITING_FOR_NETWORK
+    assert results[0].error is harness.retryable_error
+    assert repository.get_task(task.id).state is TaskState.WAITING_FOR_NETWORK
+
+
+def test_nonretryable_worker_failure_allows_subsequent_user_cancel(
+    monkeypatch,
+) -> None:
+    harness = _ParallelWorkerHarness(2, "fail-first")
+    engine, repository, task, _ = _parallel_engine(
+        max_parallel_items=2,
+        item_count=4,
+        harness=harness,
+    )
+    token = CancellationToken()
+    wait_has_completed_future = Event()
+    release_scheduler = Event()
+    real_wait = transfer_engine_module.wait
+
+    def blocked_wait(*args, **kwargs):
+        result = real_wait(*args, **kwargs)
+        wait_has_completed_future.set()
+        if not release_scheduler.wait(2):
+            raise TimeoutError("scheduler processing was not released")
+        return result
+
+    monkeypatch.setattr(transfer_engine_module, "wait", blocked_wait)
+    results: list[TaskResult] = []
+    runner = Thread(target=lambda: results.append(engine.run_task(task.id, token)))
+    runner.start()
+    try:
+        assert wait_has_completed_future.wait(2)
+        token.request_cancel()
+    finally:
+        release_scheduler.set()
+    runner.join(2)
+
+    assert not runner.is_alive()
+    assert token.cancel_requested is True
+    assert results[0].state is TaskState.CANCELED
+    assert repository.get_task(task.id).state is TaskState.CANCELED
 
 
 @pytest.mark.parametrize(
@@ -954,12 +995,70 @@ def test_unhandled_future_exception_is_item_and_task_visible() -> None:
     assert result.state is TaskState.FAILED
     assert isinstance(result.error, RuntimeError)
     assert repository.get_task(task.id).state is TaskState.FAILED
-    assert harness.started == harness.closed == [TransferItemId("item-1")]
+    assert harness.started == harness.closed == [
+        TransferItemId("item-1"),
+        TransferItemId("item-2"),
+    ]
     assert any(
         event.item_id == TransferItemId("item-1")
         and isinstance(event.error, RuntimeError)
         for event in events
     )
+
+
+def test_ten_items_one_fails_nine_succeed_and_resume_retries_failed() -> None:
+    class _FlakyWorkerHarness:
+        def __init__(self) -> None:
+            self.fail_item_3 = True
+            self.executed: list[TransferItemId] = []
+            self.failure_error = PermissionError("access denied on item-3")
+
+        def factory(self, task, password):
+            del task, password
+            return self
+
+        def run(self, item, task, token):
+            del task, token
+            self.executed.append(item.id)
+            if item.id == TransferItemId("item-3") and self.fail_item_3:
+                return ItemRunOutcome(item.id, ItemState.INTERRUPTED, error=self.failure_error)
+            return ItemRunOutcome(item.id, ItemState.DONE)
+
+        def close(self):
+            pass
+
+    harness = _FlakyWorkerHarness()
+    engine, repository, task, _ = _parallel_engine(
+        max_parallel_items=3,
+        item_count=10,
+        harness=harness,
+    )
+
+    result = engine.run_task(task.id, CancellationToken())
+
+    # 1. First run: 10 executed, 9 succeeded, 1 failed, task FAILED
+    assert result.state is TaskState.FAILED
+    assert result.completed_items == 9
+    assert result.failed_items == 1
+    assert result.error is harness.failure_error
+    assert repository.get_task(task.id).state is TaskState.FAILED
+    assert len(harness.executed) == 10
+
+    # 2. Transition failed task back to queued (resume)
+    repository.transition_task(task.id, TaskState.FAILED, TaskState.QUEUED)
+    assert repository.get_task(task.id).state is TaskState.QUEUED
+
+    # 3. Item 3 issue resolved, retry
+    harness.fail_item_3 = False
+    harness.executed.clear()
+
+    result2 = engine.run_task(task.id, CancellationToken())
+
+    # 4. Second run: all 10 items are now done!
+    assert result2.state is TaskState.COMPLETED
+    assert result2.completed_items == 10
+    assert result2.failed_items == 0
+    assert repository.get_task(task.id).state is TaskState.COMPLETED
 
 
 def test_move_item_follows_copy_verify_commit_delete_order(engine_fixture) -> None:

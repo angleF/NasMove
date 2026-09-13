@@ -9,8 +9,8 @@ from typing import TypeVar
 from nasmove.core.states import ItemState, TaskState
 from nasmove.core.transitions import ITEM_TRANSITIONS, TASK_TRANSITIONS
 
-SCHEMA_VERSION = "7"
-LEGACY_SCHEMA_VERSIONS = ("6", "5", "4", "3")
+SCHEMA_VERSION = "8"
+LEGACY_SCHEMA_VERSIONS = ("7", "6", "5", "4", "3")
 SCHEMA_HASH_KEY = "schema_hash"
 CORE_TABLES = frozenset(
     {
@@ -198,13 +198,21 @@ def _trigger_sql() -> str:
     )
 
 
-def _legacy_trigger_sql() -> str:
+def _legacy_task_transitions_v7() -> dict[TaskState, frozenset[TaskState]]:
+    transitions = dict(TASK_TRANSITIONS)
+    transitions.pop(TaskState.FAILED, None)
+    return transitions
+
+
+def _legacy_trigger_sql(version: str = "4") -> str:
+    legacy_task_transitions = _legacy_task_transitions_v7()
     legacy_item_transitions = dict(ITEM_TRANSITIONS)
-    verified_targets = set(ITEM_TRANSITIONS[ItemState.VERIFIED])
-    verified_targets.discard(ItemState.SKIPPED)
-    legacy_item_transitions[ItemState.VERIFIED] = frozenset(verified_targets)
+    if version in ("3", "4"):
+        verified_targets = set(ITEM_TRANSITIONS[ItemState.VERIFIED])
+        verified_targets.discard(ItemState.SKIPPED)
+        legacy_item_transitions[ItemState.VERIFIED] = frozenset(verified_targets)
     return (
-        _transition_trigger("tasks", TASK_TRANSITIONS, "tasks_state_guard")
+        _transition_trigger("tasks", legacy_task_transitions, "tasks_state_guard")
         + _transition_trigger(
             "transfer_items",
             legacy_item_transitions,
@@ -257,10 +265,19 @@ def expected_schema_fingerprint() -> str:
 def _expected_legacy_schema_fingerprint(version: str) -> str:
     connection = sqlite3.connect(":memory:")
     try:
-        if version == "6":
+        if version == "7":
             connection.executescript(
                 SCHEMA_SQL
-                + _trigger_sql()
+                + _legacy_trigger_sql("7")
+                + PROFILE_ARCHIVE_SQL
+                + CONFLICT_STRATEGY_SQL
+                + PARALLEL_ITEMS_SQL
+                + CREDENTIALS_SQL
+            )
+        elif version == "6":
+            connection.executescript(
+                SCHEMA_SQL
+                + _legacy_trigger_sql("6")
                 + PROFILE_ARCHIVE_SQL
                 + CONFLICT_STRATEGY_SQL
                 + PARALLEL_ITEMS_SQL
@@ -268,13 +285,13 @@ def _expected_legacy_schema_fingerprint(version: str) -> str:
         elif version == "5":
             connection.executescript(
                 SCHEMA_SQL
-                + _trigger_sql()
+                + _legacy_trigger_sql("5")
                 + PROFILE_ARCHIVE_SQL
                 + CONFLICT_STRATEGY_SQL
             )
         else:
             suffix = PROFILE_ARCHIVE_SQL if version == "4" else ""
-            connection.executescript(SCHEMA_SQL + _legacy_trigger_sql() + suffix)
+            connection.executescript(SCHEMA_SQL + _legacy_trigger_sql(version) + suffix)
         return schema_fingerprint(connection)
     finally:
         connection.close()
@@ -364,9 +381,19 @@ def _migrate_legacy_schema(connection: sqlite3.Connection, version: str) -> None
             for statement in PARALLEL_ITEMS_SQL.split(";"):
                 if statement.strip():
                     connection.execute(statement)
-        for statement in CREDENTIALS_SQL.split(";"):
-            if statement.strip():
-                connection.execute(statement)
+        if version in ("3", "4", "5", "6"):
+            for statement in CREDENTIALS_SQL.split(";"):
+                if statement.strip():
+                    connection.execute(statement)
+        if version in ("3", "4", "5", "6", "7"):
+            connection.execute("DROP TRIGGER IF EXISTS tasks_state_guard")
+            connection.execute(
+                _transition_trigger(
+                    "tasks",
+                    TASK_TRANSITIONS,
+                    "tasks_state_guard",
+                )
+            )
         actual_hash = schema_fingerprint(connection)
         if actual_hash != expected_hash:
             raise RuntimeError("migrated database does not match the current schema")

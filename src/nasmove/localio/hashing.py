@@ -44,12 +44,15 @@ def sha256_stream(stream: BinaryIO, block_size: int = _DEFAULT_BLOCK_SIZE, *, pr
     return HashResult(hexdigest=digest.hexdigest(), byte_count=byte_count)
 
 
-def sha256_range(stream: BinaryIO, start: int, length: int) -> str:
+def sha256_range(stream: BinaryIO, start: int, length: int, stream_size: int | None = None) -> str:
     start = _validate_non_negative_int(start, "start")
     length = _validate_non_negative_int(length, "length")
 
-    stream.seek(0, os.SEEK_END)
-    end = stream.tell()
+    if stream_size is None:
+        stream.seek(0, os.SEEK_END)
+        end = stream.tell()
+    else:
+        end = _validate_non_negative_int(stream_size, "stream_size")
     if start > end or length > end - start:
         raise ValueError("requested range is outside the stream")
     stream.seek(start, os.SEEK_SET)

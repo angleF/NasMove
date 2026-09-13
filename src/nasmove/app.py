@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import fcntl
 import os
 import sqlite3
 import stat
@@ -8,12 +7,36 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Thread
-from typing import Any, cast
+from typing import Any, Protocol, cast, runtime_checkable
 
 from nasmove.core.states import TaskState
 from nasmove.persistence.sqlite_repository import SqliteTaskRepository
 from nasmove.transfer.checkpoint_writer import CancellationToken
 from nasmove.transfer.recovery import RecoveryCoordinator
+
+
+@runtime_checkable
+class AppTaskRepository(Protocol):
+    def list_tasks(self) -> list[Any]: ...
+
+    def transition_task(self, task_id: Any, expected: TaskState, target: TaskState) -> None: ...
+
+    def mark_active_tasks_interrupted(self) -> int: ...
+
+
+@runtime_checkable
+class AppQueueCoordinator(Protocol):
+    def enqueue(self, task_id: Any) -> None: ...
+
+
+@runtime_checkable
+class AppCredentialStore(Protocol):
+    def get_password(self, profile_id: str) -> str | None: ...
+
+
+@runtime_checkable
+class AppSmbGateway(Protocol):
+    def disconnect(self) -> None: ...
 
 _APPLICATION_DIR = Path("Library") / "Application Support" / "NasMove"
 _DEFAULT_LOCK_NAME = "app.lock"
@@ -81,24 +104,34 @@ class SingleInstanceLock:
             fd = os.open(self.path, flags, 0o600)
         except FileExistsError:
             return False
+        opened_fd: int | None = fd
         try:
-            info = os.fstat(fd)
-            if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
-                raise PermissionError("application lock must be an owned regular file")
-            os.fchmod(fd, 0o600)
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return False
-            self._fd = fd
-            return True
-        except BaseException:
-            os.close(fd)
-            raise
-        finally:
-            if self._fd is None:
+            import sys
+            if sys.platform == "win32":
+                import msvcrt
                 try:
-                    os.close(fd)
+                    msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    return False
+            else:
+                import fcntl
+                info = os.fstat(fd)
+                if getattr(info, "st_uid", -1) != getattr(os, "getuid", lambda: -1)():
+                    raise PermissionError("application lock must be an owned regular file")
+                if not stat.S_ISREG(info.st_mode):
+                    raise PermissionError("application lock must be an owned regular file")
+                os.fchmod(fd, 0o600)
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return False
+            self._fd = fd
+            opened_fd = None
+            return True
+        finally:
+            if opened_fd is not None:
+                try:
+                    os.close(opened_fd)
                 except OSError:
                     pass
 
@@ -107,12 +140,22 @@ class SingleInstanceLock:
         if fd is None:
             return
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            import sys
+            if sys.platform == "win32":
+                import msvcrt
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
 
     def _prepare_parent(self) -> None:
         parent = self.path.parent
+        import sys
+        if sys.platform == "win32":
+            parent.mkdir(parents=True, exist_ok=True)
+            return
         self._reject_symlink_ancestors(parent)
         try:
             info = os.lstat(parent)
@@ -148,13 +191,13 @@ class ApplicationService:
 
     def __init__(
         self,
-        repository: object | None = None,
+        repository: AppTaskRepository | SqliteTaskRepository | object | None = None,
         recovery: RecoveryCoordinator | object | None = None,
-        queue: object | None = None,
+        queue: AppQueueCoordinator | object | None = None,
         *,
-        queue_coordinator: object | None = None,
-        smb_gateway: object | None = None,
-        credential_store: object | None = None,
+        queue_coordinator: AppQueueCoordinator | object | None = None,
+        smb_gateway: AppSmbGateway | object | None = None,
+        credential_store: AppCredentialStore | object | None = None,
         lock_path: Path | str | None = None,
         database_path: Path | str | None = None,
         transfer_ownership: bool = False,
@@ -406,6 +449,10 @@ class ApplicationService:
 
 
 __all__ = [
+    "AppCredentialStore",
+    "AppQueueCoordinator",
+    "AppSmbGateway",
+    "AppTaskRepository",
     "ApplicationService",
     "DatabaseIntegrityError",
     "ShutdownResult",

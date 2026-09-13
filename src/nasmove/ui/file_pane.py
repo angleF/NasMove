@@ -162,6 +162,7 @@ class FilePane(QWidget):
         self.table.enter_pressed.connect(self._on_table_enter)
         self.table.parent_requested.connect(self.parent_requested.emit)
         self.table.selectionModel().selectionChanged.connect(self._selection_changed)
+        self.model.entries_updated.connect(self._on_model_updated)
         self.setAcceptDrops(True)
 
     @property
@@ -226,9 +227,12 @@ class FilePane(QWidget):
 
     def _apply_search_filter(self) -> None:
         self.model.set_filter(self.search_input.text())
+
+    def _on_model_updated(self) -> None:
         selection_model = self.table.selectionModel()
         if selection_model is not None:
             selection_model.clearSelection()
+        self.set_loading(False)
         self._sync_view_state()
         self.selection_changed.emit(self.selected_entries())
 
@@ -295,12 +299,6 @@ class FilePane(QWidget):
         self.location = snapshot.location
         self.path_label.setText(snapshot.location or ("Mac" if self.side is DirectorySide.LOCAL else "NAS"))
         self.model.replace(snapshot)
-        selection_model = self.table.selectionModel()
-        if selection_model is not None:
-            selection_model.clearSelection()
-        self.set_loading(False)
-        self._sync_view_state()
-        self.selection_changed.emit(self.selected_entries())
 
     def selected_entries(self) -> tuple[DirectoryEntryViewModel, ...]:
         selection_model = self.table.selectionModel()

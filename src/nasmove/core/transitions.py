@@ -114,6 +114,7 @@ TASK_TRANSITIONS: Final[Mapping[TaskState, frozenset[TaskState]]] = MappingProxy
                 TaskState.FAILED,
             }
         ),
+        TaskState.FAILED: frozenset({TaskState.QUEUED, TaskState.CANCELED}),
     }
 )
 

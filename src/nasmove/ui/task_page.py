@@ -31,8 +31,10 @@ from nasmove.ui.task_presentation import (
     ERROR_TEXT,
     STATE_TEXT,
     duration_text,
+    format_error_detail_report,
     safe_code,
     size_text,
+    task_display_name,
 )
 
 
@@ -40,6 +42,7 @@ class TaskPage(QWidget):
     pause_requested = Signal()
     resume_requested = Signal()
     cancel_requested = Signal()
+    delete_requested = Signal()
     queue_reordered = Signal(object)
     selection_changed = Signal(object)
     connection_requested = Signal()
@@ -77,6 +80,7 @@ class TaskPage(QWidget):
         self._total_files = 0
         self._error_code: str | None = None
         self._deletion_outcome: str | None = None
+        self._task_summary: object | None = None
         self._retry_deadline: float | None = None
         self._retry_attempt: int | None = None
         self._smoothed_speed: float | None = None
@@ -88,7 +92,7 @@ class TaskPage(QWidget):
         self.result_summary.setWordWrap(True)
         self.error_details = QTextEdit()
         self.error_details.setReadOnly(True)
-        self.error_details.setMaximumHeight(140)
+        self.error_details.setMaximumHeight(220)
         self.error_details.hide()
         self.details_button = QPushButton("▸ 错误详情与处理记录")
         self.details_button.setCheckable(True)
@@ -103,22 +107,25 @@ class TaskPage(QWidget):
         self.pause_button = QPushButton("暂停")
         self.resume_button = QPushButton("继续")
         self.cancel_button = QPushButton("取消")
+        self.delete_button = QPushButton("删除")
         self.export_button = QPushButton("导出脱敏摘要")
         self.back_button = QPushButton("‹ 返回迁移工作台")
         self.back_button.setProperty("themeRole", "secondary")
         self.back_button.clicked.connect(self.workbench_requested.emit)
         self.queue_list = QListWidget()
+        self.queue_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.queue_list.currentItemChanged.connect(
             lambda *_: self.selection_changed.emit(self.selected_task_id())
         )
         self.move_up_button = QPushButton("上移")
         self.move_down_button = QPushButton("下移")
-        self.pause_button.clicked.connect(self.pause_requested.emit)
-        self.resume_button.clicked.connect(self.resume_requested.emit)
-        self.cancel_button.clicked.connect(self.cancel_requested.emit)
+        self.pause_button.clicked.connect(lambda *_: self.pause_requested.emit())
+        self.resume_button.clicked.connect(lambda *_: self.resume_requested.emit())
+        self.cancel_button.clicked.connect(lambda *_: self.cancel_requested.emit())
+        self.delete_button.clicked.connect(lambda *_: self.delete_requested.emit())
         self.export_button.clicked.connect(self._choose_export_path)
-        self.move_up_button.clicked.connect(lambda: self._move_selected(-1))
-        self.move_down_button.clicked.connect(lambda: self._move_selected(1))
+        self.move_up_button.clicked.connect(lambda *_: self._move_selected(-1))
+        self.move_down_button.clicked.connect(lambda *_: self._move_selected(1))
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         splitter = QSplitter()
@@ -164,7 +171,7 @@ class TaskPage(QWidget):
         detail.addWidget(self.safety_label)
         detail.addWidget(self.recovery_card)
         actions = QHBoxLayout()
-        for button in (self.pause_button, self.resume_button, self.cancel_button, self.connection_button):
+        for button in (self.pause_button, self.resume_button, self.cancel_button, self.delete_button, self.connection_button):
             actions.addWidget(button)
         actions.addStretch()
         detail.addLayout(actions)
@@ -193,9 +200,10 @@ class TaskPage(QWidget):
         self.recovery_card.hide()
 
     def show_task(self, task: object) -> None:
+        self._task_summary = None
         self._action = str(getattr(getattr(task, "action", "copy"), "value", "copy"))
         self._total_files = int(getattr(task, "total_files", 0))
-        self.task_name_label.setText(str(getattr(task, "name", "迁移任务")))
+        self.task_name_label.setText(task_display_name(task))
         connection = getattr(task, "connection", None)
         self._target_url = QUrl()
         self._target_url.setScheme("smb")
@@ -227,6 +235,23 @@ class TaskPage(QWidget):
             int(getattr(task, "verified_bytes", 0)), 0, None), state=getattr(task, "state", None))
         self._update_actions(getattr(task, "state", None))
 
+    def set_task_summary(self, summary: object | None) -> None:
+        """Attach persisted transfer summary statistics to enrich failure diagnostics."""
+        self._task_summary = summary
+        if summary is not None:
+            value = str(getattr(self._state, "value", self._state))
+            if value in {TaskState.FAILED.value, "execution_stopped"}:
+                self.set_workspace_state(cast(Any, self._state))
+                all_committed = bool(getattr(summary, "all_committed", False))
+                if all_committed:
+                    if self._error_code == "file_locked":
+                        self.result_summary.setText("数据已全部复制到 NAS。部分本地源文件正在被其他程序使用，未能移入废纸篓。")
+                    self.safety_label.setText(
+                        "目标端数据安全无损：所有文件已完整写入 NAS 并通过完整性校验。仅本地源文件因占用未能移入废纸篓，源文件仍完好保留在本机。"
+                    )
+        if self._error_code is not None:
+            self._show_reason(self._error_code)
+
     def _update_activity(self) -> None:
         value = str(getattr(self._state, "value", self._state))
         if value == "waiting_for_network" and self._retry_deadline is not None:
@@ -251,6 +276,8 @@ class TaskPage(QWidget):
     def set_deletion_outcome(self, code: str | None) -> None:
         """Remember the persisted source-deletion outcome for the summary export."""
         self._deletion_outcome = code
+        if self._error_code is not None:
+            self._show_reason(self._error_code)
 
     def export_summary(self, destination: Path) -> None:
         """Export user-facing state only; technical details may contain sensitive paths."""
@@ -414,8 +441,25 @@ class TaskPage(QWidget):
                 "canceled": "任务已取消。已提交的目标文件保留，请核对文件结果。",
                 "waiting_for_network": "连接暂时不可用，正在等待网络恢复。"}[value])
         else:
-            self.result_summary.setText("任务未完成，请查看原因及处理建议。")
-            self.safety_label.setText("可能已有部分目标文件，源文件和目标文件状态需要核对。")
+            all_committed = (
+                bool(getattr(self._task_summary, "all_committed", False))
+                or (self.copy_progress.value() >= 100 and self.verify_progress.value() >= 100)
+            )
+            committed_items = int(getattr(self._task_summary, "committed_items", 0))
+            total_items = int(getattr(self._task_summary, "total_items", 0) or self._total_files)
+            if all_committed:
+                self.result_summary.setText("数据已全部成功复制到 NAS，但部分本地源文件移入废纸篓受阻。")
+                self.safety_label.setText(
+                    "目标端数据安全无损：所有文件已完整写入 NAS 并通过完整性校验。仅本地源文件因占用未能移入废纸篓，源文件仍完好保留在本机。"
+                )
+            elif committed_items > 0:
+                self.result_summary.setText(f"已成功传输 {committed_items}/{total_items} 个文件，其余文件处理未完成。")
+                self.safety_label.setText(
+                    f"部分数据已就绪：{committed_items} 个文件已安全写入 NAS；未完成文件源文件完好保留在本机，无数据丢失风险。"
+                )
+            else:
+                self.result_summary.setText("任务未完成，请查看原因及处理建议。")
+                self.safety_label.setText("可能已有部分目标文件，源文件和目标文件状态需要核对。")
         error = getattr(result, "error", None)
         if error is not None:
             self._show_reason(redacted_error_code(error))
@@ -430,11 +474,15 @@ class TaskPage(QWidget):
         self.pause_button.setEnabled(
             value in {"queued", "running", "interrupted", "waiting_for_network"}
         )
-        self.resume_button.setEnabled(value == "paused")
+        self.resume_button.setEnabled(value in {"paused", "failed"})
+        self.resume_button.setText("重试" if value == "failed" else "继续")
         self.cancel_button.setEnabled(
-            value in {"draft", "preflight", "queued", "running", "interrupted", "waiting_for_network", "paused"}
+            value in {"draft", "preflight", "queued", "running", "interrupted", "waiting_for_network", "paused", "failed"}
         )
-        for button in (self.pause_button, self.resume_button, self.cancel_button):
+        self.delete_button.setEnabled(
+            value in {"completed", "completed_with_warnings", "failed", "canceled"}
+        )
+        for button in (self.pause_button, self.resume_button, self.cancel_button, self.delete_button):
             button.setVisible(button.isEnabled())
         self.connection_button.setVisible(value in {"failed", "interrupted", "paused", "waiting_for_network"})
         state_role = "recovered" if value == "completed" else "failure" if value in {
@@ -468,21 +516,68 @@ class TaskPage(QWidget):
             self.phase_label.setText("正在复制　›　完整回读校验　›　原子提交　›　移入废纸篓")
         elif value == TaskState.COMPLETED.value:
             self.phase_label.setText("复制、完整回读校验和原子提交均已完成")
+        elif value == TaskState.COMPLETED_WITH_WARNINGS.value:
+            self.phase_label.setText("复制、回读校验与原子提交已完成　›　部分源文件清理有警告并保留")
+        elif value == TaskState.PAUSED.value:
+            self.phase_label.setText("任务已暂停　›　已保存断点，可继续传输")
+        elif value == TaskState.CANCELED.value:
+            self.phase_label.setText("任务已取消　›　已提交目标文件保留，未完成部分已清理")
+        elif value == TaskState.INTERRUPTED.value:
+            self.phase_label.setText("任务异常中断　›　已保存断点，可重试恢复")
+        elif value in {TaskState.FAILED.value, "execution_stopped"}:
+            all_done = (
+                bool(getattr(self._task_summary, "all_committed", False))
+                or (self.copy_progress.value() >= 100 and self.verify_progress.value() >= 100)
+            )
+            if all_done:
+                self.phase_label.setText("复制完成　›　完整回读校验完成　›　原子提交完成　›　源文件移入废纸篓受阻")
+            elif self.verify_progress.value() >= 100:
+                self.phase_label.setText("复制与完整回读校验已完成　›　原子提交或源文件处理受阻")
+            elif self.copy_progress.value() >= 100:
+                self.phase_label.setText("复制已完成　›　完整回读校验未完成")
+            else:
+                self.phase_label.setText("传输未完成　›　任务已停止")
         else:
             self.phase_label.setText("等待任务开始")
 
     def _show_reason(self, code: str) -> None:
         code = safe_code(code)
         self._error_code = code
-        self.result_summary.setText(ERROR_TEXT[code])
-        self.error_details.setPlainText(f"错误代码：{code}\n{ERROR_TEXT[code]}")
+        all_committed = (
+            bool(getattr(self._task_summary, "all_committed", False))
+            or (self.copy_progress.value() >= 100 and self.verify_progress.value() >= 100)
+        )
+        if all_committed and code == "file_locked":
+            self.result_summary.setText("数据已全部复制到 NAS。部分本地源文件正在被其他程序使用，未能移入废纸篓。")
+        else:
+            self.result_summary.setText(ERROR_TEXT[code])
+        report = format_error_detail_report(
+            code,
+            task_summary=self._task_summary,
+            action=self._action,
+            copy_percent=self.copy_progress.value(),
+            verify_percent=self.verify_progress.value(),
+            total_files=self._total_files,
+            deletion_outcome=self._deletion_outcome,
+        )
+        self.error_details.setPlainText(report)
         self.details_button.show()
+        self.details_button.setChecked(True)
         self.export_button.show()
 
     def show_execution_error(self, code: str = "unexpected_error") -> None:
         self._update_actions("failed")
         self.status_label.setText("执行已停止 · 需要处理")
         self._show_reason(code)
-        self.safety_label.setText("任务已停止。可能有部分文件已传输，请核对文件结果后再处理。")
+        all_committed = (
+            bool(getattr(self._task_summary, "all_committed", False))
+            or (self.copy_progress.value() >= 100 and self.verify_progress.value() >= 100)
+        )
+        if all_committed:
+            self.safety_label.setText(
+                "目标端数据安全无损：所有文件已完整写入 NAS 并通过完整性校验。仅本地源文件未能移入废纸篓，源文件仍完好保留在本机。"
+            )
+        else:
+            self.safety_label.setText("任务已停止。可能有部分文件已传输，请核对文件结果后再处理。")
         self.speed_label.setText("速度：—")
         self.eta_label.setText("剩余：—")

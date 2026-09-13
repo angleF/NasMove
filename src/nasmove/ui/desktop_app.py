@@ -170,6 +170,7 @@ def build_engine(
     progress_lock = RLock()
     copied: dict[TransferItemId, int] = {}
     verified: dict[TransferItemId, int] = {}
+    planned_dirs: set[Path] = set()
     for item in repository.list_items(task.id):
         if item.state.value in {
             "committed",
@@ -179,6 +180,13 @@ def build_engine(
         }:
             copied[item.id] = item.source_fingerprint.size
             verified[item.id] = item.source_fingerprint.size
+            
+        if item.source_fingerprint.kind.value == "empty_directory":
+            planned_dirs.add(item.source_path)
+        
+        num_parents_to_add = len(item.relative_path.parts) - 1
+        for i in range(num_parents_to_add):
+            planned_dirs.add(item.source_path.parents[i])
 
     def copy_progress(item: TransferItemRecord, offset: int) -> None:
         with progress_lock:
@@ -212,7 +220,7 @@ def build_engine(
                 ),
                 verifier,
                 cast(Committer, TargetCommitter(protocol_repository, gateway, session)),
-                SourceDeletionService(protocol_repository, local, gateway, verifier),
+                SourceDeletionService(protocol_repository, local, gateway, verifier, planned_dirs),
                 smb_gateway=gateway,
                 session=session,
                 event_sink=cast(EventSink, events),

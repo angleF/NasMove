@@ -23,6 +23,7 @@ from nasmove.core.model import (
     SourceFingerprint,
     TaskId,
     TaskRecord,
+    TaskSummary,
     TransferItemId,
     TransferItemRecord,
 )
@@ -609,6 +610,15 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
             ],
         )
 
+    def delete_task(self, task_id: TaskId) -> None:
+        self._begin()
+        try:
+            self._connection.execute("DELETE FROM tasks WHERE task_id = ?", (str(task_id),))
+            self._commit()
+        except sqlite3.Error:
+            self._rollback()
+            raise
+
     def get_task(self, task_id: TaskId) -> TaskRecord:
         row = self._connection.execute("SELECT * FROM tasks WHERE task_id = ?", (str(task_id),)).fetchone()
         if row is None:
@@ -854,6 +864,44 @@ class SqliteTaskRepository(AbstractContextManager["SqliteTaskRepository"]):
         if row is None:
             return None
         return str(row[0]), None if row[1] is None else str(row[1])
+
+    def task_summary(self, task_id: TaskId | None) -> TaskSummary:
+        """Query aggregate transfer statistics for the given task."""
+        if task_id is None:
+            return TaskSummary()
+        row = self._connection.execute(
+            """
+            SELECT
+                count(*) as total_items,
+                coalesce(sum(source_size), 0) as total_bytes,
+                coalesce(sum(confirmed_offset), 0) as confirmed_bytes,
+                coalesce(sum(case when state = 'done' then 1 else 0 end), 0) as done_items,
+                coalesce(sum(case when state in ('committed', 'source_delete_authorized', 'source_retained', 'done') then 1 else 0 end), 0) as committed_items,
+                coalesce(sum(case when full_hash_verified = 1 then 1 else 0 end), 0) as verified_items
+            FROM transfer_items WHERE task_id = ?
+            """,
+            (str(task_id),),
+        ).fetchone()
+        if row is None or row[0] == 0:
+            return TaskSummary()
+        uncompleted_rows = self._connection.execute(
+            """
+            SELECT source_path FROM transfer_items
+            WHERE task_id = ? AND state NOT IN ('done', 'skipped')
+            LIMIT 5
+            """,
+            (str(task_id),),
+        ).fetchall()
+        uncompleted_names = tuple(Path(r[0]).name for r in uncompleted_rows)
+        return TaskSummary(
+            total_items=int(row[0]),
+            total_bytes=int(row[1]),
+            confirmed_bytes=int(row[2]),
+            done_items=int(row[3]),
+            committed_items=int(row[4]),
+            verified_items=int(row[5]),
+            uncompleted_names=uncompleted_names,
+        )
 
     def mark_active_tasks_interrupted(self) -> int:
         self._begin()

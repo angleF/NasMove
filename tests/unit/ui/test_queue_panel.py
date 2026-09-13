@@ -178,3 +178,39 @@ def test_queue_panel_switching_tasks_updates_progress_immediately(qtbot) -> None
     panel.set_tasks(())
     assert panel.progress.value() == 0
     assert panel.progress.format() == "尚无活动任务"
+
+
+def test_queue_panel_enables_retry_and_cancel_for_failed_task(qtbot) -> None:
+    panel = QueuePanel()
+    qtbot.addWidget(panel)
+    task = replace(build_task_record(), state=TaskState.FAILED)
+    panel.set_tasks((task,))
+    panel.select_task(task.id)
+
+    assert panel.resume_button.isEnabled() is True
+    assert panel.resume_button.text() == "重试"
+    assert panel.cancel_button.isEnabled() is True
+    assert panel.pause_button.isEnabled() is False
+
+    with qtbot.waitSignal(panel.resume_requested) as signal:
+        panel.resume_button.click()
+
+    assert signal.args == [task.id]
+
+
+def test_queue_panel_uses_distinctive_name_fallback_for_connection_named_tasks(qtbot) -> None:
+    from nasmove.core.model import RemotePath
+
+    panel = QueuePanel()
+    qtbot.addWidget(panel)
+    base = build_task_record()
+    # Legacy bug: task name was set to connection profile name "local"
+    task = replace(
+        base,
+        name="local",
+        connection=replace(base.connection, display_name="local"),
+        target_root=RemotePath("local/Catherine Knight"),
+    )
+    panel.set_tasks((task,))
+
+    assert "Catherine Knight" in panel.row_text(task.id)

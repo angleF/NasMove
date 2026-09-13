@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from nasmove.core.model import TaskId
 from nasmove.core.states import TaskState, TransferAction
 from nasmove.transfer.progress import ProgressSnapshot
-from nasmove.ui.task_presentation import STATE_TEXT
+from nasmove.ui.task_presentation import STATE_TEXT, task_display_name
 
 
 def _percent(part: int, total: int) -> int:
@@ -46,6 +46,7 @@ class QueuePanel(QWidget):
     pause_requested = Signal(object)
     resume_requested = Signal(object)
     cancel_requested = Signal(object)
+    delete_requested = Signal(object)
     move_to_top_requested = Signal(object)
 
     def __init__(self) -> None:
@@ -60,6 +61,7 @@ class QueuePanel(QWidget):
         self.count_label.setProperty("themeRole", "muted")
         self.list_widget = QListWidget()
         self.list_widget.setObjectName("queueList")
+        self.list_widget.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
@@ -70,30 +72,39 @@ class QueuePanel(QWidget):
         self.resume_button.setObjectName("queueResumeButton")
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setObjectName("queueCancelButton")
+        self.delete_button = QPushButton("删除")
+        self.delete_button.setObjectName("queueDeleteButton")
         self.top_button = QPushButton("置顶")
         self.top_button.setObjectName("queueTopButton")
         self.fold_button = QPushButton("›")
         self.fold_button.setAccessibleName("收起传输队列")
-        self.fold_button.clicked.connect(lambda: self.set_compact(not self.is_compact))
+        self.fold_button.clicked.connect(lambda *_: self.set_compact(not self.is_compact))
         self.list_widget.currentItemChanged.connect(self._selection_changed)
-        self.pause_button.clicked.connect(lambda: self._emit_for_selected(self.pause_requested))
-        self.resume_button.clicked.connect(lambda: self._emit_for_selected(self.resume_requested))
-        self.cancel_button.clicked.connect(lambda: self._emit_for_selected(self.cancel_requested))
-        self.top_button.clicked.connect(lambda: self._emit_for_selected(self.move_to_top_requested))
+        self.pause_button.clicked.connect(lambda *_: self._emit_for_selected(self.pause_requested))
+        self.resume_button.clicked.connect(lambda *_: self._emit_for_selected(self.resume_requested))
+        self.cancel_button.clicked.connect(lambda *_: self._emit_for_selected(self.cancel_requested))
+        self.delete_button.clicked.connect(lambda *_: self._emit_for_selected(self.delete_requested))
+        self.top_button.clicked.connect(lambda *_: self._emit_for_selected(self.move_to_top_requested))
 
         top = QHBoxLayout()
         top.addWidget(self.heading)
         top.addWidget(self.count_label)
         top.addStretch()
         top.addWidget(self.fold_button)
-        actions = QHBoxLayout()
-        for button in (self.top_button, self.pause_button, self.resume_button, self.cancel_button):
-            actions.addWidget(button)
+        actions1 = QHBoxLayout()
+        actions1.setSpacing(6)
+        for button in (self.top_button, self.pause_button, self.resume_button):
+            actions1.addWidget(button)
+        actions2 = QHBoxLayout()
+        actions2.setSpacing(6)
+        for button in (self.cancel_button, self.delete_button):
+            actions2.addWidget(button)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(12, 12, 12, 12)
         layout.addLayout(top)
         layout.addWidget(self.list_widget, 1)
-        layout.addLayout(actions)
+        layout.addLayout(actions1)
+        layout.addLayout(actions2)
         layout.addWidget(self.progress)
         self._update_actions()
 
@@ -108,7 +119,7 @@ class QueuePanel(QWidget):
             state = cast(TaskState, getattr(task, "state", TaskState.DRAFT))
             row = QueueRowState(
                 task_id=cast(TaskId, cast(Any, task).id),
-                name=str(getattr(task, "name", "迁移任务")),
+                name=task_display_name(task),
                 action=cast(TransferAction, getattr(task, "action", TransferAction.COPY)),
                 state=state,
                 total_files=int(getattr(task, "total_files", 0)),
@@ -136,7 +147,7 @@ class QueuePanel(QWidget):
         state = cast(TaskState, getattr(task, "state", TaskState.DRAFT))
         row = QueueRowState(
             task_id=cast(TaskId, task_id),
-            name=str(getattr(task, "name", "迁移任务")),
+            name=task_display_name(task),
             action=cast(TransferAction, getattr(task, "action", TransferAction.COPY)),
             state=state,
             total_files=int(getattr(task, "total_files", 0)),
@@ -255,6 +266,7 @@ class QueuePanel(QWidget):
             self.pause_button,
             self.resume_button,
             self.cancel_button,
+            self.delete_button,
             self.top_button,
         ):
             widget.setVisible(not compact)
@@ -314,7 +326,8 @@ class QueuePanel(QWidget):
         self.pause_button.setEnabled(
             state in {TaskState.QUEUED, TaskState.RUNNING, TaskState.WAITING_FOR_NETWORK}
         )
-        self.resume_button.setEnabled(state is TaskState.PAUSED)
+        self.resume_button.setEnabled(state in {TaskState.PAUSED, TaskState.FAILED})
+        self.resume_button.setText("重试" if state is TaskState.FAILED else "继续")
         self.cancel_button.setEnabled(
             state
             in {
@@ -324,6 +337,16 @@ class QueuePanel(QWidget):
                 TaskState.RUNNING,
                 TaskState.WAITING_FOR_NETWORK,
                 TaskState.PAUSED,
+                TaskState.FAILED,
+            }
+        )
+        self.delete_button.setEnabled(
+            state
+            in {
+                TaskState.COMPLETED,
+                TaskState.COMPLETED_WITH_WARNINGS,
+                TaskState.FAILED,
+                TaskState.CANCELED,
             }
         )
 

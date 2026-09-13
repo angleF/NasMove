@@ -8,7 +8,11 @@ from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter, QPen
 
 
 def _ensure_chevron_icon(color_hex: str) -> str:
-    cache_dir = Path(tempfile.gettempdir()) / "nasmove_assets"
+    caches_parent = Path.home() / "Library" / "Caches"
+    if caches_parent.is_dir():
+        cache_dir = caches_parent / "NasMove" / "assets"
+    else:
+        cache_dir = Path(tempfile.gettempdir()) / "nasmove_assets"
     cache_dir.mkdir(parents=True, exist_ok=True)
     slug = color_hex.replace("#", "")
     path = cache_dir / f"chevron_down_{slug}.png"
@@ -121,10 +125,10 @@ _PALETTES = {
 
 def is_system_dark() -> bool:
     app = QGuiApplication.instance()
-    if app is not None:
+    if isinstance(app, QGuiApplication):
         hints = app.styleHints()
         if hints is not None:
-            return hints.colorScheme() == Qt.ColorScheme.Dark
+            return bool(hints.colorScheme() == Qt.ColorScheme.Dark)
     return False
 
 
@@ -462,6 +466,21 @@ class ThemeController(QObject):
             }}
             QScrollBar::handle:vertical:hover {{ background: {palette.muted_text}; }}
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
+            QScrollBar:horizontal {{
+                background: transparent;
+                border: none;
+                margin: 2px;
+                height: 10px;
+            }}
+            QScrollBar::handle:horizontal {{
+                background: {palette.surface_border};
+                border: 2px solid transparent;
+                border-radius: 4px;
+                background-clip: padding;
+                min-width: 36px;
+            }}
+            QScrollBar::handle:horizontal:hover {{ background: {palette.muted_text}; }}
+            QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
             QScrollArea {{ border: none; background: transparent; }}
             QListWidget::item {{
                 padding: 10px 8px;

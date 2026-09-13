@@ -65,8 +65,8 @@ class TransferWorkspace(QWidget):
         self.move_button.setProperty("themeRole", "warning")
         self.pull_button = QPushButton("← 从 NAS 复制")
         self.pull_button.hide()
-        self.upload_button.clicked.connect(lambda: self._request_create(move=False))
-        self.move_button.clicked.connect(lambda: self._request_create(move=True))
+        self.upload_button.clicked.connect(lambda *_: self._request_create(move=False))
+        self.move_button.clicked.connect(lambda *_: self._request_create(move=True))
         self.local_pane.selection_changed.connect(self._selection_changed)
         self.remote_pane.selection_changed.connect(self._remote_selection_changed)
         self.remote_pane.connect_requested.connect(self.connect_requested.emit)
@@ -137,6 +137,10 @@ class TransferWorkspace(QWidget):
         self.device_sidebar.show_connection_state(online=verified)
         self.remote_pane.set_connection_guidance(not verified)
         self._refresh_actions()
+
+    @property
+    def connection_verified(self) -> bool:
+        return self._connection_verified
 
     def set_creating(self, creating: bool) -> None:
         self._creating = creating

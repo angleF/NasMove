@@ -293,14 +293,22 @@ class TransferEngine:
             return self._fail_task(task, error, None)
         completed = 0
         warnings: list[str] = []
+        first_error: BaseException | None = None
+        parallel_failed = 0
 
         if self._item_worker_factory is None:
-            for completed, item in enumerate(items, 1):
+            for item in items:
                 result = self._run_item(item, task, token)
                 if isinstance(result, TaskResult):
-                    return result
-                if result:
+                    if result.state is TaskState.WAITING_FOR_NETWORK or _requested(token, "cancel_requested") or _requested(token, "pause_requested"):
+                        return result
+                    parallel_failed += 1
+                    if first_error is None:
+                        first_error = result.error
+                elif result:
                     warnings.append(result)
+                else:
+                    completed += 1
                 if self._stop_scheduling.is_set():
                     _request(token, "request_pause")
                 if _requested(token, "cancel_requested"):
@@ -320,14 +328,12 @@ class TransferEngine:
                 self._run_parallel_items(task, files, token)
             )
             warnings.extend(parallel_warnings)
-            if first_error is not None:
+            if first_error is not None and retryable:
                 return self._fail_task(
                     task,
                     first_error,
                     None,
-                    state=(
-                        TaskState.WAITING_FOR_NETWORK if retryable else TaskState.FAILED
-                    ),
+                    state=TaskState.WAITING_FOR_NETWORK,
                     completed=completed,
                     warnings=tuple(warnings),
                     failed=parallel_failed,
@@ -351,19 +357,20 @@ class TransferEngine:
                 except BaseException as caught:  # noqa: BLE001 - worker boundary must be visible
                     outcome = self._unexpected_worker_failure(task, item, caught)
                 if outcome.error is not None:
-                    return self._fail_task(
-                        task,
-                        outcome.error,
-                        item,
-                        state=(
-                            TaskState.WAITING_FOR_NETWORK
-                            if outcome.retryable
-                            else TaskState.FAILED
-                        ),
-                        completed=completed,
-                        warnings=tuple(warnings),
-                        failed=1,
-                    )
+                    if outcome.retryable:
+                        return self._fail_task(
+                            task,
+                            outcome.error,
+                            item,
+                            state=TaskState.WAITING_FOR_NETWORK,
+                            completed=completed,
+                            warnings=tuple(warnings),
+                            failed=parallel_failed + 1,
+                        )
+                    if first_error is None:
+                        first_error = outcome.error
+                    parallel_failed += 1
+                    continue
                 if outcome.state is ItemState.INTERRUPTED:
                     if _requested(token, "cancel_requested"):
                         return self._finish(
@@ -385,14 +392,10 @@ class TransferEngine:
                             "failed",
                         )
                     )
-                    return self._fail_task(
-                        task,
-                        interruption_error,
-                        item,
-                        completed=completed,
-                        warnings=tuple(warnings),
-                        failed=1,
-                    )
+                    if first_error is None:
+                        first_error = interruption_error
+                    parallel_failed += 1
+                    continue
                 completed += 1
                 if outcome.warning:
                     warnings.append(outcome.warning)
@@ -403,6 +406,16 @@ class TransferEngine:
 
         if not items:
             completed = 0
+        if first_error is not None:
+            return self._fail_task(
+                task,
+                first_error,
+                None,
+                state=TaskState.FAILED,
+                completed=completed,
+                warnings=tuple(warnings),
+                failed=parallel_failed,
+            )
         current_task = self._repository.get_task(task_id)
         if current_task.state is TaskState.RUNNING:
             self._transition_task_if_needed(current_task, TaskState.VERIFYING)
@@ -519,7 +532,15 @@ class TransferEngine:
         reason = stop_controller.reason
         if reason is not None and reason.kind == "error":
             return completed, tuple(ordered_warnings), reason.error, reason.retryable, failed
-        return completed, tuple(ordered_warnings), None, False, failed
+        first_item_error = next(
+            (
+                outcomes[item.id].error
+                for item in files
+                if item.id in outcomes and outcomes[item.id].error is not None
+            ),
+            None,
+        )
+        return completed, tuple(ordered_warnings), first_item_error, False, failed
 
     @staticmethod
     def _freeze_user_stop(
@@ -553,7 +574,7 @@ class TransferEngine:
             worker = factory(task, self._password or "")
         except BaseException as caught:  # noqa: BLE001 - factory failures must be classified
             retryable = self._retry_policy.is_retryable(caught)
-            if stop_controller is not None:
+            if stop_controller is not None and retryable:
                 # Freeze the reason before publishing anything: a failing event
                 # sink must not be able to let this failure escape unfrozen and
                 # be misreported as a completed task.
@@ -562,20 +583,22 @@ class TransferEngine:
         try:
             try:
                 outcome = worker.run(item, task, token)
-                if stop_controller is not None and outcome.error is not None:
+                if stop_controller is not None and outcome.error is not None and outcome.retryable:
                     stop_controller.freeze(
                         _StopReason("error", outcome.error, outcome.retryable)
                     )
             except BaseException as caught:
-                if stop_controller is not None:
-                    stop_controller.freeze(_StopReason("error", caught))
+                retryable = self._retry_policy.is_retryable(caught)
+                if stop_controller is not None and retryable:
+                    stop_controller.freeze(_StopReason("error", caught, retryable))
                 raise
         finally:
             try:
                 worker.close()
             except BaseException as caught:
-                if stop_controller is not None:
-                    stop_controller.freeze(_StopReason("error", caught))
+                retryable = self._retry_policy.is_retryable(caught)
+                if stop_controller is not None and retryable:
+                    stop_controller.freeze(_StopReason("error", caught, retryable))
                 raise
         return outcome
 

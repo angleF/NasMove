@@ -31,6 +31,7 @@ src/nasmove/smb/smbprotocol_gateway.py
 src/nasmove/transfer/checkpoint_writer.py
 src/nasmove/transfer/commit.py
 src/nasmove/transfer/deletion.py
+src/nasmove/transfer/item_worker.py
 src/nasmove/transfer/progress.py
 src/nasmove/transfer/recovery.py
 src/nasmove/transfer/retrying_runner.py

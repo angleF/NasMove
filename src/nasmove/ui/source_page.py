@@ -42,7 +42,7 @@ class SourcePage(QWidget):
         self.add_files_button.clicked.connect(self.choose_files)
         self.add_directory_button.clicked.connect(self.choose_directory)
         self.remove_button.clicked.connect(self.remove_selected_sources)
-        self.clear_button.clicked.connect(lambda: self.set_sources([]))
+        self.clear_button.clicked.connect(lambda *_: self.set_sources([]))
         self.move_checkbox.toggled.connect(self._move_toggled)
         layout = QVBoxLayout(self)
         source_hint = QLabel("选择要迁移的本地文件或文件夹，也可以直接拖入下方列表。")

@@ -60,3 +60,18 @@ def test_range_hash_rejects_invalid_or_out_of_bounds_ranges(start: object, lengt
 def test_range_hash_rejects_short_stream() -> None:
     with pytest.raises(ValueError):
         sha256_range(io.BytesIO(b"payload"), start=4, length=10)
+
+
+def test_range_hash_with_explicit_stream_size() -> None:
+    payload = b"0123456789"
+    stream = io.BytesIO(payload)
+    digest = sha256_range(stream, start=2, length=5, stream_size=len(payload))
+    assert digest == hashlib.sha256(payload[2:7]).hexdigest()
+    assert stream.tell() == 7
+
+
+def test_range_hash_rejects_invalid_stream_size() -> None:
+    with pytest.raises(ValueError):
+        sha256_range(io.BytesIO(b"payload"), start=0, length=4, stream_size=-1)
+    with pytest.raises(ValueError):
+        sha256_range(io.BytesIO(b"payload"), start=0, length=4, stream_size=2)

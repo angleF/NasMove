@@ -39,6 +39,7 @@ class TaskController(QObject):
     event_applied = Signal()
     resume_execution = Signal()
     workspace_state_changed = Signal(object)
+    task_state_updated = Signal(object, object)
 
     def __init__(
         self,
@@ -65,6 +66,7 @@ class TaskController(QObject):
         page.pause_requested.connect(lambda: self._dispatch("pause"))
         page.resume_requested.connect(lambda: self._dispatch("resume"))
         page.cancel_requested.connect(lambda: self._dispatch("cancel"))
+        page.delete_requested.connect(lambda: self._dispatch("delete"))
         page.queue_reordered.connect(self._persist_order)
         page.selection_changed.connect(self._select)
         page.files_requested.connect(self._show_files)
@@ -76,6 +78,7 @@ class TaskController(QObject):
         panel.pause_requested.connect(lambda task_id: self._dispatch_for(task_id, "pause"))
         panel.resume_requested.connect(lambda task_id: self._dispatch_for(task_id, "resume"))
         panel.cancel_requested.connect(lambda task_id: self._dispatch_for(task_id, "cancel"))
+        panel.delete_requested.connect(lambda task_id: self._dispatch_for(task_id, "delete"))
         panel.move_to_top_requested.connect(self._move_to_top)
         panel.set_tasks(self._tasks)
 
@@ -207,8 +210,10 @@ class TaskController(QObject):
         if self._queue_panel is not None:
             cast(Any, self._queue_panel).apply_result(result, task_id=task_id)
         if self._visible(task_id):
+            self._sync_task_summary(task_id)
             self._page.show_result(result)
             self._sync_deletion_outcome(task_id)
+            self._sync_task_summary(task_id)
         error = getattr(result, "error", None)
         recorder = getattr(self._repository, "record_ui_error", None)
         if error is not None and callable(recorder):
@@ -234,6 +239,7 @@ class TaskController(QObject):
             except Exception:  # noqa: BLE001 - report failed persistence below
                 saved = False
         if self._visible(task_id) or task_id is None:
+            self._sync_task_summary(task_id)
             self._page.show_execution_error(code)
             self._page.error_details.append("错误记录已保存。" if saved else "错误记录未保存，请导出报告。")
 
@@ -248,6 +254,7 @@ class TaskController(QObject):
                 if getattr(task, "id", None) == task_id and is_dataclass(task) else task
                 for task in self._tasks
             )
+        self.task_state_updated.emit(task_id, state)
         for index in range(self._page.queue_list.count()):
             item = self._page.queue_list.item(index)
             if item.data(Qt.ItemDataRole.UserRole) == task_id:
@@ -260,10 +267,30 @@ class TaskController(QObject):
         if task is None:
             return
         self._page.show_task(task)
+        self._sync_task_summary(task_id)
         if task_id in self._events:
             self._page.apply_event(self._events[task_id])
         if task_id in self._progress:
             self._page.apply_snapshot(self._progress[task_id], state=getattr(self._events.get(task_id), "state", getattr(task, "state", None)))
+        elif getattr(self._page, "_task_summary", None) is not None:
+            summary = self._page._task_summary
+            confirmed = int(getattr(summary, "confirmed_bytes", 0))
+            total_bytes = int(getattr(summary, "total_bytes", 0) or getattr(task, "total_bytes", 0))
+            verified_count = int(getattr(summary, "verified_items", 0))
+            total_count = int(getattr(summary, "total_items", 0) or getattr(task, "total_files", 0))
+            if confirmed > 0 and total_bytes > 0:
+                verified_bytes = total_bytes if (total_count > 0 and verified_count >= total_count) else 0
+                self._page.apply_snapshot(
+                    ProgressSnapshot(
+                        total_bytes * 2,
+                        0,
+                        confirmed,
+                        verified_bytes,
+                        0,
+                        None,
+                    ),
+                    state=getattr(self._events.get(task_id), "state", getattr(task, "state", None)),
+                )
         if task_id in self._results:
             self._page.show_result(self._results[task_id])
         elif str(getattr(getattr(task, "state", None), "value", "")) in _OUTCOME_STATES:
@@ -280,6 +307,18 @@ class TaskController(QObject):
             else:
                 self._page.show_execution_error(self._errors[task_id])
         self._sync_deletion_outcome(task_id)
+        self._sync_task_summary(task_id)
+
+    def _sync_task_summary(self, task_id: object) -> None:
+        """Forward aggregate task transfer statistics to the task view."""
+        reader = getattr(self._repository, "task_summary", None)
+        if not callable(reader) or task_id is None:
+            return
+        try:
+            summary = reader(task_id)
+        except Exception:  # noqa: BLE001 - diagnostics must not break the view
+            summary = None
+        self._page.set_task_summary(summary)
 
     def _sync_deletion_outcome(self, task_id: object) -> None:
         """Give the persisted source-deletion outcome a production reader.
@@ -308,6 +347,15 @@ class TaskController(QObject):
         if callable(command):
             try:
                 cast(Any, command)(task_id)
+                if name == "delete":
+                    self._tasks = tuple(t for t in self._tasks if getattr(t, "id", None) != task_id)
+                    self._events.pop(task_id, None)
+                    self._results.pop(task_id, None)
+                    self._errors.pop(task_id, None)
+                    if self._queue_panel is not None:
+                        cast(Any, self._queue_panel).set_tasks(self._tasks)
+                    self._page.set_queue(self._tasks)
+                    return
                 getter = getattr(self._repository, "get_task", None)
                 if callable(getter):
                     fresh = getter(task_id)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from pathlib import PurePosixPath
 from typing import Any, cast
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
@@ -198,8 +199,21 @@ class TaskCreationController(QObject):
         sources = tuple(self._source_page.sources)
         target = self._target_page.target_path()
         move = self._source_page.move_checkbox.isChecked()
+        name = ""
+        if sources:
+            first_name = sources[0].name or str(sources[0])
+            if len(sources) == 1:
+                name = first_name
+            else:
+                name = f"{first_name} 等 {len(sources)} 个项目"
+        elif target:
+            target_str = str(target).strip().rstrip("/\\")
+            if target_str:
+                name = PurePosixPath(target_str).name
+        if not name:
+            name = self._connection_page.display_name_lineedit.text().strip() or "NasMove 任务"
         return PlanRequest(
-            name=self._connection_page.display_name_lineedit.text().strip() or "NasMove 任务",
+            name=name,
             connection=connection,
             sources=sources,
             target_root=target,
@@ -257,9 +271,9 @@ class TaskCreationController(QObject):
         )
         target_obj = getattr(request, "target_root", None)
         target_val = (
-            target_obj.value
-            if hasattr(target_obj, "value")
-            else str(target_obj) if target_obj is not None else ""
+            getattr(target_obj, "value", str(target_obj))
+            if target_obj is not None
+            else ""
         )
         policy_obj = getattr(request, "conflict_policy", None)
         policy_val = (
@@ -343,7 +357,11 @@ class TaskCreationController(QObject):
 
     @Slot(str)
     def _show_error(self, error: str) -> None:
-        self._target_page.creation_status_label.setText("任务未创建：" + ERROR_TEXT[safe_code(error)])
+        if "insufficient NAS free space" in error:
+            code = "disk_full"
+        else:
+            code = safe_code(error)
+        self._target_page.creation_status_label.setText("任务未创建：" + ERROR_TEXT[code])
 
     @Slot()
     def _thread_finished(self) -> None:

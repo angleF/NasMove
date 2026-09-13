@@ -21,7 +21,7 @@ class TaskCommandService:
 
     def resume(self, task_id: object) -> None:
         task = self._task(task_id)
-        if task.state is not TaskState.PAUSED:
+        if task.state not in {TaskState.PAUSED, TaskState.FAILED}:
             return
         self._transition(task, TaskState.QUEUED)
         cast(Any, self._queue).enqueue(task.id)
@@ -35,10 +35,21 @@ class TaskCommandService:
             TaskState.INTERRUPTED,
             TaskState.WAITING_FOR_NETWORK,
             TaskState.PAUSED,
+            TaskState.FAILED,
         }:
             self._transition(task, TaskState.CANCELED)
         elif task.state is TaskState.RUNNING:
             cast(Any, self._queue).request_cancel()
+
+    def delete(self, task_id: object) -> None:
+        task = self._task(task_id)
+        if task.state in {
+            TaskState.COMPLETED,
+            TaskState.COMPLETED_WITH_WARNINGS,
+            TaskState.FAILED,
+            TaskState.CANCELED,
+        }:
+            cast(Any, self._repository).delete_task(task.id)
 
     def _task(self, task_id: object) -> Any:
         return cast(Any, self._repository).get_task(task_id)

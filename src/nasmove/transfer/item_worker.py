@@ -280,7 +280,7 @@ class TransferItemWorker:
             self._safe_item_transition(item, retry_state)
         elif item.state is ItemState.SOURCE_DELETE_AUTHORIZED:
             self._safe_item_transition(item, ItemState.SOURCE_RETAINED)
-        state = TaskState.WAITING_FOR_NETWORK if retryable else TaskState.FAILED
+        state = TaskState.WAITING_FOR_NETWORK if retryable else TaskState.RUNNING
         self._publish(TransferEvent(task.id, state, item.id, error, "failed"))
         return self._outcome(item, error=error, retryable=retryable)
 
